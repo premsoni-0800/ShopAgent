@@ -157,7 +157,6 @@ fun processDueScheduledJobs(ctx: JobContext, dispatcher: JobDispatcher) {
  */
 fun resumeInterruptedJobs(ctx: JobContext, dispatcher: JobDispatcher) {
     for (row in ctx.db.resumableJobs(ctx.credential.shopId)) {
-        log.info("resuming_interrupted_job job=${row.jobId} state=${row.state}")
         // Rewind to the start rather than continuing from where it stopped.
         // [processJob] always begins by moving to VALIDATING, and the state
         // machine has no edge back to it from DOWNLOADING or DOWNLOADED - so
@@ -165,8 +164,21 @@ fun resumeInterruptedJobs(ctx: JobContext, dispatcher: JobDispatcher) {
         // job FAILED that has not even been attempted. Replaying from the top
         // is safe precisely because none of these states has reached a
         // printer; the download is simply done again.
-        ctx.db.updateJobState(row.jobId, RECEIVED)
-        dispatcher.submit(row.jobId) { processJob(ctx, row.jobId) }
+        //
+        // The rewind belongs *inside* the submitted work, not before it. A job
+        // this sweep finds mid-flight is dropped by [JobDispatcher.submit] as a
+        // duplicate - but rewinding first happened anyway, pulling the running
+        // job's state back to RECEIVED underneath it. That job then reached
+        // DOWNLOADING from RECEIVED, tripped the guard, and was retried three
+        // times and failed as "download failed after 3 attempts" - a job that
+        // downloaded perfectly well and was never given the chance to print.
+        // Startup is exactly when both happen at once: this sweep runs while
+        // the stream is delivering today's jobs.
+        val accepted = dispatcher.submit(row.jobId) {
+            ctx.db.updateJobState(row.jobId, RECEIVED)
+            processJob(ctx, row.jobId)
+        }
+        if (accepted) log.info("resuming_interrupted_job job=${row.jobId} state=${row.state}")
     }
 }
 
@@ -284,6 +296,14 @@ private suspend fun downloadWithRetry(ctx: JobContext, jobId: String, detail: Pr
     for (attempt in 1..ctx.maxRetryAttempts) {
         try {
             return downloadAll(ctx, jobId, detail)
+        } catch (exc: IllegalStateException) {
+            // The state machine refused the move. Retrying cannot help - the
+            // state will be the same next time - and doing so anyway spent
+            // seven seconds of backoff before reporting the honest cause under
+            // the wrong headline, "download failed after 3 attempts", for a
+            // download that never began. Fail once, saying what happened.
+            fail(ctx, jobId, "job state no longer allows downloading: ${exc.message}", PrintJobFailureReason.UNKNOWN)
+            return null
         } catch (exc: Exception) {
             ctx.db.recordEvent(jobId, "DOWNLOAD_FAILED", "attempt $attempt: $exc")
             if (attempt == ctx.maxRetryAttempts) {
@@ -362,7 +382,13 @@ private fun pollAllOutcomes(
 
 private fun transition(ctx: JobContext, jobId: String, next: String, printerWindowsName: String? = null) {
     val row = ctx.db.getJob(jobId)
-    val current = row?.state ?: RECEIVED
+    // A missing row used to be treated as RECEIVED and written anyway. The
+    // write is a plain UPDATE, so it silently did nothing, and every later
+    // transition then reasoned from a state that was never stored - the kind
+    // of desync that surfaces somewhere else entirely, as a job that failed
+    // for a reason unrelated to what went wrong.
+    if (row == null) throw IllegalStateException("no local row for job $jobId - cannot move it to $next")
+    val current = row.state
     if (!canTransition(current, next)) throw IllegalStateException("illegal local transition $current -> $next for job $jobId")
     ctx.db.updateJobState(jobId, next, printerWindowsName = printerWindowsName)
     ctx.db.recordEvent(jobId, next)

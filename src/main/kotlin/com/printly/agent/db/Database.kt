@@ -192,6 +192,21 @@ class Database(dbPath: Path) : AutoCloseable {
         }
     }
 
+    /**
+     * Whether [jobId] has a local row at all.
+     *
+     * [updateJobState] is a plain UPDATE, so writing the state of a job that
+     * was never inserted changes nothing and says nothing - the state machine
+     * then runs on an assumed state that is not the one on disk. Callers that
+     * cannot tolerate that ask first.
+     */
+    fun hasJob(jobId: String): Boolean = synchronized(lock) {
+        connection.prepareStatement("SELECT 1 FROM print_jobs WHERE job_id = ?").use { ps ->
+            ps.setString(1, jobId)
+            ps.executeQuery().use { it.next() }
+        }
+    }
+
     fun unresolvedJobs(shopId: String): List<JobRow> = synchronized(lock) {
         connection.prepareStatement(
             "SELECT * FROM print_jobs WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') AND shop_id = ?",
