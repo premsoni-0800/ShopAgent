@@ -386,9 +386,22 @@ class PrintlyAgentApp : Application() {
             }
 
             if (exchange.requestMethod !in setOf("GET", "HEAD")) {
+                // Buffered and sent with a known length rather than streamed
+                // chunked. An API request body is a few hundred bytes, so there
+                // is nothing to gain by streaming it - and streaming costs the
+                // ability to replay it. HttpURLConnection cannot re-send a
+                // streamed body, so it answers anything that needs the request
+                // repeated - an authentication challenge above all - by
+                // throwing HttpRetryException instead of returning the status.
+                // That landed in the catch below, which replied 502 with an
+                // empty body, and an empty body is exactly the case the
+                // dashboard can say nothing useful about: "Mark as Collected"
+                // came back as "Something went wrong", only in the desktop app,
+                // because only the desktop app has this proxy in front of it.
+                val body = exchange.requestBody.use { it.readBytes() }
                 connection.doOutput = true
-                connection.setChunkedStreamingMode(0)
-                exchange.requestBody.use { input -> connection.outputStream.use { input.copyTo(it) } }
+                connection.setFixedLengthStreamingMode(body.size)
+                connection.outputStream.use { it.write(body) }
             }
 
             val status = connection.responseCode
@@ -418,9 +431,35 @@ class PrintlyAgentApp : Application() {
                 }
             }
         } catch (exc: Exception) {
-            // Routine when the page closes an SSE stream, so not worth shouting about.
-            log.log(Level.FINE, "api_proxy_failed path=${exchange.requestURI.path}", exc)
-            runCatching { exchange.sendResponseHeaders(502, -1) }
+            // A page closing an SSE stream lands here routinely and is not worth
+            // shouting about. Anything else is a request the shop made and did
+            // not get an answer to, and hiding those at FINE is how a broken
+            // button stayed unexplained: the log said nothing and the reply had
+            // no body to explain itself either.
+            val streaming = exchange.requestURI.path.endsWith("/events")
+            if (streaming) {
+                log.log(Level.FINE, "api_proxy_stream_closed path=${exchange.requestURI.path}", exc)
+            } else {
+                log.log(Level.WARNING, "api_proxy_failed path=${exchange.requestURI.path}", exc)
+            }
+
+            // With a reason in it. The dashboard shows the server's own sentence
+            // when there is one, and a bodyless 502 leaves it nothing to show
+            // but a shrug.
+            runCatching {
+                val reason = (exc.message ?: exc.javaClass.simpleName).take(300)
+                val payload = core.api.mapper.writeValueAsBytes(
+                    mapOf(
+                        "error" to mapOf(
+                            "code" to "AGENT_PROXY_FAILED",
+                            "message" to "The desktop app could not reach the Printly server: $reason",
+                        ),
+                    ),
+                )
+                exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
+                exchange.sendResponseHeaders(502, payload.size.toLong())
+                exchange.responseBody.use { it.write(payload) }
+            }
         } finally {
             exchange.close()
         }
