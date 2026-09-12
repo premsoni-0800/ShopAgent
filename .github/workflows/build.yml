@@ -41,9 +41,10 @@ jobs:
           path: build/reports/tests/test
           retention-days: 7
 
-      # No WiX Toolset on the hosted runner, so this produces the app-image
-      # (a standalone folder bundling its own JRE) rather than an MSI/EXE
-      # installer - see build.gradle.kts's jpackageMsi task for that variant.
+      # The portable variant: a folder with its own bundled JRE, run by
+      # double-clicking PrintlyAgent.exe. Needs no installer, no admin rights
+      # and no Java on the shop PC, so it stays the fallback for a machine
+      # where an MSI cannot be installed.
       - name: Package app image
         run: .\gradlew.bat jpackageAppImage --console=plain
         shell: pwsh
@@ -51,6 +52,31 @@ jobs:
       - name: Upload app image
         uses: actions/upload-artifact@v4
         with:
-          name: PrintlyAgent-app-image
+          name: PrintlyAgent-portable
           path: build/jpackage/PrintlyAgent
-          retention-days: 7
+          retention-days: 30
+
+      # jpackage shells out to WiX v3's candle.exe/light.exe to build an MSI.
+      # windows-latest ships WiX 3.14 and puts %WIX%\bin on the machine PATH
+      # already, so this is a guard rather than the normal path. It has to be
+      # v3 specifically: v4+ replaced candle/light with a single wix.exe that
+      # JDK 17's jpackage cannot drive (JDK-8319457, fixed only in JDK 24).
+      - name: Ensure WiX v3 is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --no-progress -y
+            "$env:WIX\bin" | Out-File $env:GITHUB_PATH -Append
+          }
+          candle.exe -? | Select-Object -First 1
+
+      - name: Build MSI installer
+        run: .\gradlew.bat jpackageMsi --console=plain
+        shell: pwsh
+
+      - name: Upload MSI installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrintlyAgent-msi-installer
+          path: build/jpackage/*.msi
+          retention-days: 30
