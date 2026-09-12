@@ -31,6 +31,28 @@ class DatabaseTest {
         }
     }
 
+    /**
+     * A job that is being handed to a driver may already be printing, so it is
+     * not safe to replay on restart - that is the whole reason SUBMITTING
+     * exists. DOWNLOADED is safe, and has to stay safe, or an ordinary crash
+     * between downloading and printing would need a human every time.
+     */
+    @Test
+    fun `a job on its way to the printer is never resumed`(@TempDir tempDir: Path) {
+        Database(tempDir.resolve("agent.db")).use { db ->
+            val shop = "11111111-1111-1111-1111-111111111111"
+            db.insertJobReference("job-downloaded", "order-1", "HH-000001", shopId = shop)
+            db.insertJobReference("job-submitting", "order-2", "HH-000002", shopId = shop)
+            db.updateJobState("job-downloaded", "DOWNLOADED")
+            db.updateJobState("job-submitting", "SUBMITTING")
+
+            val resumable = db.resumableJobs(shop).map { it.jobId }
+
+            assertTrue("job-downloaded" in resumable, "nothing has reached a printer, so replaying is safe")
+            assertFalse("job-submitting" in resumable, "this one may be 150 pages into a 300-page order")
+        }
+    }
+
     @Test
     fun `unresolvedJobs excludes terminal states`(@TempDir tempDir: Path) {
         Database(tempDir.resolve("agent.db")).use { db ->

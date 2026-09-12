@@ -22,6 +22,7 @@ import com.printly.agent.printing.SpoolerOutcomePoller
 import com.printly.agent.printing.downloadDocument
 import com.printly.agent.printing.printPdf
 import com.printly.agent.printing.validatePdf
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -61,6 +62,20 @@ const val RECEIVED = "RECEIVED"
 const val VALIDATING = "VALIDATING"
 const val DOWNLOADING = "DOWNLOADING"
 const val DOWNLOADED = "DOWNLOADED"
+
+/**
+ * The document is being handed to a printer driver, and may already be coming
+ * out of it.
+ *
+ * This exists to mark where "nothing has printed yet" stops being true.
+ * Without it a job read DOWNLOADED for the whole time it was printing -
+ * `printPdf` blocks until the driver has finished the entire document, and
+ * SUBMITTED was not reached until afterwards - so a job halfway through a
+ * 300-page order looked, to [Database.resumableJobs], exactly like one that
+ * had downloaded and never started. A restart replayed it, and the shop
+ * printed the whole thing again on top of what was already in the tray.
+ */
+const val SUBMITTING = "SUBMITTING"
 const val SUBMITTED = "SUBMITTED"
 const val PRINTING = "PRINTING"
 const val COMPLETED = "COMPLETED"
@@ -76,7 +91,11 @@ private val ALLOWED_NEXT: Map<String, Set<String>> = mapOf(
     RECEIVED to setOf(VALIDATING, CANCELLED),
     VALIDATING to setOf(DOWNLOADING, FAILED, CANCELLED),
     DOWNLOADING to setOf(DOWNLOADED, DOWNLOADING, FAILED, CANCELLED), // DOWNLOADING->DOWNLOADING is a bounded retry
-    DOWNLOADED to setOf(SUBMITTED, FAILED, CANCELLED),
+    // No edge to SUBMITTED: everything reaches it through SUBMITTING, so the
+    // state machine itself enforces that a job is never recorded as printing
+    // without first being recorded as about to.
+    DOWNLOADED to setOf(SUBMITTING, FAILED, CANCELLED),
+    SUBMITTING to setOf(SUBMITTED, FAILED, CANCELLED, UNKNOWN),
     SUBMITTED to setOf(PRINTING, FAILED),
     PRINTING to setOf(COMPLETED, FAILED, UNKNOWN),
 )
@@ -212,6 +231,11 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
     val row = ctx.db.getJob(jobId)
     if (row == null || row.state in TERMINAL) return
 
+    // Whether anything has been handed to a printer driver yet. Past that
+    // point no error may be reported as FAILED, however it arrives: the shop
+    // reads FAILED as "print it again", and the pages are already out.
+    var reachedPrinter = false
+
     try {
         val detail = claim(ctx, jobId) ?: return
         val downloaded = downloadWithRetry(ctx, jobId, detail) ?: return
@@ -221,7 +245,15 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
             transition(ctx, jobId, DOWNLOADED)
             pingProgress(ctx, jobId, PrintJobProgressStage.PRINTING)
             val printers = withContext(Dispatchers.IO) { discoverPrinters() }
-            submissions = withContext(Dispatchers.IO) { selectAndPrint(detail, downloaded, printers) }
+            submissions = withContext(Dispatchers.IO) {
+                selectAndPrint(detail, downloaded, printers) { printerName ->
+                    // Fired once, immediately before the first page is handed
+                    // to a driver. Everything after this point has to assume
+                    // paper may already be moving.
+                    reachedPrinter = true
+                    transition(ctx, jobId, SUBMITTING, printerWindowsName = printerName)
+                }
+            }
         } catch (exc: DocumentValidationError) {
             fail(ctx, jobId, exc.message ?: "invalid document", PrintJobFailureReason.DOCUMENT_INVALID)
             return
@@ -249,8 +281,19 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
         // when something goes wrong later, which one to go and look at.
         val printerUsed = submissions.last().first
         transition(ctx, jobId, SUBMITTED, printerWindowsName = printerUsed)
-        withContext(Dispatchers.IO) {
-            ctx.api.reportStatus(ctx.credential, jobId, PrintJobStatus.PRINT_SUBMITTED, printerName = printerUsed)
+        // Best-effort, deliberately. The driver has the document either way and
+        // the outcome report that follows carries the real answer. Letting a
+        // failure here escape would hand a printed order to the catch-all
+        // below - and the backend is a cold-starting host, so a timeout on
+        // this call is an ordinary event, not evidence anything went wrong.
+        try {
+            withContext(Dispatchers.IO) {
+                ctx.api.reportStatus(ctx.credential, jobId, PrintJobStatus.PRINT_SUBMITTED, printerName = printerUsed)
+            }
+        } catch (exc: CancellationException) {
+            throw exc
+        } catch (exc: Exception) {
+            log.log(Level.WARNING, "print_job_submitted_report_failed job=$jobId", exc)
         }
 
         // javax.print's blocking submit call only proves the driver accepted
@@ -275,8 +318,21 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
         when (result.outcome) {
             PrintOutcome.COMPLETED -> {
                 transition(ctx, jobId, COMPLETED)
-                withContext(Dispatchers.IO) { ctx.api.reportStatus(ctx.credential, jobId, PrintJobStatus.PRINT_COMPLETED) }
-                log.info("print_job_completed job=$jobId")
+                try {
+                    withContext(Dispatchers.IO) { ctx.api.reportStatus(ctx.credential, jobId, PrintJobStatus.PRINT_COMPLETED) }
+                    log.info("print_job_completed job=$jobId")
+                } catch (exc: CancellationException) {
+                    throw exc
+                } catch (exc: Exception) {
+                    // The pages printed; the only thing that failed was saying
+                    // so. Leaving it COMPLETED strands the order on the backend
+                    // as forever-printing, with nothing left locally to move it
+                    // on - COMPLETED is terminal here, so no sweep looks at it
+                    // again. UNKNOWN is the state that means a person has to
+                    // look, which is exactly what is wanted, and it is
+                    // emphatically not FAILED.
+                    markUnknown(ctx, jobId, "the pages printed, but the server could not be told: $exc")
+                }
             }
             PrintOutcome.FAILED ->
                 fail(ctx, jobId, "the printer reported an error after accepting the job", PrintJobFailureReason.PRINTER_ERROR)
@@ -294,9 +350,20 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
                         ?: "could not confirm the print finished before the spooler check timed out",
                 )
         }
+    } catch (exc: CancellationException) {
+        // Shutting down is not a print failure. CancellationException is an
+        // IllegalStateException, so without this it lands in the catch-all
+        // below and the agent marks a job FAILED on its way out of the door -
+        // closing the app mid-print then has the shop reprint, in the morning,
+        // a document that was already in the tray.
+        throw exc
     } catch (exc: Exception) { // a bug here must not crash the agent process
         log.log(Level.SEVERE, "print_job_pipeline_error job=$jobId", exc)
-        fail(ctx, jobId, "unexpected error: $exc", PrintJobFailureReason.UNKNOWN)
+        if (reachedPrinter) {
+            markUnknown(ctx, jobId, "unexpected error after the document reached the printer: $exc")
+        } else {
+            fail(ctx, jobId, "unexpected error: $exc", PrintJobFailureReason.UNKNOWN)
+        }
     }
 }
 
@@ -320,6 +387,11 @@ private suspend fun downloadWithRetry(ctx: JobContext, jobId: String, detail: Pr
     for (attempt in 1..ctx.maxRetryAttempts) {
         try {
             return downloadAll(ctx, jobId, detail)
+        } catch (exc: CancellationException) {
+            // Also an IllegalStateException, so without this it is reported as
+            // "job state no longer allows downloading: Job was cancelled" and
+            // fails a download that was going perfectly well.
+            throw exc
         } catch (exc: IllegalStateException) {
             // The state machine refused the move. Retrying cannot help - the
             // state will be the same next time - and doing so anyway spent
@@ -357,8 +429,21 @@ private suspend fun downloadAll(ctx: JobContext, jobId: String, detail: PrintJob
     return downloaded
 }
 
-/** Returns `(windowsPrinterName, jobNameToken)` per item, in print order - every one is polled before deciding the job's own outcome. */
-private fun selectAndPrint(detail: PrintJobDetail, downloaded: Map<String, Path>, printers: List<LocalPrinter>): List<Pair<String, String>> {
+/**
+ * Returns `(windowsPrinterName, jobNameToken)` per item, in print order -
+ * every one is polled before deciding the job's own outcome.
+ *
+ * [onAboutToPrint] is called exactly once, with the printer chosen for the
+ * first item, in the moment between "nothing has been sent" and "something
+ * has". Everything before it - validation, discovery, selection - can still be
+ * replayed safely; nothing after it can.
+ */
+private suspend fun selectAndPrint(
+    detail: PrintJobDetail,
+    downloaded: Map<String, Path>,
+    printers: List<LocalPrinter>,
+    onAboutToPrint: suspend (printerName: String) -> Unit,
+): List<Pair<String, String>> {
     val submissions = mutableListOf<Pair<String, String>>()
     val services = PrintServiceLookup.lookupPrintServices(null, null).associateBy { it.name }
 
@@ -371,6 +456,7 @@ private fun selectAndPrint(detail: PrintJobDetail, downloaded: Map<String, Path>
             ?: throw NoCompatiblePrinterException("printer ${printer.windowsPrinterName} not found in javax.print registry")
 
         val options = PrintOptions(item.colorMode, item.duplexMode, item.paperSize, item.copies, item.pageRange)
+        if (submissions.isEmpty()) onAboutToPrint(printer.windowsPrinterName)
         val jobNameToken = printPdf(service, validated.path, options, validated.pageCount)
         submissions.add(printer.windowsPrinterName to jobNameToken)
     }

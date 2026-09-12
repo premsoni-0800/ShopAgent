@@ -8,10 +8,35 @@ class JobPipelineStateMachineTest {
 
     @Test
     fun `happy path is allowed step by step`() {
-        val path = listOf(RECEIVED, VALIDATING, DOWNLOADING, DOWNLOADED, SUBMITTED, PRINTING, COMPLETED)
+        val path = listOf(RECEIVED, VALIDATING, DOWNLOADING, DOWNLOADED, SUBMITTING, SUBMITTED, PRINTING, COMPLETED)
         for (i in 0 until path.size - 1) {
             assertTrue(canTransition(path[i], path[i + 1]), "${path[i]} -> ${path[i + 1]} should be allowed")
         }
+    }
+
+    /**
+     * The state machine is what enforces that a job cannot be recorded as
+     * printing without first being recorded as about to print. That matters
+     * because SUBMITTING is the marker [com.printly.agent.db.Database
+     * .resumableJobs] uses to decide a job is no longer safe to replay - if
+     * anything could reach SUBMITTED around it, a job could be printing while
+     * still looking replayable, and a restart would print it twice.
+     */
+    @Test
+    fun `nothing reaches submitted without passing through submitting`() {
+        assertTrue(canTransition(DOWNLOADED, SUBMITTING))
+        assertTrue(canTransition(SUBMITTING, SUBMITTED))
+        assertFalse(canTransition(DOWNLOADED, SUBMITTED), "DOWNLOADED is still replayable; SUBMITTED is not")
+        assertFalse(canTransition(DOWNLOADING, SUBMITTED))
+        assertFalse(canTransition(VALIDATING, SUBMITTING))
+    }
+
+    /** A job that never got as far as the driver is still an honest failure. */
+    @Test
+    fun `submitting can still fail or be cancelled`() {
+        assertTrue(canTransition(SUBMITTING, FAILED))
+        assertTrue(canTransition(SUBMITTING, CANCELLED))
+        assertTrue(canTransition(SUBMITTING, UNKNOWN))
     }
 
     @Test
