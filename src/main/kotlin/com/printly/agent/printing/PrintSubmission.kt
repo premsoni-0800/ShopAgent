@@ -100,12 +100,25 @@ fun printPdf(service: PrintService, pdfPath: Path, options: PrintOptions, docume
         // A "print-to-file" driver (Microsoft Print to PDF, XPS Document
         // Writer, ...) asks the OS for a destination filename via a native
         // Save-As dialog on every job unless one is supplied up front - fatal
-        // for an unattended agent, since nothing is there to click it. Only
-        // such drivers advertise support for this attribute at all (a real
-        // physical printer does not), so this is a no-op everywhere else.
-        // Doubles as this project's virtual-printer output for dev/testing -
-        // see the master prompt's "Virtual Printer -> Output PDF" step.
-        if (service.isAttributeCategorySupported(Destination::class.java)) {
+        // for an unattended agent, since nothing is there to click it.
+        //
+        // Which driver gets one is decided by name, and never by asking
+        // whether the service supports Destination. That check looked like the
+        // principled way to do it and is actively dangerous: every Windows
+        // print service - physical or virtual - is the same
+        // sun.print.Win32PrintService, and all of them answer true, because
+        // "print to file" is a capability Windows offers for any printer.
+        // Attaching a file destination to a real printer does not print the
+        // document; it silently writes it to disk. The spooler still sees a
+        // completed job, so the pipeline would report PRINT_COMPLETED, the
+        // order would go READY, and the student would be told to collect
+        // paper that was never printed.
+        //
+        // So the default is to print normally, and only a driver recognised as
+        // print-to-file is redirected. Getting that wrong for an unlisted
+        // virtual printer costs a stuck dialog on a dev machine; getting it
+        // wrong the other way costs a customer their order.
+        if (isPrintToFileDriver(service.name)) {
             val outputDir = virtualPrinterOutputDir()
             Files.createDirectories(outputDir)
             attributes.add(Destination(outputDir.resolve("$jobNameToken.pdf").toUri()))
@@ -122,6 +135,41 @@ fun printPdf(service: PrintService, pdfPath: Path, options: PrintOptions, docume
 
     return jobNameToken
 }
+
+/**
+ * Whether this printer writes a file instead of putting ink on paper.
+ *
+ * Matched by name because Windows offers nothing better to match on: physical
+ * and virtual printers are the same `sun.print.Win32PrintService` and both
+ * report Destination as supported, so there is no capability that separates
+ * them (see [printPdf] for what going by that capability would cost).
+ *
+ * Substring matching keeps this working across the suffixes Windows adds to
+ * driver names ("OneNote (Desktop)", "Foxit Reader PDF Printer", a "(Copy 1)"
+ * on a reinstall). An unrecognised virtual printer simply prints normally and
+ * shows its dialog - the safe direction to be wrong in, and visible
+ * immediately, unlike the alternative.
+ */
+internal fun isPrintToFileDriver(printerName: String): Boolean {
+    val name = printerName.lowercase()
+    return PRINT_TO_FILE_DRIVER_MARKERS.any { it in name }
+}
+
+/** Lowercase, matched as substrings. Windows' own virtual drivers plus the PDF printers commonly installed alongside them. */
+private val PRINT_TO_FILE_DRIVER_MARKERS = listOf(
+    "print to pdf",
+    "xps document writer",
+    "onenote",
+    "adobe pdf",
+    "pdfcreator",
+    "cutepdf",
+    "bullzip",
+    "dopdf",
+    "primopdf",
+    "nitro pdf",
+    "foxit reader pdf printer",
+    "microsoft shared fax driver",
+)
 
 /** Where a print-to-file driver's output actually lands - not a secret, not customer data retention (it's the agent's own already-printed copy, in its own app-data folder, not a shop-browsable location). */
 internal fun virtualPrinterOutputDir(): Path {
