@@ -23,7 +23,17 @@ data class Settings(
     val dbPath: Path,
     val logDir: Path,
     val tempDir: Path,
-    val heartbeatIntervalSeconds: Long = 45,
+    val heartbeatIntervalSeconds: Long = 10,
+    /**
+     * How often to ask the backend outright for work, independently of the
+     * SSE stream. The stream is the fast path and normally delivers a job in
+     * well under a second; this is what makes the agent autonomous when the
+     * stream is not delivering - a connection that died without the socket
+     * closing, a push dropped mid-deploy, a job created while reconnecting.
+     * Reconciling is free when there is nothing to do: the id is already in
+     * the local database, so it never re-prints anything.
+     */
+    val jobReconcileIntervalSeconds: Long = 10,
     val reconnectBaseDelaySeconds: Double = 1.0,
     val reconnectMaxDelaySeconds: Double = 60.0,
     val downloadTimeoutSeconds: Long = 60,

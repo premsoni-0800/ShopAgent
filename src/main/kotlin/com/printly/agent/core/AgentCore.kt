@@ -74,6 +74,7 @@ class AgentCore(val settings: Settings) {
             scope.launch { sse.runForever() },
             scope.launch { orderEvents.runForever() },
             scope.launch { scheduledJobsLoop() },
+            scope.launch { jobReconcileLoop() },
         )
     }
 
@@ -321,6 +322,40 @@ class AgentCore(val settings: Settings) {
                 }
             }
             delay(scheduledJobCheckInterval.toMillis())
+        }
+    }
+
+    /**
+     * Asks the backend outright for outstanding work, independently of the SSE
+     * stream.
+     *
+     * The stream is the fast path and normally delivers a job in under a
+     * second, but it is not something to stake unattended operation on: a
+     * connection can stop delivering without ever closing (so no reconnect,
+     * and no reconnect means no reconcile), a push can be dropped while the
+     * backend restarts mid-deploy, and a job created during a reconnect window
+     * belongs to neither side. This loop is what makes the agent autonomous
+     * rather than merely reactive - the worst case for any job becomes one
+     * interval, not "until something else happens to wake the stream".
+     *
+     * Safe to run as often as we like: [handleJobReference] keys off the local
+     * database, so a job id already seen is dropped before any printer is
+     * touched. A pass with nothing new costs one GET.
+     */
+    private suspend fun jobReconcileLoop() {
+        while (true) {
+            delay(settings.jobReconcileIntervalSeconds * 1000)
+            val credential = agentCredential ?: continue
+            try {
+                val outstanding = withContext(Dispatchers.IO) { api.outstandingJobs(credential) }
+                for (job in outstanding) {
+                    onJobReference(job.jobId, job.orderId, job.orderCode)
+                }
+            } catch (exc: Exception) {
+                // Expected whenever the backend is briefly unreachable; the
+                // next pass is seconds away, so this is not worth escalating.
+                log.log(Level.FINE, "job_reconcile_failed", exc)
+            }
         }
     }
 }
