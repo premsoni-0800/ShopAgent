@@ -15,6 +15,7 @@ import com.printly.agent.net.PrintlyApiClient
 import com.printly.agent.printers.discoverPrinters
 import com.printly.agent.printing.sweepOrphanedDocuments
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -373,8 +374,20 @@ class AgentCore(val settings: Settings) {
     private fun onJobReference(jobId: String, orderId: String, orderCode: String?) {
         val credential = agentCredential ?: return
         intake.submit(jobId) {
-            val scheduledPrintAt = computeScheduledPrintAt(orderId)
-            handleJobReference(jobContext(credential), printQueue, jobId, orderId, orderCode, scheduledPrintAt)
+            val plan = schedulePlanFor(orderScheduledSlotStart(orderId), scheduledPrintLeadTime, Instant.now())
+            when (plan) {
+                is SchedulePlan.PrintAt ->
+                    handleJobReference(jobContext(credential), printQueue, jobId, orderId, orderCode, plan.at)
+                // Deliberately records nothing. Recording the job means deciding
+                // when to print it, and that is the one thing this path could
+                // not find out - so it is left to the ten-second reconciliation
+                // poll, which re-lists every outstanding job and brings this one
+                // back here to be asked again. Printing it now instead is what
+                // sent a six o'clock order out at eleven in the morning, to sit
+                // on the counter all day.
+                SchedulePlan.Hold ->
+                    log.warning("scheduled_lookup_deferred job=$jobId order=$orderId")
+            }
         }
     }
 
@@ -398,27 +411,44 @@ class AgentCore(val settings: Settings) {
         onEvent = ::onJobProgress,
     )
 
-    /** None means "print as soon as claimed" - no scheduled slot, or it (or its lead-time offset) is already in the past. */
-    private suspend fun computeScheduledPrintAt(orderId: String): String? {
-        val slotStartRaw = orderScheduledSlotStart(orderId) ?: return null
-        val slotStart = try {
-            Instant.parse(slotStartRaw)
-        } catch (exc: DateTimeParseException) {
-            log.warning("unparseable_scheduled_slot_start orderId=$orderId value=$slotStartRaw")
-            return null
-        }
-        val printAt = slotStart.minus(scheduledPrintLeadTime)
-        if (!printAt.isAfter(Instant.now())) return null
-        return printAt.toString()
-    }
-
+    /**
+     * Asks the backend when this order is due, and says plainly when it could
+     * not find out.
+     *
+     * The distinction is the whole point. This used to catch everything and
+     * answer null, and null already meant "no slot, print it now" - so a
+     * momentary 500, a timeout against a cold-starting host, or a token that
+     * had just aged out all read as "this order is not scheduled". A six
+     * o'clock slot discovered at eleven in the morning printed at eleven in
+     * the morning, which is precisely what the scheduling exists to stop.
+     *
+     * Only an answer from the server is treated as an answer. A client error
+     * is not worth retrying - a 404 for an order that is gone will say the
+     * same thing every time - but anything that might succeed later says so.
+     */
     @Suppress("UNCHECKED_CAST")
-    private fun orderScheduledSlotStart(orderId: String): String? = try {
-        val order = ownerRequest { s -> api.ownerGet(s, "/api/v1/shop/${s.shopId}/orders/$orderId") }
-        (order as? Map<String, Any?>)?.get("scheduledSlotStart") as? String
+    private suspend fun orderScheduledSlotStart(orderId: String): ScheduleLookup = try {
+        // On Dispatchers.IO because ownerGet blocks, and this runs on the
+        // shared Default dispatcher the print queue's own workers live on.
+        val order = withContext(Dispatchers.IO) {
+            ownerRequest { s -> api.ownerGet(s, "/api/v1/shop/${s.shopId}/orders/$orderId") }
+        }
+        ScheduleLookup.Known((order as? Map<String, Any?>)?.get("scheduledSlotStart") as? String)
+    } catch (exc: CancellationException) {
+        throw exc
+    } catch (exc: ApiError) {
+        if (exc.statusCode in 400..499) {
+            // ownerRequest has already refreshed and retried once, so a 401
+            // here means the owner is signed out, not that the token aged out.
+            log.warning("order_schedule_lookup_refused orderId=$orderId status=${exc.statusCode} code=${exc.code}")
+            ScheduleLookup.Refused
+        } else {
+            log.log(Level.WARNING, "order_schedule_lookup_unavailable orderId=$orderId", exc)
+            ScheduleLookup.Unavailable
+        }
     } catch (exc: Exception) {
-        log.log(Level.SEVERE, "order_lookup_for_schedule_failed orderId=$orderId", exc)
-        null
+        log.log(Level.WARNING, "order_schedule_lookup_unavailable orderId=$orderId", exc)
+        ScheduleLookup.Unavailable
     }
 
     private suspend fun scheduledJobsLoop() {
@@ -490,5 +520,55 @@ class AgentCore(val settings: Settings) {
                 log.log(Level.FINE, "job_reconcile_failed", exc)
             }
         }
+    }
+}
+
+/** What the backend could tell the agent about an order's slot. */
+internal sealed interface ScheduleLookup {
+    /** The server answered. [slotStart] is null when the order genuinely has no slot. */
+    data class Known(val slotStart: String?) : ScheduleLookup
+
+    /** It could not be asked, and asking again shortly might work - a 5xx, a timeout, a dropped connection. */
+    object Unavailable : ScheduleLookup
+
+    /** It refused, and will refuse again - a 404 for an order that is gone, or a 401 once the owner is signed out. */
+    object Refused : ScheduleLookup
+}
+
+/** What to do about it. */
+internal sealed interface SchedulePlan {
+    /** Record the job and print it at [at]; null means as soon as it is claimed. */
+    data class PrintAt(val at: String?) : SchedulePlan
+
+    /** Establish nothing and record nothing, so the reconciliation poll asks again. */
+    object Hold : SchedulePlan
+}
+
+/**
+ * Turns what the lookup found into what the agent should do.
+ *
+ * Printing early and never printing at all are both real harms, so they are
+ * weighed rather than one being picked outright. A failure that might clear
+ * holds the job: the reconciliation poll re-lists it within ten seconds, and a
+ * scheduled order is by definition one with time to spare. A failure that will
+ * not clear prints it now, because the alternative there is an order that
+ * never comes out at all.
+ *
+ * A slot already upon us is not a schedule, it is a job to print now - which
+ * is also what an order with no slot at all, or an unreadable one, deserves.
+ */
+internal fun schedulePlanFor(lookup: ScheduleLookup, leadTime: Duration, now: Instant): SchedulePlan = when (lookup) {
+    ScheduleLookup.Unavailable -> SchedulePlan.Hold
+    ScheduleLookup.Refused -> SchedulePlan.PrintAt(null)
+    is ScheduleLookup.Known -> {
+        val slotStart = lookup.slotStart?.let {
+            try {
+                Instant.parse(it)
+            } catch (exc: DateTimeParseException) {
+                null
+            }
+        }
+        val printAt = slotStart?.minus(leadTime)
+        if (printAt == null || !printAt.isAfter(now)) SchedulePlan.PrintAt(null) else SchedulePlan.PrintAt(printAt.toString())
     }
 }
