@@ -4,6 +4,7 @@ import com.printly.agent.credentials.CredentialStore
 import com.printly.agent.net.ApiError
 import com.printly.agent.net.PrintlyApiClient
 import java.util.UUID
+import java.util.logging.Level
 import java.util.logging.Logger
 
 /**
@@ -77,7 +78,7 @@ object Auth {
      */
     fun ensurePaired(api: PrintlyApiClient, session: CredentialStore.OwnerSession): CredentialStore.AgentCredential {
         val existing = CredentialStore.loadAgentCredential()
-        if (existing != null && existing.shopId == session.shopId) return existing
+        if (existing != null && existing.shopId == session.shopId && stillValid(api, existing)) return existing
 
         return try {
             pairAndExchange(api, session)
@@ -86,6 +87,37 @@ object Auth {
             revokeStaleRegistrationForThisMachine(api, session)
             pairAndExchange(api, session)
         }
+    }
+
+    /**
+     * Whether a stored credential still works, asked of the server rather than
+     * assumed.
+     *
+     * Holding one is not the same as being paired. The owner can revoke this
+     * machine from the dashboard, or another PC can take the shop's
+     * registration - and the stored secret looks exactly the same afterwards.
+     * Trusting it on sight left the agent retrying a dead credential every ten
+     * seconds forever, with no way to recover from inside the app: re-pairing
+     * returned the same rejected credential it already had.
+     *
+     * A rejection is the only thing that discards it. A network failure
+     * deliberately does not: the credential is probably fine, the connection
+     * is not, and throwing away a working pairing because the wifi dropped
+     * would turn a blip into an unpairing.
+     */
+    private fun stillValid(api: PrintlyApiClient, credential: CredentialStore.AgentCredential): Boolean = try {
+        api.heartbeat(credential, AGENT_VERSION)
+        true
+    } catch (exc: ApiError) {
+        val rejected = exc.statusCode == 401 || exc.statusCode == 403
+        if (rejected) {
+            log.info("stored_agent_credential_rejected code=${exc.code} - pairing again")
+            CredentialStore.clearAgentCredential()
+        }
+        !rejected
+    } catch (exc: Exception) {
+        log.log(Level.FINE, "agent_credential_check_unreachable", exc)
+        true
     }
 
     private fun pairAndExchange(api: PrintlyApiClient, session: CredentialStore.OwnerSession): CredentialStore.AgentCredential {

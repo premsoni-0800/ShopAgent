@@ -15,9 +15,28 @@ data class SelectionResult(val printer: LocalPrinter?, val reason: String? = nul
  * because a printer was available.
  */
 fun selectPrinter(item: PrintJobItem, printers: List<LocalPrinter>): SelectionResult {
+    // Whether this machine has any real printer at all, judged across every
+    // printer rather than only the usable ones - a shop whose only laser is
+    // offline still has a laser, and the right answer then is "this cannot be
+    // printed now", not "written to a file instead".
+    val hasPhysicalPrinter = printers.any { !isPrintToFileDriver(it.windowsPrinterName) }
+
     val candidates = printers
         .filter { it.status != PrinterReportedStatus.OFFLINE && it.status != PrinterReportedStatus.ERROR }
         .filterNot { provenIncompatible(item, it) }
+        // Never quietly swap a real printer for one that writes a file.
+        //
+        // Scoring alone was not enough. A mono laser is *proven incompatible*
+        // with a colour job and drops out above, leaving "Microsoft Print to
+        // PDF" as the only candidate - so the shop's colour order would be
+        // written to disk, reported PRINT_COMPLETED, and the student told to
+        // come and collect paper that was never printed. Failing with
+        // PRINTER_INCOMPATIBLE is the honest answer: a shop with only a mono
+        // laser genuinely cannot fulfil a colour order, and needs to be told.
+        //
+        // Still selectable when there is nothing else on the machine, which is
+        // every dev box and this project's own test setup.
+        .filterNot { hasPhysicalPrinter && isPrintToFileDriver(it.windowsPrinterName) }
 
     if (candidates.isEmpty()) return SelectionResult(printer = null, reason = "PRINTER_INCOMPATIBLE")
 
@@ -34,21 +53,6 @@ private fun provenIncompatible(item: PrintJobItem, printer: LocalPrinter): Boole
 
 private fun score(item: PrintJobItem, printer: LocalPrinter): Int {
     var score = 0
-    // A printer that writes a file is the last thing a shop wants chosen: the
-    // order never reaches paper, yet everything downstream reports success
-    // and the student is told to come and collect it.
-    //
-    // This is not hypothetical. "Microsoft Print to PDF" is the Windows
-    // default on a great many machines, and it advertises colour and every
-    // common paper size - so on a shop PC with a mono laser attached it
-    // outscored the real printer on the two things that matter most here
-    // (+10 for being the default, +3 for proven paper support) and would have
-    // quietly swallowed every job.
-    //
-    // Penalised rather than excluded, so a machine with nothing but virtual
-    // printers - any dev box, and this project's own testing setup - still
-    // selects one. The penalty only has to beat the highest real score.
-    if (isPrintToFileDriver(printer.windowsPrinterName)) score -= 100
     if (printer.isSystemDefault) score += 10
     if (item.colorMode == ColorMode.COLOR && printer.colorCapable == true) score += 3
     if (item.colorMode == ColorMode.BLACK_AND_WHITE && printer.colorCapable != null) score += 1

@@ -120,9 +120,14 @@ class PrinterSelectorTest {
         assertEquals("Microsoft Print to PDF", result.printer?.windowsPrinterName)
     }
 
-    /** A real printer that cannot do the job is still excluded - the penalty must not promote an unusable one. */
+    /**
+     * A shop with only a mono laser genuinely cannot fulfil a colour order,
+     * and has to be told so. Falling back to the PDF writer here would write
+     * the order to disk, report it printed, and send the student to collect
+     * paper that never existed - the failure this whole file exists to stop.
+     */
     @Test
-    fun `a colour job falls back to the PDF writer over a mono-only laser`() {
+    fun `a colour job a real printer cannot do fails rather than becoming a file`() {
         val printers = listOf(
             printer("Microsoft Print to PDF", colorCapable = true, paperSizes = setOf(PaperSize.A4)),
             printer("Hewlett-Packard HP LaserJet M1005", colorCapable = false, paperSizes = setOf(PaperSize.A4)),
@@ -130,6 +135,21 @@ class PrinterSelectorTest {
 
         val result = selectPrinter(item(colorMode = ColorMode.COLOR), printers)
 
-        assertEquals("Microsoft Print to PDF", result.printer?.windowsPrinterName)
+        assertNull(result.printer)
+        assertEquals("PRINTER_INCOMPATIBLE", result.reason)
+    }
+
+    /** Even an offline laser means this machine is a real printer's machine - its jobs wait, they do not become files. */
+    @Test
+    fun `an offline real printer does not hand the job to the PDF writer`() {
+        val printers = listOf(
+            printer("Microsoft Print to PDF", isDefault = true, colorCapable = true, paperSizes = setOf(PaperSize.A4)),
+            printer("Hewlett-Packard HP LaserJet M1005", status = PrinterReportedStatus.OFFLINE, paperSizes = setOf(PaperSize.A4)),
+        )
+
+        val result = selectPrinter(item(), printers)
+
+        assertNull(result.printer)
+        assertEquals("PRINTER_INCOMPATIBLE", result.reason)
     }
 }

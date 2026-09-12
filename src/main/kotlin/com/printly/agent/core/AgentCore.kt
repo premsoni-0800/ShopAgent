@@ -50,6 +50,19 @@ class AgentCore(val settings: Settings) {
     @Volatile var lastHeartbeatOk: Boolean = false
         private set
 
+    /**
+     * Set when the server answers the heartbeat with a rejection rather than
+     * not answering at all.
+     *
+     * The difference matters to whoever is looking at the screen. "Cannot
+     * reach the server" sends them to check the network; a revoked
+     * registration needs them to sign in again, and no amount of waiting or
+     * rebooting the router will fix it. Reporting the second as the first is
+     * how someone spends twenty minutes on the wrong problem.
+     */
+    @Volatile var credentialRejected: Boolean = false
+        private set
+
     /** Best-effort UI push - the JavaFX host wires this to `webEngine.executeScript(...)`. No-op headless. */
     var onEmit: (event: String, payload: Map<String, Any?>) -> Unit = { _, _ -> }
 
@@ -146,6 +159,7 @@ class AgentCore(val settings: Settings) {
         "shopId" to ownerSession?.shopId,
         "autoPrintEnabled" to autoPrintEnabled,
         "connected" to lastHeartbeatOk,
+        "credentialRejected" to credentialRejected,
         "agentVersion" to Auth.AGENT_VERSION,
         "computerName" to runCatching { java.net.InetAddress.getLocalHost().hostName }.getOrDefault("-"),
     )
@@ -246,9 +260,13 @@ class AgentCore(val settings: Settings) {
                     val result = withContext(Dispatchers.IO) { api.heartbeat(credential, Auth.AGENT_VERSION) }
                     autoPrintEnabled = result.autoPrintEnabled
                     lastHeartbeatOk = true
+                    credentialRejected = false
                 } catch (exc: Exception) {
                     log.log(Level.WARNING, "heartbeat_failed", exc)
                     lastHeartbeatOk = false
+                    // 401/403 is the server saying who this machine is no
+                    // longer holds - a different problem from not answering.
+                    credentialRejected = (exc as? ApiError)?.statusCode in setOf(401, 403)
                 }
                 // Push only on an actual flip - not every tick.
                 if ((lastHeartbeatOk to autoPrintEnabled) != before) onEmit("status", status())
