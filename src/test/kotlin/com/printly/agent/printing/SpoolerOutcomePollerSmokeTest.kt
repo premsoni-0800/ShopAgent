@@ -28,6 +28,6 @@ class SpoolerOutcomePollerSmokeTest {
         // resolves to COMPLETED, same as a real job that finished and was
         // removed. The point of this test is that the native call sequence
         // completes cleanly at all, not this particular outcome.
-        assertEquals(PrintOutcome.COMPLETED, outcome)
+        assertEquals(PrintOutcome.COMPLETED, outcome.outcome)
     }
 }

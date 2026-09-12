@@ -14,6 +14,8 @@ import com.printly.agent.printers.selectPrinter
 import com.printly.agent.printing.DocumentValidationError
 import com.printly.agent.printing.PrintOptions
 import com.printly.agent.printing.PrintOutcome
+import com.printly.agent.printing.PrinterCondition
+import com.printly.agent.printing.SpoolerOutcome
 import com.printly.agent.printing.PrintSubmissionError
 import com.printly.agent.printing.SpoolerOutcomePoller
 import com.printly.agent.printing.downloadDocument
@@ -210,9 +212,21 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
         // decided by asking the spooler what actually happened, same rule as
         // the module kdoc above.
         transition(ctx, jobId, PRINTING)
-        val outcome = withContext(Dispatchers.IO) { pollAllOutcomes(submissions, ctx.jobTimeoutSeconds) }
+        val result = withContext(Dispatchers.IO) {
+            pollAllOutcomes(submissions, ctx.jobTimeoutSeconds) { condition ->
+                // Recorded the moment it happens, so the shop's job list can
+                // say "out of paper" while the job is still waiting rather
+                // than only once it has timed out.
+                if (condition != null) {
+                    log.warning("print_job_blocked job=$jobId condition=${condition.name}")
+                    ctx.db.updateJobState(jobId, PRINTING, lastError = "waiting: ${condition.description}")
+                    ctx.db.recordEvent(jobId, "BLOCKED", condition.description)
+                    ctx.onEvent()
+                }
+            }
+        }
 
-        when (outcome) {
+        when (result.outcome) {
             PrintOutcome.COMPLETED -> {
                 transition(ctx, jobId, COMPLETED)
                 withContext(Dispatchers.IO) { ctx.api.reportStatus(ctx.credential, jobId, PrintJobStatus.PRINT_COMPLETED) }
@@ -221,7 +235,18 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
             PrintOutcome.FAILED ->
                 fail(ctx, jobId, "the printer reported an error after accepting the job", PrintJobFailureReason.PRINTER_ERROR)
             PrintOutcome.UNKNOWN ->
-                markUnknown(ctx, jobId, "could not confirm the print finished before the spooler check timed out")
+                // A stuck job is still in the queue and may yet print, so this
+                // is never reported as failed - that is what would let the
+                // shop reprint a page that then comes out anyway. Naming the
+                // condition turns "go and look at the printer" into something
+                // actionable.
+                markUnknown(
+                    ctx,
+                    jobId,
+                    result.condition
+                        ?.let { "still waiting: ${it.description}. The job is queued and prints once this is fixed." }
+                        ?: "could not confirm the print finished before the spooler check timed out",
+                )
         }
     } catch (exc: Exception) { // a bug here must not crash the agent process
         log.log(Level.SEVERE, "print_job_pipeline_error job=$jobId", exc)
@@ -300,13 +325,27 @@ private fun selectAndPrint(detail: PrintJobDetail, downloaded: Map<String, Path>
     return submissions
 }
 
-/** Any FAILED short-circuits immediately; COMPLETED only if every item resolved COMPLETED; UNKNOWN if any item's outcome could not be confirmed. */
-private fun pollAllOutcomes(submissions: List<Pair<String, String>>, timeoutSeconds: Double): PrintOutcome {
-    var worst = PrintOutcome.COMPLETED
+/**
+ * Any FAILED short-circuits immediately; COMPLETED only if every item resolved
+ * COMPLETED; UNKNOWN if any item's outcome could not be confirmed.
+ *
+ * [onCondition] fires while a job is stuck on something a person can fix, so
+ * the shop is told "out of paper" as it happens rather than after the timeout.
+ */
+private fun pollAllOutcomes(
+    submissions: List<Pair<String, String>>,
+    timeoutSeconds: Double,
+    onCondition: (PrinterCondition?) -> Unit,
+): SpoolerOutcome {
+    var worst = SpoolerOutcome(PrintOutcome.COMPLETED)
     for ((printerName, jobNameToken) in submissions) {
-        val outcome = SpoolerOutcomePoller.pollJobOutcome(printerName, jobNameToken, timeoutSeconds)
-        if (outcome == PrintOutcome.FAILED) return PrintOutcome.FAILED
-        if (outcome == PrintOutcome.UNKNOWN) worst = PrintOutcome.UNKNOWN
+        val result = SpoolerOutcomePoller.pollJobOutcome(
+            printerName, jobNameToken, timeoutSeconds, onCondition = onCondition,
+        )
+        if (result.outcome == PrintOutcome.FAILED) return result
+        // Keep the condition with the UNKNOWN it belongs to - it is the only
+        // thing that tells a human what to go and fix.
+        if (result.outcome == PrintOutcome.UNKNOWN) worst = result
     }
     return worst
 }
