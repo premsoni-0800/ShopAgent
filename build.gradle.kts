@@ -142,3 +142,71 @@ tasks.withType<Test> {
     useJUnitPlatform()
     testLogging { events("passed", "skipped", "failed") }
 }
+
+// ---------------------------------------------------------------------------
+// The shop dashboard, built from source rather than copied in by hand.
+//
+// The dashboard is a separate repo (premsoni-0800/printlypartner) whose built
+// `dist/` is served from inside this app. Vendoring that by hand is how a
+// build quietly ships a months-old UI: nothing fails, the bundle is simply
+// stale, and the only symptom is a fix that "didn't take".
+//
+// So the checkout is the source of truth when it is present, and the vendored
+// copy under src/main/resources/dashboard is a build output. It stays in git
+// because CI and anyone without the dashboard checked out still need to
+// produce a working MSI - the task is skipped, with a warning, rather than
+// failing the build.
+//
+// Point it elsewhere with -PdashboardDir=... or PRINTLY_DASHBOARD_DIR.
+// ---------------------------------------------------------------------------
+
+val dashboardDir: String = (project.findProperty("dashboardDir") as String?)
+    ?: System.getenv("PRINTLY_DASHBOARD_DIR")
+    ?: "../printlypartner-web"
+
+val vendoredDashboard = layout.projectDirectory.dir("src/main/resources/dashboard")
+
+abstract class BuildDashboardTask @Inject constructor(private val execOps: ExecOperations) : DefaultTask() {
+    @get:Input abstract val sourceDir: Property<String>
+    @get:OutputDirectory abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun run() {
+        val source = project.file(sourceDir.get())
+        if (!source.resolve("package.json").exists()) {
+            logger.warn(
+                "dashboard source not found at ${source.absolutePath} - keeping the vendored bundle as-is. " +
+                    "Set -PdashboardDir=<path> to rebuild it from source.",
+            )
+            return
+        }
+
+        // npm is a .cmd on Windows and has no extensionless sibling, so it
+        // cannot be exec'd directly the way it can elsewhere.
+        val npm = if (System.getProperty("os.name").startsWith("Windows", true)) "npm.cmd" else "npm"
+        if (!source.resolve("node_modules").exists()) {
+            execOps.exec { commandLine(npm, "ci"); workingDir = source }
+        }
+        execOps.exec { commandLine(npm, "run", "build"); workingDir = source }
+
+        val dist = source.resolve("dist")
+        if (!dist.exists()) throw GradleException("dashboard build produced no dist/ at ${dist.absolutePath}")
+
+        val target = outputDir.get().asFile
+        target.deleteRecursively()
+        target.mkdirs()
+        dist.copyRecursively(target, overwrite = true)
+        logger.lifecycle("dashboard rebuilt from ${source.absolutePath}")
+    }
+}
+
+val buildDashboard = tasks.register<BuildDashboardTask>("buildDashboard") {
+    group = "build"
+    description = "Builds the shop dashboard and vendors it into src/main/resources/dashboard"
+    sourceDir.set(dashboardDir)
+    outputDir.set(vendoredDashboard)
+}
+
+// Anything that packages the app gets the current dashboard, so an MSI can
+// never ship a bundle older than the checkout it was built from.
+tasks.named("processResources") { dependsOn(buildDashboard) }
