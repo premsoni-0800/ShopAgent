@@ -294,8 +294,21 @@ class PrintlyAgentApp : Application() {
         }
     }
 
-    private fun readResource(path: String): ByteArray? =
-        javaClass.getResourceAsStream(path)?.use { it.readBytes() }
+    /**
+     * Reads a bundled file. Refuses any path with a `..` segment in it.
+     *
+     * The name here is built from the request URI, and the classloader does not
+     * normalise the result: packaged as a jar the lookup simply misses, but run
+     * from a directory - `./gradlew run`, and so every developer machine - the
+     * traversal resolves and serves whatever it lands on.
+     */
+    private fun readResource(path: String): ByteArray? {
+        if (path.split('/').any { it == ".." }) {
+            log.warning("rejected_traversal path=$path")
+            return null
+        }
+        return javaClass.getResourceAsStream(path)?.use { it.readBytes() }
+    }
 
     /**
      * Whether a URL is this app's own UI, compared by parsed scheme/host/port
