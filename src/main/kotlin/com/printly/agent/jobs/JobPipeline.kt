@@ -109,27 +109,50 @@ private val log = Logger.getLogger("com.printly.agent.jobs.JobPipeline")
  * still in flight from an earlier delivery of the same reference - is
  * dropped here before any printer is ever touched again.
  */
-suspend fun handleJobReference(
+fun registerJobReference(
     ctx: JobContext,
     jobId: String,
     orderId: String,
     orderCode: String?,
     scheduledPrintAt: String? = null,
-) {
+): Boolean {
     val isNew = ctx.db.insertJobReference(jobId, orderId, orderCode, scheduledPrintAt, ctx.credential.shopId)
     if (!isNew) {
         log.fine("duplicate_job_reference_ignored job=$jobId")
-        return
+        return false
     }
     ctx.onEvent()
 
     if (scheduledPrintAt != null && scheduledPrintAt > nowIso()) {
         log.info("print_job_scheduled job=$jobId order=$orderId scheduledPrintAt=$scheduledPrintAt")
-        return
+        return false
     }
 
     log.info("print_job_received job=$jobId order=$orderId")
-    processJob(ctx, jobId)
+    return true
+}
+
+/**
+ * Records the reference and, if it is due, puts it in the print queue.
+ *
+ * The recording half and the printing half are deliberately separate calls.
+ * They used to be one, run inside the print slot, so an order could not even
+ * be written down until the previous one had finished printing - which is why
+ * the queue was never ordered: there was never more than one thing in it to
+ * sort. Intake now runs ahead of printing, and [PrintQueue] decides what
+ * prints next by order number.
+ */
+suspend fun handleJobReference(
+    ctx: JobContext,
+    queue: PrintQueue,
+    jobId: String,
+    orderId: String,
+    orderCode: String?,
+    scheduledPrintAt: String? = null,
+) {
+    if (registerJobReference(ctx, jobId, orderId, orderCode, scheduledPrintAt)) {
+        queue.enqueue(jobId, orderCode) { processJob(ctx, jobId) }
+    }
 }
 
 /**
@@ -140,10 +163,11 @@ suspend fun handleJobReference(
  * in the same tick, and printing them one after another would make the last
  * one late by however long all the others took.
  */
-fun processDueScheduledJobs(ctx: JobContext, dispatcher: JobDispatcher) {
+fun processDueScheduledJobs(ctx: JobContext, queue: PrintQueue) {
     for (row in ctx.db.dueScheduledJobs(nowIso(), ctx.credential.shopId)) {
-        log.info("scheduled_print_job_due job=${row.jobId} order=${row.orderId}")
-        dispatcher.submit(row.jobId) { processJob(ctx, row.jobId) }
+        if (queue.enqueue(row.jobId, row.orderCode) { processJob(ctx, row.jobId) }) {
+            log.info("scheduled_print_job_due job=${row.jobId} order=${row.orderId}")
+        }
     }
 }
 
@@ -155,7 +179,7 @@ fun processDueScheduledJobs(ctx: JobContext, dispatcher: JobDispatcher) {
  * duplicate, and nothing else ever looks at it again. See
  * [Database.resumableJobs] for why only the pre-printing states qualify.
  */
-fun resumeInterruptedJobs(ctx: JobContext, dispatcher: JobDispatcher) {
+fun resumeInterruptedJobs(ctx: JobContext, queue: PrintQueue) {
     for (row in ctx.db.resumableJobs(ctx.credential.shopId)) {
         // Rewind to the start rather than continuing from where it stopped.
         // [processJob] always begins by moving to VALIDATING, and the state
@@ -174,7 +198,7 @@ fun resumeInterruptedJobs(ctx: JobContext, dispatcher: JobDispatcher) {
         // downloaded perfectly well and was never given the chance to print.
         // Startup is exactly when both happen at once: this sweep runs while
         // the stream is delivering today's jobs.
-        val accepted = dispatcher.submit(row.jobId) {
+        val accepted = queue.enqueue(row.jobId, row.orderCode) {
             ctx.db.updateJobState(row.jobId, RECEIVED)
             processJob(ctx, row.jobId)
         }

@@ -59,16 +59,16 @@ class ResumeInterruptedJobsTest {
         db.updateJobState(jobId, DOWNLOADING)
 
         // Occupy the dispatcher with this id, exactly as a job mid-download does.
-        val dispatcher = JobDispatcher(scope, maxConcurrent = 2)
+        val queue = PrintQueue(scope, workers = 2)
         val started = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
-        dispatcher.submit(jobId) {
+        queue.enqueue(jobId, "AA-000001") {
             started.complete(Unit)
             release.await()
         }
         withTimeout(5_000) { started.await() }
 
-        resumeInterruptedJobs(ctx, dispatcher)
+        resumeInterruptedJobs(ctx, queue)
 
         assertEquals(
             DOWNLOADING,
@@ -91,10 +91,10 @@ class ResumeInterruptedJobsTest {
         db.insertJobReference(jobId, "order-2", "AA-000002", null, shopId)
         db.updateJobState(jobId, DOWNLOADING)
 
-        // maxConcurrent 0 would deadlock; instead let it run and observe the
+        // workers 0 would deadlock; instead let it run and observe the
         // rewind, which happens first thing inside the submitted work.
-        val dispatcher = JobDispatcher(scope, maxConcurrent = 1)
-        resumeInterruptedJobs(ctx, dispatcher)
+        val queue = PrintQueue(scope, workers = 1)
+        resumeInterruptedJobs(ctx, queue)
 
         withTimeout(5_000) {
             while (db.getJob(jobId)?.state == DOWNLOADING) kotlinx.coroutines.delay(20)

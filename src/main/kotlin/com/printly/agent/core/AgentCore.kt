@@ -4,6 +4,7 @@ import com.printly.agent.credentials.CredentialStore
 import com.printly.agent.db.Database
 import com.printly.agent.jobs.JobContext
 import com.printly.agent.jobs.JobDispatcher
+import com.printly.agent.jobs.PrintQueue
 import com.printly.agent.jobs.handleJobReference
 import com.printly.agent.jobs.processDueScheduledJobs
 import com.printly.agent.jobs.resumeInterruptedJobs
@@ -25,6 +26,17 @@ import java.time.Instant
 import java.time.format.DateTimeParseException
 import java.util.logging.Level
 import java.util.logging.Logger
+
+/**
+ * How many orders may be looked up at once.
+ *
+ * Intake is network-bound and touches no printer, so it is not the thing that
+ * needs limiting - but it is still somebody's backend, and a hundred orders
+ * arriving at once should not become a hundred simultaneous requests. Four
+ * keeps a backlog moving into the queue quickly while the printer works
+ * through what is already there.
+ */
+private const val INTAKE_CONCURRENCY = 4
 
 /**
  * Wires the pieces together: heartbeat, printer sync, and the SSE job
@@ -71,7 +83,17 @@ class AgentCore(val settings: Settings) {
     private val scope = CoroutineScope(Dispatchers.Default + supervisorJob)
     private var jobs: List<Job> = emptyList()
 
-    private val dispatcher = JobDispatcher(scope, settings.maxConcurrentPrintJobs)
+    /**
+     * Intake: fetching an order's details and writing it down. Deliberately
+     * separate from printing and allowed to run several at a time - it is
+     * network-bound, and none of it touches a printer. Running it inside the
+     * print slot, as it used to, meant the next order could not be recorded
+     * until the current one had finished printing.
+     */
+    private val intake = JobDispatcher(scope, maxConcurrent = INTAKE_CONCURRENCY)
+
+    /** Printing: one order at a time, lowest order number first. */
+    private val printQueue = PrintQueue(scope, settings.maxConcurrentPrintJobs) { onJobProgress() }
 
     private val sse = PrintJobSseClient(api, { agentCredential }, ::onJobReference)
     private val orderEvents = OrderEventsClient(api, { ownerSession }, ::onOrdersChanged, ::refreshOwnerSession)
@@ -170,6 +192,11 @@ class AgentCore(val settings: Settings) {
         "autoPrintEnabled" to autoPrintEnabled,
         "connected" to lastHeartbeatOk,
         "credentialRejected" to credentialRejected,
+        // What the counter needs to answer "where is my order?": how much work
+        // is outstanding, and the codes in the order they will actually print.
+        "queueDepth" to printQueue.depth,
+        "printingNow" to printQueue.activeCount,
+        "queuedOrders" to printQueue.waiting(),
         "agentVersion" to Auth.AGENT_VERSION,
         "computerName" to runCatching { java.net.InetAddress.getLocalHost().hostName }.getOrDefault("-"),
     )
@@ -345,9 +372,9 @@ class AgentCore(val settings: Settings) {
      */
     private fun onJobReference(jobId: String, orderId: String, orderCode: String?) {
         val credential = agentCredential ?: return
-        dispatcher.submit(jobId) {
+        intake.submit(jobId) {
             val scheduledPrintAt = computeScheduledPrintAt(orderId)
-            handleJobReference(jobContext(credential), jobId, orderId, orderCode, scheduledPrintAt)
+            handleJobReference(jobContext(credential), printQueue, jobId, orderId, orderCode, scheduledPrintAt)
         }
     }
 
@@ -399,7 +426,7 @@ class AgentCore(val settings: Settings) {
             val credential = agentCredential
             if (credential != null) {
                 try {
-                    processDueScheduledJobs(jobContext(credential), dispatcher)
+                    processDueScheduledJobs(jobContext(credential), printQueue)
                 } catch (exc: Exception) {
                     log.log(Level.SEVERE, "scheduled_jobs_check_failed", exc)
                 }
@@ -425,7 +452,7 @@ class AgentCore(val settings: Settings) {
         delay(settings.heartbeatIntervalSeconds * 1000)
         val credential = agentCredential ?: return
         try {
-            resumeInterruptedJobs(jobContext(credential), dispatcher)
+            resumeInterruptedJobs(jobContext(credential), printQueue)
         } catch (exc: Exception) {
             log.log(Level.SEVERE, "resume_interrupted_jobs_failed", exc)
         }
