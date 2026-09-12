@@ -2,6 +2,7 @@ package com.printly.agent.jobs
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.PriorityBlockingQueue
@@ -39,6 +40,8 @@ import java.util.logging.Logger
 class PrintQueue(
     scope: CoroutineScope,
     workers: Int,
+    private val settleMillis: Long = SETTLE_MILLIS,
+    private val maxSettleMillis: Long = MAX_SETTLE_MILLIS,
     private val onDepthChanged: () -> Unit = {},
 ) {
     private val log = Logger.getLogger(javaClass.name)
@@ -57,11 +60,20 @@ class PrintQueue(
     /** One permit per queued job. Workers wait on this rather than spinning. */
     private val signal = Channel<Unit>(Channel.UNLIMITED)
 
+    /** When intake last added something - see [awaitIntakeSettled]. */
+    @Volatile private var lastEnqueueAt = 0L
+
     init {
         repeat(workers.coerceAtLeast(1)) {
             scope.launch {
+                // Whether the queue had run dry when this worker last looked.
+                // Only then is the job it picks up next the start of a burst,
+                // and only then is it worth waiting for intake - see
+                // [awaitIntakeSettled].
+                var idle = true
                 while (true) {
                     signal.receive()
+                    if (idle) awaitIntakeSettled()
                     val entry = pending.poll() ?: continue
                     running.add(entry.jobId)
                     onDepthChanged()
@@ -75,6 +87,7 @@ class PrintQueue(
                     } finally {
                         running.remove(entry.jobId)
                         known.remove(entry.jobId)
+                        idle = pending.isEmpty()
                         onDepthChanged()
                     }
                 }
@@ -92,6 +105,7 @@ class PrintQueue(
             log.fine("job_already_queued job=$jobId")
             return false
         }
+        lastEnqueueAt = System.currentTimeMillis()
         pending.add(Entry(orderSequence(orderCode), jobId, orderCode, work))
         signal.trySend(Unit)
         log.info("print_job_queued job=$jobId order=${orderCode ?: "?"} depth=${known.size}")
@@ -107,6 +121,48 @@ class PrintQueue(
 
     /** Waiting order codes, in the order they will print. For the UI and for tests. */
     fun waiting(): List<String> = pending.sorted().map { it.orderCode ?: it.jobId }
+
+    /**
+     * Lets a burst finish arriving before the first sheet comes out.
+     *
+     * Sorting only orders what is already in the queue, and intake runs while
+     * printing does - so when a hundred orders arrive at once the first one
+     * registered starts printing before the rest have been fetched, and goes
+     * out ahead of lower numbers still on their way. Observed exactly that:
+     * HH-000108 printed first out of a backlog starting at HH-000025.
+     *
+     * So a worker coming off an idle queue waits for intake to go quiet before
+     * taking the first job. Bounded by [maxSettleMillis], because orders
+     * trickling in steadily must not hold the printer indefinitely - past that
+     * the queue prints what it has and the next arrival takes its place in
+     * what remains.
+     *
+     * Only the first job of a burst waits. Once the queue is draining, a job
+     * that arrives is sorted into a queue that is already moving, and holding
+     * the printer again would mean a steady trickle of orders stalling it for
+     * [maxSettleMillis] between every sheet.
+     */
+    private suspend fun awaitIntakeSettled() {
+        val deadline = System.currentTimeMillis() + maxSettleMillis
+        while (true) {
+            val now = System.currentTimeMillis()
+            val quietFor = now - lastEnqueueAt
+            if (quietFor >= settleMillis || now >= deadline) return
+            delay(minOf(settleMillis - quietFor, deadline - now).coerceAtLeast(25L))
+        }
+    }
+
+    private companion object {
+        /**
+         * How long intake must be quiet before the first job prints. Long
+         * enough for a burst of a hundred references to land and be sorted,
+         * short enough that a lone order is not noticeably delayed.
+         */
+        const val SETTLE_MILLIS = 2_000L
+
+        /** Never hold the printer longer than this waiting for a lull. */
+        const val MAX_SETTLE_MILLIS = 20_000L
+    }
 
     private class Entry(
         val sequence: Long,

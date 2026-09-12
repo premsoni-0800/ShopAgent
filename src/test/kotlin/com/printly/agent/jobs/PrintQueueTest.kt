@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.AfterEach
@@ -45,7 +46,7 @@ class PrintQueueTest {
         }
 
         assertEquals(
-            listOf(8, 12, 31, 47, 99).map(::order),
+            listOf(1, 8, 12, 31, 47, 99).map(::order),
             queue.waiting(),
             "the queue must be ordered before anything is printed, not after",
         )
@@ -142,6 +143,99 @@ class PrintQueueTest {
 
         withTimeout(5_000) { while (queue.depth > 0) delay(10) }
         assertEquals(listOf(order(2)), printed)
+    }
+
+    /**
+     * The bug this was reported for: a backlog does not arrive all at once.
+     * Intake fetches each order in turn, so by the time the second one is
+     * recorded the first is already on the printer - and HH-000108 came out
+     * ahead of a backlog that started at HH-000025.
+     */
+    @Test
+    fun `a burst is allowed to land before the first sheet comes out`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1, settleMillis = 400, maxSettleMillis = 5_000)
+        val printed = Collections.synchronizedList(mutableListOf<String>())
+
+        queue.enqueue("job-108", order(108)) { printed.add(order(108)) }
+        delay(100)
+        queue.enqueue("job-25", order(25)) { printed.add(order(25)) }
+        delay(100)
+        queue.enqueue("job-26", order(26)) { printed.add(order(26)) }
+
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+
+        assertEquals(
+            listOf(order(25), order(26), order(108)),
+            printed,
+            "the order registered first must not print ahead of lower numbers still arriving",
+        )
+    }
+
+    /**
+     * Waiting for a lull is a courtesy, not a licence to sit idle. A shop
+     * taking orders steadily never goes quiet, and the printer must still run.
+     */
+    @Test
+    fun `a steady trickle does not hold the printer past the cap`(): Unit = runBlocking {
+        // Intake never goes quiet for this long, so only the cap can release it.
+        val queue = PrintQueue(scope, workers = 1, settleMillis = 60_000, maxSettleMillis = 300)
+        val first = CompletableDeferred<Unit>()
+
+        queue.enqueue("job-1", order(1)) { first.complete(Unit) }
+        val intake = scope.launch {
+            var n = 2
+            while (true) {
+                delay(50)
+                queue.enqueue("job-$n", order(n)) {}
+                n++
+            }
+        }
+
+        try {
+            withTimeout(3_000) { first.await() }
+        } finally {
+            intake.cancel()
+        }
+    }
+
+    /**
+     * Only the *first* job of a burst waits. Settling again before every sheet
+     * would mean a shop with orders coming in steadily stalls for the full cap
+     * between each one - the queue is already sorted and already moving.
+     */
+    @Test
+    fun `a draining queue is never held up again`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1, settleMillis = 500, maxSettleMillis = 10_000)
+        val printed = AtomicInteger()
+        val started = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { started.complete(Unit); gate.await() }
+        repeat(5) { n -> queue.enqueue("job-$n", order(n + 2)) { printed.incrementAndGet() } }
+
+        // The burst's own wait belongs to the first job; the rest is the drain.
+        withTimeout(5_000) { started.await() }
+
+        // Intake keeps ticking over, so the queue never sees a lull again.
+        val intake = scope.launch {
+            var n = 100
+            while (true) {
+                delay(100)
+                queue.enqueue("late-$n", order(n)) {}
+                n++
+            }
+        }
+
+        // Let intake tick at least once, so the queue is demonstrably mid-burst
+        // and not merely quiet, before the drain begins.
+        delay(150)
+        gate.complete(Unit)
+        val elapsed = kotlin.system.measureTimeMillis {
+            withTimeout(4_000) { while (printed.get() < 5) delay(10) }
+        }
+        intake.cancel()
+
+        assertTrue(elapsed < 2_000, "a sorted, draining queue must keep printing (took ${elapsed}ms)")
     }
 
     @Test
