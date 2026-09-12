@@ -1,0 +1,9 @@
+# Vendored build output: byte-for-byte what Vite produced, never normalised.
+#
+# With core.autocrlf on, git rewrites these on checkout, so the working tree
+# stops matching what the build wrote and `git status` reports the vendored
+# dashboard as modified after every single build. That makes "is the bundle in
+# this checkout current?" unanswerable from git status - and answering it wrong
+# is how a months-old dashboard ships inside an installer.
+src/main/resources/dashboard/** -text
+src/main/resources/webui/** -text
