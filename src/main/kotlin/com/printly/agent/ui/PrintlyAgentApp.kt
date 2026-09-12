@@ -400,7 +400,19 @@ class PrintlyAgentApp : Application() {
                 // because only the desktop app has this proxy in front of it.
                 val body = exchange.requestBody.use { it.readBytes() }
                 connection.doOutput = true
-                connection.setFixedLengthStreamingMode(body.size)
+                // No streaming mode at all. In streaming mode - fixed length or
+                // chunked - HttpURLConnection has already committed the request
+                // by the time the response arrives, and it cannot then produce
+                // an error stream: a 4xx comes back with the status intact and
+                // getErrorStream() empty. Measured against the live backend, the
+                // same 401 returned 165 bytes of JSON through a GET and nothing
+                // at all through a POST. The dashboard shows the server's own
+                // sentence when there is one, so an emptied error body is
+                // exactly what surfaced as "Something went wrong", and only in
+                // the desktop app, because only it proxies.
+                //
+                // Letting the connection buffer instead costs one copy of a few
+                // hundred bytes and gets the body back.
                 connection.outputStream.use { it.write(body) }
             }
 
