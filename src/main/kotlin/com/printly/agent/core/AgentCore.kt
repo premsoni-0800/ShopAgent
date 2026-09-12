@@ -84,6 +84,13 @@ class AgentCore(val settings: Settings) {
     private var jobs: List<Job> = emptyList()
 
     /**
+     * Held separately from [jobs] because it is the one loop that can stop on
+     * its own - see [OrderEventsClient.resume] - and has to be startable again
+     * without restarting the other six.
+     */
+    private var orderEventsJob: Job? = null
+
+    /**
      * Intake: fetching an order's details and writing it down. Deliberately
      * separate from printing and allowed to run several at a time - it is
      * network-bound, and none of it touches a printer. Running it inside the
@@ -121,7 +128,7 @@ class AgentCore(val settings: Settings) {
             scope.launch { heartbeatLoop() },
             scope.launch { printerSyncLoop() },
             scope.launch { sse.runForever() },
-            scope.launch { orderEvents.runForever() },
+            scope.launch { orderEvents.runForever() }.also { orderEventsJob = it },
             scope.launch { scheduledJobsLoop() },
             scope.launch { jobReconcileLoop() },
             scope.launch { resumeInterruptedJobsOnce() },
@@ -176,8 +183,22 @@ class AgentCore(val settings: Settings) {
     private fun afterSignIn(session: CredentialStore.OwnerSession): CredentialStore.OwnerSession {
         ownerSession = session
         agentCredential = Auth.ensurePaired(api, session)
-        if (jobs.isEmpty()) start()
+        if (jobs.isEmpty()) start() else restartOrderEventsIfStopped()
         return session
+    }
+
+    /**
+     * Brings the Orders stream back after a sign-in, if it had given up.
+     *
+     * [start] only ever runs once, guarded on [jobs] being empty, so without
+     * this a stream that stopped on a revoked token stayed stopped for the
+     * life of the process however many times the owner signed back in.
+     */
+    private fun restartOrderEventsIfStopped() {
+        if (orderEventsJob?.isActive == true) return
+        orderEvents.resume()
+        orderEventsJob = scope.launch { orderEvents.runForever() }
+        log.info("order_events_restarted")
     }
 
     fun signOut() {
