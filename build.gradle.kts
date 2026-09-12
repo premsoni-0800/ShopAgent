@@ -96,6 +96,28 @@ abstract class JPackageTask @Inject constructor(private val execOps: ExecOperati
         val javaHome = System.getProperty("java.home")
         val type = installerType.getOrElse("app-image")
 
+        // jpackage refuses to write over what it made last time, and this task
+        // never cleared up after itself - so every rebuild after the first
+        // failed with "destination directory already exists" and left the
+        // previous artifact sitting there looking current. A failed build that
+        // leaves a plausible, months-old installer on disk is worse than one
+        // that leaves nothing, because the MSI still installs.
+        //
+        // Only ever the artifacts this run is about to replace: the two
+        // packaging tasks share an output directory, and clearing the whole
+        // thing would mean building an MSI deleted the app image.
+        val dest = outputDir.get().asFile
+        val previous = when (type) {
+            "app-image" -> dest.resolve(appName.get())
+            else -> dest.resolve("${appName.get()}-${appVersionValue.get()}.$type")
+        }
+        if (previous.exists() && !previous.deleteRecursively()) {
+            throw GradleException(
+                "could not clear ${previous.absolutePath} - close the app if it is running, " +
+                    "then build again",
+            )
+        }
+
         val args = mutableListOf(
             "--type", type,
             "--input", inputDir.get().asFile.absolutePath,
