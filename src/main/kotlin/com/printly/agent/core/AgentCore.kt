@@ -440,7 +440,16 @@ class AgentCore(val settings: Settings) {
         }
         val fields = order as? Map<String, Any?>
         ScheduleLookup.Known(
-            slotStart = fields?.get("scheduledSlotStart") as? String,
+            // scheduledPrintAt, not scheduledSlotStart. Both exist on
+            // OrderResponse and only one of them is ever filled in: Schedule
+            // Print is what the student app sends and what the backend stores,
+            // and scheduledSlotStart - a booked collection slot - is unused.
+            // Reading the empty one meant every scheduled order looked
+            // unscheduled and printed the moment it was paid for, which is the
+            // whole of what this feature exists to prevent. Measured against
+            // the live database: 0 orders carry a slot start, and the one
+            // scheduled order carries a print-at.
+            printAt = fields?.get("scheduledPrintAt") as? String,
             priority = fields?.get("inShopPriority") == true,
         )
     } catch (exc: CancellationException) {
@@ -535,11 +544,12 @@ class AgentCore(val settings: Settings) {
 /** What the backend could tell the agent about an order's slot. */
 internal sealed interface ScheduleLookup {
     /**
-     * The server answered. [slotStart] is null when the order genuinely has no
-     * slot, and [priority] is true when the student has scanned the shop's QR
-     * at the counter and the backend has agreed to serve them next.
+     * The server answered. [printAt] is null when the order is not scheduled
+     * at all - Print Now - and [priority] is true when the student has scanned
+     * the shop's QR at the counter and the backend has agreed to serve them
+     * next.
      */
-    data class Known(val slotStart: String?, val priority: Boolean = false) : ScheduleLookup
+    data class Known(val printAt: String?, val priority: Boolean = false) : ScheduleLookup
 
     /** It could not be asked, and asking again shortly might work - a 5xx, a timeout, a dropped connection. */
     object Unavailable : ScheduleLookup
@@ -574,14 +584,18 @@ internal fun schedulePlanFor(lookup: ScheduleLookup, leadTime: Duration, now: In
     ScheduleLookup.Unavailable -> SchedulePlan.Hold
     ScheduleLookup.Refused -> SchedulePlan.PrintAt(null)
     is ScheduleLookup.Known -> {
-        val slotStart = lookup.slotStart?.let {
+        val wantedReadyAt = lookup.printAt?.let {
             try {
                 Instant.parse(it)
             } catch (exc: DateTimeParseException) {
                 null
             }
         }
-        val printAt = slotStart?.minus(leadTime)
-        if (printAt == null || !printAt.isAfter(now)) SchedulePlan.PrintAt(null) else SchedulePlan.PrintAt(printAt.toString())
+        val startPrintingAt = wantedReadyAt?.minus(leadTime)
+        if (startPrintingAt == null || !startPrintingAt.isAfter(now)) {
+            SchedulePlan.PrintAt(null)
+        } else {
+            SchedulePlan.PrintAt(startPrintingAt.toString())
+        }
     }
 }

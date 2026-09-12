@@ -27,13 +27,13 @@ class SchedulePlanTest {
     }
 
     @Test
-    fun `an order with no slot prints as soon as it is claimed`() {
+    fun `an unscheduled order prints as soon as it is claimed`() {
         assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known(null), leadTime, now))
     }
 
     /** The student is already due. Holding it back would be the opposite of the point. */
     @Test
-    fun `a slot already upon us prints now`() {
+    fun `a time already upon us prints now`() {
         assertEquals(
             SchedulePlan.PrintAt(null),
             schedulePlanFor(ScheduleLookup.Known("2026-09-12T11:05:00Z"), leadTime, now),
@@ -47,9 +47,22 @@ class SchedulePlanTest {
     }
 
     @Test
-    fun `an unreadable slot is treated as no slot rather than guessed at`() {
+    fun `an unreadable time is treated as unscheduled rather than guessed at`() {
         assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known("tomorrow-ish"), leadTime, now))
         assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known(""), leadTime, now))
+    }
+
+    /**
+     * The field the time is read from, pinned because reading the wrong one is
+     * exactly what broke this. OrderResponse carries both scheduledPrintAt and
+     * scheduledSlotStart; only Schedule Print is ever populated, and the agent
+     * spent its life reading the empty one - so every scheduled order looked
+     * unscheduled and printed the moment it was paid for.
+     */
+    @Test
+    fun `the print time comes from Schedule Print`() {
+        val plan = schedulePlanFor(ScheduleLookup.Known(printAt = "2026-09-12T18:00:00Z"), leadTime, now)
+        assertEquals(SchedulePlan.PrintAt("2026-09-12T17:50:00Z"), plan)
     }
 
     /**
