@@ -168,6 +168,22 @@ val vendoredDashboard = layout.projectDirectory.dir("src/main/resources/dashboar
 
 abstract class BuildDashboardTask @Inject constructor(private val execOps: ExecOperations) : DefaultTask() {
     @get:Input abstract val sourceDir: Property<String>
+
+    /**
+     * The dashboard's own sources. Without these declared, the only input is
+     * the *path* to the dashboard, which does not change when the dashboard
+     * does - so Gradle called the task up-to-date and packaged whatever bundle
+     * happened to be vendored, which is precisely the stale-MSI failure the
+     * processResources hook below is supposed to rule out.
+     *
+     * Empty when the dashboard is not checked out. Deliberately not
+     * @SkipWhenEmpty: the task itself handles that case, keeping the vendored
+     * copy and saying so, and skipping it outright would lose the warning.
+     */
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val sourceFiles: ConfigurableFileCollection
+
     @get:OutputDirectory abstract val outputDir: DirectoryProperty
 
     @TaskAction
@@ -204,6 +220,15 @@ val buildDashboard = tasks.register<BuildDashboardTask>("buildDashboard") {
     group = "build"
     description = "Builds the shop dashboard and vendors it into src/main/resources/dashboard"
     sourceDir.set(dashboardDir)
+    // Everything npm actually reads to produce the bundle. node_modules and
+    // dist are excluded because they are inputs to nothing and would make
+    // fingerprinting cost more than the build being fingerprinted.
+    sourceFiles.from(
+        fileTree(dashboardDir) {
+            include("src/**", "public/**", "index.html", "package.json", "package-lock.json")
+            include("vite.config.*", "tailwind.config.*", "postcss.config.*")
+        },
+    )
     outputDir.set(vendoredDashboard)
 }
 

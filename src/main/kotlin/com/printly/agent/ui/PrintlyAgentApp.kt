@@ -8,6 +8,8 @@ import javafx.application.Application
 import javafx.application.Platform
 import javafx.concurrent.Worker
 import javafx.scene.Scene
+import javafx.scene.control.Alert
+import javafx.scene.control.ButtonType
 import javafx.scene.web.WebView
 import javafx.stage.Stage
 import netscape.javascript.JSObject
@@ -78,6 +80,31 @@ class PrintlyAgentApp : Application() {
             Files.createDirectories(webViewData)
             engine.userDataDirectory = webViewData.toFile()
         }.onFailure { log.log(Level.WARNING, "webview_user_data_dir_failed", it) }
+
+        // A WebEngine with no handlers set does not merely skip these dialogs -
+        // it answers them. alert() is dropped on the floor and confirm()
+        // returns *false*, so every button in the dashboard guarded by
+        // `if (!confirm(...)) return` silently does nothing here while working
+        // perfectly in a browser. That was four dead buttons, logout included,
+        // and an invisible "could not send that to the printer" message.
+        //
+        // Modal against the app window, because the caller is a synchronous
+        // JavaScript confirm(): it is already blocking the FX thread and needs
+        // an answer before it can return.
+        engine.setOnAlert { event ->
+            Alert(Alert.AlertType.INFORMATION, event.data ?: "", ButtonType.OK).apply {
+                initOwner(primaryStage)
+                headerText = null
+                title = "Printly Partner"
+            }.showAndWait()
+        }
+        engine.setConfirmHandler { message ->
+            Alert(Alert.AlertType.CONFIRMATION, message ?: "", ButtonType.OK, ButtonType.CANCEL).apply {
+                initOwner(primaryStage)
+                headerText = null
+                title = "Printly Partner"
+            }.showAndWait().orElse(ButtonType.CANCEL) == ButtonType.OK
+        }
 
         val bridge = JsBridge(core) { script -> engine.executeScript(script) }
 
