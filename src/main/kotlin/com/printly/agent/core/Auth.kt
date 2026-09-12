@@ -21,6 +21,9 @@ object Auth {
     class NoOwnedShopError(message: String) : RuntimeException(message)
     class PasswordNotSetError(message: String) : RuntimeException(message)
 
+    /** A different PC already holds this shop's one active agent slot - never silently taken over. */
+    class AnotherMachinePairedError(message: String) : RuntimeException(message)
+
     @Suppress("UNCHECKED_CAST")
     private fun establishSession(body: Map<String, Any?>): CredentialStore.OwnerSession {
         val tokens = body["tokens"] as Map<String, Any?>
@@ -76,6 +79,16 @@ object Auth {
         val existing = CredentialStore.loadAgentCredential()
         if (existing != null && existing.shopId == session.shopId) return existing
 
+        return try {
+            pairAndExchange(api, session)
+        } catch (exc: ApiError) {
+            if (exc.code != "PRINT_AGENT_ALREADY_ACTIVE") throw exc
+            revokeStaleRegistrationForThisMachine(api, session)
+            pairAndExchange(api, session)
+        }
+    }
+
+    private fun pairAndExchange(api: PrintlyApiClient, session: CredentialStore.OwnerSession): CredentialStore.AgentCredential {
         val pairing = api.pair(session)
         val exchanged = api.exchange(
             code = pairing.code,
@@ -88,6 +101,34 @@ object Auth {
         CredentialStore.saveAgentCredential(credential)
         log.info("agent_paired agentId=${credential.agentId} shopId=${credential.shopId}")
         return credential
+    }
+
+    /**
+     * Clears a registration this same PC left behind - the backend allows one
+     * ACTIVE agent per shop, so a local credential that has gone missing
+     * (reinstall, cleared credential store, wiped profile) otherwise locks the
+     * owner out of ever signing in here again: pairing refuses with
+     * PRINT_AGENT_ALREADY_ACTIVE and no UI path exists to clear it.
+     *
+     * Only ever revokes a registration whose name matches this machine's own
+     * hostname. A *different* PC holding the pairing is someone else's live
+     * agent, and silently stealing it would take that shop's printing offline
+     * with no warning - the backend's own "explicit revoke-then-pair, never a
+     * silent swap" rule. That case is surfaced to the owner instead.
+     */
+    private fun revokeStaleRegistrationForThisMachine(api: PrintlyApiClient, session: CredentialStore.OwnerSession) {
+        val active = api.listPrintAgents(session).firstOrNull { it.status == "ACTIVE" }
+            ?: return // nothing active after all - a concurrent revoke won the race; retrying is correct
+
+        if (!active.name.equals(hostName(), ignoreCase = true)) {
+            throw AnotherMachinePairedError(
+                "\"${active.name}\" is already this shop's print agent. Disconnect it there first, " +
+                    "or revoke it from the shop dashboard, then sign in again here.",
+            )
+        }
+
+        log.info("revoking_stale_self_registration agentId=${active.id} name=${active.name}")
+        api.revokePrintAgent(session, active.id)
     }
 
     private fun hostName(): String = runCatching { java.net.InetAddress.getLocalHost().hostName }.getOrDefault("Print Agent")

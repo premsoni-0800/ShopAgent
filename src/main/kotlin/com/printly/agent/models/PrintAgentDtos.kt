@@ -31,6 +31,17 @@ enum class PrintJobProgressStage { DOWNLOADING, PRINTING }
 
 data class PairingCodeResponse(val code: String, val expiresAt: Instant)
 
+/** One of a shop's registered agents, as the owner-facing list returns it. */
+data class PrintAgentSummary(
+    val id: String,
+    val name: String,
+    val status: String,
+    val online: Boolean,
+    val lastSeenAt: Instant?,
+    val agentVersion: String?,
+    val createdAt: Instant,
+)
+
 data class PrintAgentExchangeRequest(
     val code: String,
     val agentName: String = "Print Agent",

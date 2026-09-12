@@ -66,6 +66,20 @@ class PrintlyApiClient(val baseUrl: String) {
         return mapper.readValue(response)
     }
 
+    fun listPrintAgents(session: CredentialStore.OwnerSession): List<PrintAgentSummary> = mapper.readValue(
+        request(
+            Request.Builder().url(url("/api/v1/shop/${session.shopId}/print-agents"))
+                .headers(ownerHeaders(session)).build(),
+        ),
+    )
+
+    fun revokePrintAgent(session: CredentialStore.OwnerSession, agentId: String) {
+        request(
+            Request.Builder().url(url("/api/v1/shop/${session.shopId}/print-agents/$agentId/revoke"))
+                .post("".toRequestBody(null)).headers(ownerHeaders(session)).build(),
+        )
+    }
+
     fun ownerGet(session: CredentialStore.OwnerSession, path: String): Any =
         mapper.readValue(request(Request.Builder().url(url(path)).headers(ownerHeaders(session)).build()))
 

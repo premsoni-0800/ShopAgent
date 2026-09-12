@@ -66,9 +66,15 @@ object CredentialStore {
 
     // -------------------------------------------------------------------
     // Raw Windows Credential Manager access (CRED_TYPE_GENERIC, per-machine)
+    //
+    // `internal` rather than private purely so the JNA round-trip can be
+    // exercised against a test-only target name. A test must never touch
+    // [OWNER_SESSION_TARGET]/[AGENT_CREDENTIAL_TARGET]: clearing those in a
+    // teardown signs the shop owner out and unpairs the PC for real, which
+    // then dead-ends the next sign-in on PRINT_AGENT_ALREADY_ACTIVE.
     // -------------------------------------------------------------------
 
-    private fun write(target: String, json: String) {
+    internal fun write(target: String, json: String) {
         val blob = json.toByteArray(StandardCharsets.UTF_16LE)
         val blobMemory = Memory(blob.size.toLong().coerceAtLeast(1))
         blobMemory.write(0, blob, 0, blob.size)
@@ -86,7 +92,7 @@ object CredentialStore {
         check(ok) { "CredWrite failed for $target (error ${Native.getLastError()})" }
     }
 
-    private fun read(target: String): String? {
+    internal fun read(target: String): String? {
         val ref = PointerByReference()
         val ok = Advapi32Cred.INSTANCE.CredReadW(target, CRED_TYPE_GENERIC, 0, ref)
         if (!ok) return null // not found - never an error for callers checking "is anything stored yet"
@@ -100,7 +106,7 @@ object CredentialStore {
         }
     }
 
-    private fun delete(target: String) {
+    internal fun delete(target: String) {
         // Idempotent, same as the Python side's `_delete_quietly`: signing out
         // twice, or clearing a credential that was never set, is a no-op.
         Advapi32Cred.INSTANCE.CredDeleteW(target, CRED_TYPE_GENERIC, 0)

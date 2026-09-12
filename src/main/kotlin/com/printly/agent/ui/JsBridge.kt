@@ -77,6 +77,8 @@ class JsBridge(private val core: AgentCore, private val executeScript: (String) 
         mapOf("ok" to false, "code" to "PASSWORD_NOT_SET", "error" to exc.message)
     } catch (exc: Auth.NoOwnedShopError) {
         mapOf("ok" to false, "error" to exc.message)
+    } catch (exc: Auth.AnotherMachinePairedError) {
+        mapOf("ok" to false, "code" to "ANOTHER_MACHINE_PAIRED", "error" to exc.message)
     } catch (exc: ApiError) {
         mapOf("ok" to false, "code" to exc.code, "error" to exc.message)
     } catch (exc: Exception) {
