@@ -81,4 +81,55 @@ class PrinterSelectorTest {
         val result = selectPrinter(item(paperSize = PaperSize.A4), printers)
         assertNull(result.printer)
     }
+
+    /**
+     * The exact shape of a real shop PC: a mono laser plus Windows' built-in
+     * PDF writer, with the PDF writer left as the system default (which it
+     * very often is). On score alone the virtual printer wins outright - it is
+     * the default (+10) and advertises every common paper size (+3) - and the
+     * order would be written to a file, reported as printed, and the student
+     * told to collect paper that does not exist.
+     */
+    @Test
+    fun `a real printer beats the system-default PDF writer`() {
+        val printers = listOf(
+            printer(
+                "Microsoft Print to PDF", isDefault = true, colorCapable = true, duplexCapable = true,
+                paperSizes = setOf(PaperSize.A4, PaperSize.A3, PaperSize.LETTER, PaperSize.LEGAL),
+            ),
+            printer(
+                "Hewlett-Packard HP LaserJet M1005", isDefault = false, colorCapable = false,
+                duplexCapable = true, paperSizes = setOf(PaperSize.A4),
+            ),
+        )
+
+        val result = selectPrinter(item(), printers)
+
+        assertEquals("Hewlett-Packard HP LaserJet M1005", result.printer?.windowsPrinterName)
+    }
+
+    /** Nothing else to print with - a dev box, or this project's own test machine. */
+    @Test
+    fun `a virtual printer is still chosen when it is the only one`() {
+        val printers = listOf(
+            printer("Microsoft Print to PDF", isDefault = true, colorCapable = true, paperSizes = setOf(PaperSize.A4)),
+        )
+
+        val result = selectPrinter(item(), printers)
+
+        assertEquals("Microsoft Print to PDF", result.printer?.windowsPrinterName)
+    }
+
+    /** A real printer that cannot do the job is still excluded - the penalty must not promote an unusable one. */
+    @Test
+    fun `a colour job falls back to the PDF writer over a mono-only laser`() {
+        val printers = listOf(
+            printer("Microsoft Print to PDF", colorCapable = true, paperSizes = setOf(PaperSize.A4)),
+            printer("Hewlett-Packard HP LaserJet M1005", colorCapable = false, paperSizes = setOf(PaperSize.A4)),
+        )
+
+        val result = selectPrinter(item(colorMode = ColorMode.COLOR), printers)
+
+        assertEquals("Microsoft Print to PDF", result.printer?.windowsPrinterName)
+    }
 }

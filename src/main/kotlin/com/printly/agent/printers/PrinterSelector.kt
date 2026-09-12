@@ -4,6 +4,7 @@ import com.printly.agent.models.ColorMode
 import com.printly.agent.models.DuplexMode
 import com.printly.agent.models.PrintJobItem
 import com.printly.agent.models.PrinterReportedStatus
+import com.printly.agent.printing.isPrintToFileDriver
 
 data class SelectionResult(val printer: LocalPrinter?, val reason: String? = null)
 
@@ -33,6 +34,21 @@ private fun provenIncompatible(item: PrintJobItem, printer: LocalPrinter): Boole
 
 private fun score(item: PrintJobItem, printer: LocalPrinter): Int {
     var score = 0
+    // A printer that writes a file is the last thing a shop wants chosen: the
+    // order never reaches paper, yet everything downstream reports success
+    // and the student is told to come and collect it.
+    //
+    // This is not hypothetical. "Microsoft Print to PDF" is the Windows
+    // default on a great many machines, and it advertises colour and every
+    // common paper size - so on a shop PC with a mono laser attached it
+    // outscored the real printer on the two things that matter most here
+    // (+10 for being the default, +3 for proven paper support) and would have
+    // quietly swallowed every job.
+    //
+    // Penalised rather than excluded, so a machine with nothing but virtual
+    // printers - any dev box, and this project's own testing setup - still
+    // selects one. The penalty only has to beat the highest real score.
+    if (isPrintToFileDriver(printer.windowsPrinterName)) score -= 100
     if (printer.isSystemDefault) score += 10
     if (item.colorMode == ColorMode.COLOR && printer.colorCapable == true) score += 3
     if (item.colorMode == ColorMode.BLACK_AND_WHITE && printer.colorCapable != null) score += 1
