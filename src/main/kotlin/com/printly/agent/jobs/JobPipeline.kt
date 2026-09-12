@@ -17,6 +17,7 @@ import com.printly.agent.printing.PrintOutcome
 import com.printly.agent.printing.PrinterCondition
 import com.printly.agent.printing.SpoolerOutcome
 import com.printly.agent.printing.PrintSubmissionError
+import com.printly.agent.printing.PrintSubmissionStalled
 import com.printly.agent.printing.SpoolerOutcomePoller
 import com.printly.agent.printing.downloadDocument
 import com.printly.agent.printing.printPdf
@@ -193,6 +194,15 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
             return
         } catch (exc: PrintSubmissionError) {
             fail(ctx, jobId, exc.message ?: "print submission failed", PrintJobFailureReason.PRINTER_ERROR)
+            return
+        } catch (exc: PrintSubmissionStalled) {
+            // Deliberately not a failure. The driver took the job and stopped
+            // responding partway through, so pages may well be in the tray
+            // already - reporting it failed is what would have the shop print
+            // the whole thing again on top of what came out. Same rule as the
+            // spooler's own UNKNOWN: only somebody who can look at the printer
+            // can say what happened.
+            markUnknown(ctx, jobId, exc.message ?: "the printer stopped responding")
             return
         } finally {
             downloaded.values.forEach { it.toFile().delete() }

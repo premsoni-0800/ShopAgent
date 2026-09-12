@@ -155,6 +155,43 @@ object SpoolerOutcomePoller {
         }
     }
 
+    /**
+     * How far along a job is, for watching whether it is still moving.
+     *
+     * [pagesPrinted] is the spooler's own count and is what distinguishes a
+     * long job from a stuck one: a 3,000-page document legitimately takes a
+     * while, but it climbs while it does. One that stops climbing has stopped.
+     */
+    data class JobProgress(val found: Boolean, val pagesPrinted: Int)
+
+    /** Null when the spooler could not be asked at all - which is not the same as "no progress". */
+    fun jobProgress(printerName: String, jobNameToken: String): JobProgress? {
+        val printerHandle = PointerByReference()
+        if (!WinSpool.INSTANCE.OpenPrinterW(printerName, printerHandle, null)) return null
+        try {
+            val needed = IntByReference()
+            val returned = IntByReference()
+            WinSpool.INSTANCE.EnumJobsW(printerHandle.value, 0, 999, 1, null, 0, needed, returned)
+            if (needed.value <= 0) return JobProgress(found = false, pagesPrinted = 0)
+
+            val buffer = Memory(needed.value.toLong())
+            if (!WinSpool.INSTANCE.EnumJobsW(printerHandle.value, 0, 999, 1, buffer, needed.value, needed, returned)) {
+                return null
+            }
+
+            @Suppress("UNCHECKED_CAST")
+            val jobs = JOB_INFO_1(buffer).toArray(returned.value) as Array<JOB_INFO_1>
+            val match = jobs.firstOrNull { it.pDocument?.getWideString(0) == jobNameToken }
+                ?: return JobProgress(found = false, pagesPrinted = 0)
+            return JobProgress(found = true, pagesPrinted = match.pagesPrinted)
+        } catch (exc: Exception) {
+            log.fine("job_progress_read_failed printer=$printerName: $exc")
+            return null
+        } finally {
+            WinSpool.INSTANCE.ClosePrinter(printerHandle.value)
+        }
+    }
+
     /** `(statusBits, found)`; null statusBits means the spooler itself could not be asked. */
     private fun jobStatus(printerName: String, jobNameToken: String): Pair<Int?, Boolean> {
         val printerHandle = PointerByReference()

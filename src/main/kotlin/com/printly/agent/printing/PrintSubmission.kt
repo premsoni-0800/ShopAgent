@@ -13,6 +13,11 @@ import java.awt.print.PrinterJob
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.UUID
 import javax.print.PrintService
 import javax.print.attribute.HashPrintRequestAttributeSet
@@ -33,6 +38,17 @@ data class PrintOptions(
 )
 
 class PrintSubmissionError(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+
+/**
+ * The driver accepted the job and then stopped making progress.
+ *
+ * Distinct from [PrintSubmissionError] because the outcome is genuinely
+ * unknown rather than failed: pages may well have come out before it stalled.
+ * Observed on a real 3,100-page job that printed 2,860 pages and then froze -
+ * the spooler kept it as "Printing, Retained" and `PrinterJob.print()`, which
+ * blocks until the driver is finished, never returned at all.
+ */
+class PrintSubmissionStalled(message: String) : RuntimeException(message)
 
 private val PAPER_SIZE_TO_MEDIA: Map<PaperSize, MediaSizeName> = mapOf(
     PaperSize.A4 to MediaSizeName.ISO_A4,
@@ -124,11 +140,7 @@ fun printPdf(service: PrintService, pdfPath: Path, options: PrintOptions, docume
             attributes.add(Destination(outputDir.resolve("$jobNameToken.pdf").toUri()))
         }
 
-        try {
-            printerJob.print(attributes)
-        } catch (exc: Exception) {
-            throw PrintSubmissionError("printing failed on ${service.name}: $exc", exc)
-        }
+        submitAndWatch(printerJob, attributes, service.name, jobNameToken)
     } finally {
         document.close()
     }
@@ -170,6 +182,109 @@ private val PRINT_TO_FILE_DRIVER_MARKERS = listOf(
     "foxit reader pdf printer",
     "microsoft shared fax driver",
 )
+
+/**
+ * How long a job may make no progress at all before it is treated as stuck.
+ *
+ * Not a total time limit: a 3,000-page document legitimately takes a long
+ * while, and killing it for being big would be worse than the bug. What is
+ * never legitimate is the spooler's own page count standing still - a job that
+ * is working climbs, and one that has stopped climbing has stopped.
+ */
+private const val STALL_TIMEOUT_SECONDS = 300L
+private const val PROGRESS_POLL_SECONDS = 15L
+
+/**
+ * Runs the blocking submit, and gives up on it if the driver stops responding.
+ *
+ * `PrinterJob.print()` blocks until the driver has finished with the whole
+ * document, and there is no timeout on it. When a driver wedges - as Microsoft
+ * Print to PDF did on a 3,100-page job, stalling at 2,860 pages with the
+ * spooler still calling it "Printing" - that call simply never returns. The
+ * job then sits at DOWNLOADED forever: never failed, never unknown, never
+ * surfaced to anyone, while permanently holding one of the agent's few
+ * concurrent print slots. Four of those and the shop stops printing silently.
+ *
+ * So the submit runs on its own thread and this watches the spooler's page
+ * count beside it. Returning early leaks that thread - it is still blocked in
+ * the driver and cannot be safely killed - which is a deliberate trade: one
+ * parked thread is recoverable on the next restart, a wedged print slot and an
+ * invisible job are not.
+ */
+private fun submitAndWatch(
+    printerJob: PrinterJob,
+    attributes: HashPrintRequestAttributeSet,
+    printerName: String,
+    jobNameToken: String,
+) {
+    val submission = CompletableFuture.runAsync(
+        {
+            printerJob.print(attributes)
+        },
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "printly-submit-$jobNameToken").apply { isDaemon = true }
+        },
+    )
+
+    val detector = StallDetector(STALL_TIMEOUT_SECONDS)
+
+    while (true) {
+        try {
+            submission.get(PROGRESS_POLL_SECONDS, TimeUnit.SECONDS)
+            return // the driver finished, one way or another
+        } catch (exc: TimeoutException) {
+            // Still printing. Fall through and ask whether it is moving.
+        } catch (exc: ExecutionException) {
+            val cause = exc.cause ?: exc
+            throw PrintSubmissionError("printing failed on $printerName: $cause", cause)
+        }
+
+        val progress = SpoolerOutcomePoller.jobProgress(printerName, jobNameToken)
+        val stalledFor = detector.sample(progress, System.nanoTime())
+        if (stalledFor != null) {
+            runCatching { printerJob.cancel() }
+            throw PrintSubmissionStalled(
+                "the printer stopped responding after ${progress?.pagesPrinted ?: 0} pages - " +
+                    "it made no progress for ${stalledFor}s. Check the printer and the Windows print queue.",
+            )
+        }
+    }
+}
+
+/**
+ * Decides whether a job has stopped moving, kept apart from the threading so
+ * the rule can be tested without a printer.
+ *
+ * The rule is deliberately about *change*, not about totals: a job climbing
+ * through 3,000 pages is healthy however long it takes, and one whose count
+ * has not moved in five minutes is not, whatever it reached.
+ */
+internal class StallDetector(private val stallSeconds: Long) {
+
+    private var last: SpoolerOutcomePoller.JobProgress? = null
+    private var lastChangeAt: Long? = null
+
+    /**
+     * Feeds in one observation. Returns how many seconds it has been stuck for
+     * once that passes the limit, or null while it is still moving.
+     *
+     * A null [progress] means the spooler could not be read at all, which is
+     * not evidence of a stall - an unreadable sample leaves the clock exactly
+     * where it was rather than counting towards giving up on the job.
+     */
+    fun sample(progress: SpoolerOutcomePoller.JobProgress?, nowNanos: Long): Long? {
+        if (progress == null) return null
+
+        if (lastChangeAt == null || progress != last) {
+            last = progress
+            lastChangeAt = nowNanos
+            return null
+        }
+
+        val stalledFor = (nowNanos - lastChangeAt!!) / 1_000_000_000L
+        return if (stalledFor >= stallSeconds) stalledFor else null
+    }
+}
 
 /** Where a print-to-file driver's output actually lands - not a secret, not customer data retention (it's the agent's own already-printed copy, in its own app-data folder, not a shop-browsable location). */
 internal fun virtualPrinterOutputDir(): Path {
