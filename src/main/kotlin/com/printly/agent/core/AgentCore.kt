@@ -99,10 +99,6 @@ class AgentCore(val settings: Settings) {
     private val sse = PrintJobSseClient(api, { agentCredential }, ::onJobReference)
     private val orderEvents = OrderEventsClient(api, { ownerSession }, ::onOrdersChanged, ::refreshOwnerSession)
 
-    // How long before a scheduled order's slot the agent should actually
-    // print it - printing right when the job is created would mean paper
-    // sitting at the counter well before the student is due.
-    private val scheduledPrintLeadTime: Duration = Duration.ofMinutes(10)
     private val scheduledJobCheckInterval: Duration = Duration.ofSeconds(30)
 
     // --- lifecycle ---
@@ -380,7 +376,7 @@ class AgentCore(val settings: Settings) {
             // carried inShopPriority all along - so knowing that a student is
             // standing at the counter costs nothing extra.
             val priority = (lookup as? ScheduleLookup.Known)?.priority == true
-            when (val plan = schedulePlanFor(lookup, scheduledPrintLeadTime, Instant.now())) {
+            when (val plan = schedulePlanFor(lookup, Instant.now())) {
                 is SchedulePlan.PrintAt ->
                     handleJobReference(jobContext(credential), printQueue, jobId, orderId, orderCode, plan.at, priority)
                 // Deliberately records nothing. Recording the job means deciding
@@ -440,16 +436,15 @@ class AgentCore(val settings: Settings) {
         }
         val fields = order as? Map<String, Any?>
         ScheduleLookup.Known(
-            // scheduledPrintAt, not scheduledSlotStart. Both exist on
-            // OrderResponse and only one of them is ever filled in: Schedule
-            // Print is what the student app sends and what the backend stores,
-            // and scheduledSlotStart - a booked collection slot - is unused.
-            // Reading the empty one meant every scheduled order looked
-            // unscheduled and printed the moment it was paid for, which is the
-            // whole of what this feature exists to prevent. Measured against
-            // the live database: 0 orders carry a slot start, and the one
-            // scheduled order carries a print-at.
-            printAt = fields?.get("scheduledPrintAt") as? String,
+            // shopReleaseAt, which the backend works out as scheduledPrintAt
+            // minus its own release lead, and which is exactly the moment this
+            // shop is meant to receive the order. Taking it whole means the
+            // agent has no opinion about the lead time and cannot disagree
+            // with the server about it - see [schedulePlanFor].
+            //
+            // Null on a Print Now order, which is the same thing as "print it
+            // as soon as it is claimed".
+            releaseAt = fields?.get("shopReleaseAt") as? String,
             priority = fields?.get("inShopPriority") == true,
         )
     } catch (exc: CancellationException) {
@@ -544,12 +539,12 @@ class AgentCore(val settings: Settings) {
 /** What the backend could tell the agent about an order's slot. */
 internal sealed interface ScheduleLookup {
     /**
-     * The server answered. [printAt] is null when the order is not scheduled
-     * at all - Print Now - and [priority] is true when the student has scanned
-     * the shop's QR at the counter and the backend has agreed to serve them
-     * next.
+     * The server answered. [releaseAt] is when this shop is meant to receive
+     * the order - null on a Print Now order - and [priority] is true when the
+     * student has scanned the shop's QR at the counter and the backend has
+     * agreed to serve them next.
      */
-    data class Known(val printAt: String?, val priority: Boolean = false) : ScheduleLookup
+    data class Known(val releaseAt: String?, val priority: Boolean = false) : ScheduleLookup
 
     /** It could not be asked, and asking again shortly might work - a 5xx, a timeout, a dropped connection. */
     object Unavailable : ScheduleLookup
@@ -577,25 +572,35 @@ internal sealed interface SchedulePlan {
  * not clear prints it now, because the alternative there is an order that
  * never comes out at all.
  *
- * A slot already upon us is not a schedule, it is a job to print now - which
- * is also what an order with no slot at all, or an unreadable one, deserves.
+ * There is deliberately no lead time here. The backend already subtracted its
+ * own from the student's chosen time and sent the answer as `shopReleaseAt`,
+ * so the agent takes that whole rather than keeping a number of its own. A
+ * copy would be a fourth: the backend has `printly.scheduled-print
+ * .release-lead`, the student app has SHOP_RELEASE_LEAD, and the dashboard has
+ * PRINT_LEAD_MINUTES. That shape has already failed once - the student app sat
+ * at twenty minutes while the server released at five, so a student asking for
+ * 7:00 was told 6:40 and the shop got it at 6:55. An agent that derives
+ * nothing cannot drift.
+ *
+ * A release time already upon us is not a schedule, it is a job to print now -
+ * which is also what an unscheduled order, or one with an unreadable time,
+ * deserves.
  */
-internal fun schedulePlanFor(lookup: ScheduleLookup, leadTime: Duration, now: Instant): SchedulePlan = when (lookup) {
+internal fun schedulePlanFor(lookup: ScheduleLookup, now: Instant): SchedulePlan = when (lookup) {
     ScheduleLookup.Unavailable -> SchedulePlan.Hold
     ScheduleLookup.Refused -> SchedulePlan.PrintAt(null)
     is ScheduleLookup.Known -> {
-        val wantedReadyAt = lookup.printAt?.let {
+        val releaseAt = lookup.releaseAt?.let {
             try {
                 Instant.parse(it)
             } catch (exc: DateTimeParseException) {
                 null
             }
         }
-        val startPrintingAt = wantedReadyAt?.minus(leadTime)
-        if (startPrintingAt == null || !startPrintingAt.isAfter(now)) {
+        if (releaseAt == null || !releaseAt.isAfter(now)) {
             SchedulePlan.PrintAt(null)
         } else {
-            SchedulePlan.PrintAt(startPrintingAt.toString())
+            SchedulePlan.PrintAt(releaseAt.toString())
         }
     }
 }

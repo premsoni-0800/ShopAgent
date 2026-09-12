@@ -2,80 +2,76 @@ package com.printly.agent.core
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
-import java.time.Duration
 import java.time.Instant
 
 /**
  * When a scheduled order actually prints, and what happens when the agent
  * cannot find out.
  *
+ * Two things went wrong here before, and both are pinned below.
+ *
  * The lookup used to catch every exception and answer null, and null already
- * meant "no slot, print it now" - so a momentary 500 or a timed-out token read
- * as "this order is not scheduled" and a six o'clock slot discovered at eleven
- * in the morning printed at eleven in the morning. The distinction between
- * "there is no slot" and "I could not ask" is the whole of this.
+ * meant "not scheduled, print it now" - so a momentary 500 or a timed-out
+ * token read as "this order is not scheduled" and a six o'clock order printed
+ * at eleven in the morning.
+ *
+ * And it read the wrong field: scheduledSlotStart, a booked collection slot
+ * that nothing in this system sets, rather than the Schedule Print time the
+ * student actually chose. Every scheduled order looked unscheduled.
  */
 class SchedulePlanTest {
 
-    private val leadTime: Duration = Duration.ofMinutes(10)
     private val now: Instant = Instant.parse("2026-09-12T11:00:00Z")
 
+    /**
+     * The whole of the arithmetic, and the agent does none of it. The backend
+     * subtracts its own release lead from the student's chosen time and sends
+     * the answer; taking it whole is what stops a fourth copy of "five
+     * minutes" drifting away from the other three.
+     */
     @Test
-    fun `a future slot prints one lead time before it`() {
-        val plan = schedulePlanFor(ScheduleLookup.Known("2026-09-12T18:00:00Z"), leadTime, now)
-        assertEquals(SchedulePlan.PrintAt("2026-09-12T17:50:00Z"), plan)
+    fun `the agent prints when the backend says the shop receives it`() {
+        val plan = schedulePlanFor(ScheduleLookup.Known(releaseAt = "2026-09-12T17:55:00Z"), now)
+        assertEquals(SchedulePlan.PrintAt("2026-09-12T17:55:00Z"), plan)
     }
 
     @Test
-    fun `an unscheduled order prints as soon as it is claimed`() {
-        assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known(null), leadTime, now))
+    fun `a Print Now order prints as soon as it is claimed`() {
+        assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known(releaseAt = null), now))
     }
 
-    /** The student is already due. Holding it back would be the opposite of the point. */
+    /** The shop was due this already. Holding it back would be the opposite of the point. */
     @Test
-    fun `a time already upon us prints now`() {
+    fun `a release time already upon us prints now`() {
         assertEquals(
             SchedulePlan.PrintAt(null),
-            schedulePlanFor(ScheduleLookup.Known("2026-09-12T11:05:00Z"), leadTime, now),
-            "the lead time has already elapsed, so this is a job to print, not to schedule",
+            schedulePlanFor(ScheduleLookup.Known("2026-09-12T11:00:00Z"), now),
+            "due exactly now is due",
         )
         assertEquals(
             SchedulePlan.PrintAt(null),
-            schedulePlanFor(ScheduleLookup.Known("2026-09-12T09:00:00Z"), leadTime, now),
-            "a slot in the past is a late order, not a future one",
+            schedulePlanFor(ScheduleLookup.Known("2026-09-12T09:00:00Z"), now),
+            "a release time in the past is a late order, not a future one",
         )
     }
 
     @Test
     fun `an unreadable time is treated as unscheduled rather than guessed at`() {
-        assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known("tomorrow-ish"), leadTime, now))
-        assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known(""), leadTime, now))
+        assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known("tomorrow-ish"), now))
+        assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Known(""), now))
     }
 
     /**
-     * The field the time is read from, pinned because reading the wrong one is
-     * exactly what broke this. OrderResponse carries both scheduledPrintAt and
-     * scheduledSlotStart; only Schedule Print is ever populated, and the agent
-     * spent its life reading the empty one - so every scheduled order looked
-     * unscheduled and printed the moment it was paid for.
-     */
-    @Test
-    fun `the print time comes from Schedule Print`() {
-        val plan = schedulePlanFor(ScheduleLookup.Known(printAt = "2026-09-12T18:00:00Z"), leadTime, now)
-        assertEquals(SchedulePlan.PrintAt("2026-09-12T17:50:00Z"), plan)
-    }
-
-    /**
-     * The bug this exists for. A failure that might clear must not be allowed
-     * to look like "not scheduled" - the job is held, unrecorded, and the
-     * ten-second reconciliation poll brings it back to be asked again.
+     * A failure that might clear must not be allowed to look like "not
+     * scheduled" - the job is held, unrecorded, and the ten-second
+     * reconciliation poll brings it back to be asked again.
      */
     @Test
     fun `a lookup that might succeed later holds the job instead of printing it`() {
         assertEquals(
             SchedulePlan.Hold,
-            schedulePlanFor(ScheduleLookup.Unavailable, leadTime, now),
-            "a 500 or a timeout is not evidence that an order has no slot",
+            schedulePlanFor(ScheduleLookup.Unavailable, now),
+            "a 500 or a timeout is not evidence that an order is unscheduled",
         )
     }
 
@@ -86,19 +82,15 @@ class SchedulePlanTest {
      */
     @Test
     fun `a refusal that will not clear prints rather than holding for ever`() {
-        assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Refused, leadTime, now))
+        assertEquals(SchedulePlan.PrintAt(null), schedulePlanFor(ScheduleLookup.Refused, now))
     }
 
-    /** The lead time is the agent's to choose; the arithmetic must follow it. */
+    /** Priority rides along on the same lookup, and does not disturb the timing. */
     @Test
-    fun `the lead time is honoured, whatever it is set to`() {
+    fun `priority is independent of when it prints`() {
         assertEquals(
             SchedulePlan.PrintAt("2026-09-12T17:55:00Z"),
-            schedulePlanFor(ScheduleLookup.Known("2026-09-12T18:00:00Z"), Duration.ofMinutes(5), now),
-        )
-        assertEquals(
-            SchedulePlan.PrintAt("2026-09-12T17:00:00Z"),
-            schedulePlanFor(ScheduleLookup.Known("2026-09-12T18:00:00Z"), Duration.ofHours(1), now),
+            schedulePlanFor(ScheduleLookup.Known("2026-09-12T17:55:00Z", priority = true), now),
         )
     }
 }
