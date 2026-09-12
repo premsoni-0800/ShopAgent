@@ -73,7 +73,23 @@ class OrderEventsClient(
                     kotlinx.coroutines.runBlocking {
                         try {
                             refreshSession()
+                        } catch (exc: ApiError) {
+                            // A refresh token the server has thrown away is not
+                            // going to start working. Retrying it reconnected
+                            // every couple of seconds for as long as the agent
+                            // ran - thirty failures a minute, forever, drowning
+                            // the log and hiding anything real. The owner has to
+                            // sign in again, and nothing here can do that for
+                            // them, so stop asking.
+                            if (exc.code == "TOKEN_REVOKED" || exc.code == "TOKEN_INVALID" || exc.statusCode == 401) {
+                                log.warning("order_events_stopped_signed_out code=${exc.code}")
+                                stopped = true
+                            } else {
+                                log.log(Level.WARNING, "order_events_session_refresh_failed", exc)
+                            }
                         } catch (exc: Exception) {
+                            // Anything else - a network blip mid-refresh - is
+                            // worth retrying, so the loop is left alone.
                             log.log(Level.WARNING, "order_events_session_refresh_failed", exc)
                         }
                     }

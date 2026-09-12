@@ -82,6 +82,18 @@ class Database(dbPath: Path) : AutoCloseable {
                 )
                 """.trimIndent(),
             )
+
+            // One machine can serve different shops over its life: a shop signs
+            // in with its own credentials and the agent re-pairs to them. The
+            // jobs already here belong to whoever had the machine before, and
+            // are invisible to the new shop's credential - so they must not be
+            // resumed, which means knowing whose they were.
+            //
+            // Added separately rather than in the CREATE above because installs
+            // predating it exist, and CREATE TABLE IF NOT EXISTS leaves those
+            // untouched. Already-present is the normal case on every run after
+            // the first, so the duplicate-column error is expected, not a fault.
+            runCatching { st.executeUpdate("ALTER TABLE print_jobs ADD COLUMN shop_id TEXT") }
         }
     }
 
@@ -128,11 +140,17 @@ class Database(dbPath: Path) : AutoCloseable {
      * entire duplicate-print protection: nothing downstream decides whether
      * to print twice, this insert already decided it.
      */
-    fun insertJobReference(jobId: String, orderId: String, orderCode: String?, scheduledPrintAt: String? = null): Boolean = synchronized(lock) {
+    fun insertJobReference(
+        jobId: String,
+        orderId: String,
+        orderCode: String?,
+        scheduledPrintAt: String? = null,
+        shopId: String? = null,
+    ): Boolean = synchronized(lock) {
         connection.prepareStatement(
             "INSERT OR IGNORE INTO print_jobs " +
-                "(job_id, order_id, order_code, state, attempt_count, received_at, updated_at, scheduled_print_at) " +
-                "VALUES (?, ?, ?, 'RECEIVED', 0, ?, ?, ?)",
+                "(job_id, order_id, order_code, state, attempt_count, received_at, updated_at, scheduled_print_at, shop_id) " +
+                "VALUES (?, ?, ?, 'RECEIVED', 0, ?, ?, ?, ?)",
         ).use { ps ->
             val now = Instant.now().toString()
             ps.setString(1, jobId)
@@ -141,6 +159,7 @@ class Database(dbPath: Path) : AutoCloseable {
             ps.setString(4, now)
             ps.setString(5, now)
             ps.setString(6, scheduledPrintAt)
+            ps.setString(7, shopId)
             return ps.executeUpdate() == 1
         }
     }
@@ -173,10 +192,11 @@ class Database(dbPath: Path) : AutoCloseable {
         }
     }
 
-    fun unresolvedJobs(): List<JobRow> = synchronized(lock) {
+    fun unresolvedJobs(shopId: String): List<JobRow> = synchronized(lock) {
         connection.prepareStatement(
-            "SELECT * FROM print_jobs WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')",
+            "SELECT * FROM print_jobs WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') AND shop_id = ?",
         ).use { ps ->
+            ps.setString(1, shopId)
             ps.executeQuery().use { rs ->
                 val rows = mutableListOf<JobRow>()
                 while (rs.next()) rows.add(rs.toJobRow())
@@ -197,12 +217,18 @@ class Database(dbPath: Path) : AutoCloseable {
      *
      * Excludes anything still held back for a future slot; that is
      * [dueScheduledJobs]' job, and running it now would print it early.
+     *
+     * Scoped to one shop because a machine can serve several over its life -
+     * each shop signs in with its own credentials and the agent re-pairs. A
+     * job left behind by the previous shop is not this one's to resume, and
+     * claiming it would be done with credentials that cannot even see it.
      */
-    fun resumableJobs(): List<JobRow> = synchronized(lock) {
+    fun resumableJobs(shopId: String): List<JobRow> = synchronized(lock) {
         connection.prepareStatement(
             "SELECT * FROM print_jobs WHERE state IN ('RECEIVED', 'VALIDATING', 'DOWNLOADING', 'DOWNLOADED') " +
-                "AND scheduled_print_at IS NULL",
+                "AND scheduled_print_at IS NULL AND shop_id = ?",
         ).use { ps ->
+            ps.setString(1, shopId)
             ps.executeQuery().use { rs ->
                 val rows = mutableListOf<JobRow>()
                 while (rs.next()) rows.add(rs.toJobRow())
@@ -212,12 +238,13 @@ class Database(dbPath: Path) : AutoCloseable {
     }
 
     /** RECEIVED jobs held back for a future print time whose time has now arrived. */
-    fun dueScheduledJobs(nowIso: String): List<JobRow> = synchronized(lock) {
+    fun dueScheduledJobs(nowIso: String, shopId: String): List<JobRow> = synchronized(lock) {
         connection.prepareStatement(
             "SELECT * FROM print_jobs WHERE state = 'RECEIVED' " +
-                "AND scheduled_print_at IS NOT NULL AND scheduled_print_at <= ?",
+                "AND scheduled_print_at IS NOT NULL AND scheduled_print_at <= ? AND shop_id = ?",
         ).use { ps ->
             ps.setString(1, nowIso)
+            ps.setString(2, shopId)
             ps.executeQuery().use { rs ->
                 val rows = mutableListOf<JobRow>()
                 while (rs.next()) rows.add(rs.toJobRow())

@@ -116,7 +116,7 @@ suspend fun handleJobReference(
     orderCode: String?,
     scheduledPrintAt: String? = null,
 ) {
-    val isNew = ctx.db.insertJobReference(jobId, orderId, orderCode, scheduledPrintAt)
+    val isNew = ctx.db.insertJobReference(jobId, orderId, orderCode, scheduledPrintAt, ctx.credential.shopId)
     if (!isNew) {
         log.fine("duplicate_job_reference_ignored job=$jobId")
         return
@@ -141,7 +141,7 @@ suspend fun handleJobReference(
  * one late by however long all the others took.
  */
 fun processDueScheduledJobs(ctx: JobContext, dispatcher: JobDispatcher) {
-    for (row in ctx.db.dueScheduledJobs(nowIso())) {
+    for (row in ctx.db.dueScheduledJobs(nowIso(), ctx.credential.shopId)) {
         log.info("scheduled_print_job_due job=${row.jobId} order=${row.orderId}")
         dispatcher.submit(row.jobId) { processJob(ctx, row.jobId) }
     }
@@ -156,7 +156,7 @@ fun processDueScheduledJobs(ctx: JobContext, dispatcher: JobDispatcher) {
  * [Database.resumableJobs] for why only the pre-printing states qualify.
  */
 fun resumeInterruptedJobs(ctx: JobContext, dispatcher: JobDispatcher) {
-    for (row in ctx.db.resumableJobs()) {
+    for (row in ctx.db.resumableJobs(ctx.credential.shopId)) {
         log.info("resuming_interrupted_job job=${row.jobId} state=${row.state}")
         // Rewind to the start rather than continuing from where it stopped.
         // [processJob] always begins by moving to VALIDATING, and the state

@@ -198,17 +198,22 @@ class AgentCore(val settings: Settings) {
         onEmit("orders", emptyMap())
     }
 
-    fun unresolvedJobs(): List<Map<String, Any?>> = db.unresolvedJobs().map { row ->
-        mapOf(
-            "jobId" to row.jobId,
-            "orderId" to row.orderId,
-            "orderCode" to row.orderCode,
-            "state" to row.state,
-            "attemptCount" to row.attemptCount,
-            "lastError" to row.lastError,
-            "updatedAt" to row.updatedAt,
-            "scheduledPrintAt" to row.scheduledPrintAt,
-        )
+    fun unresolvedJobs(): List<Map<String, Any?>> {
+        // Nothing to show before this machine belongs to a shop, and once it
+        // does, another shop's leftovers are not this one's business.
+        val shopId = agentCredential?.shopId ?: return emptyList()
+        return db.unresolvedJobs(shopId).map { row ->
+            mapOf(
+                "jobId" to row.jobId,
+                "orderId" to row.orderId,
+                "orderCode" to row.orderCode,
+                "state" to row.state,
+                "attemptCount" to row.attemptCount,
+                "lastError" to row.lastError,
+                "updatedAt" to row.updatedAt,
+                "scheduledPrintAt" to row.scheduledPrintAt,
+            )
+        }
     }
 
     private fun requireSession(): CredentialStore.OwnerSession = ownerSession ?: error("not signed in")
@@ -252,6 +257,7 @@ class AgentCore(val settings: Settings) {
     // --- background loops ---
 
     private suspend fun heartbeatLoop() {
+        log.info("heartbeat_loop_started interval=${settings.heartbeatIntervalSeconds}s shop=${agentCredential?.shopId}")
         while (true) {
             val credential = agentCredential
             if (credential != null) {
