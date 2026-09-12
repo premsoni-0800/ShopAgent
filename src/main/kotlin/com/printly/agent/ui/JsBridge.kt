@@ -61,7 +61,7 @@ class JsBridge(private val core: AgentCore, private val executeScript: (String) 
         "set_password" -> ok { core.setPassword(args[0] as String) }
         "sign_out" -> { core.signOut(); mapOf("ok" to true) }
         "status" -> core.status()
-        "get_config" -> mapOf("msg91WidgetId" to (System.getenv("PRINTLY_MSG91_WIDGET_ID") ?: ""))
+        "get_config" -> mapOf("msg91WidgetId" to core.settings.msg91WidgetId)
         "unresolved_jobs" -> core.unresolvedJobs()
         "resolve_print_job" -> resolvePrintJob(args[0] as String, args[1] as Boolean, args.getOrNull(2) as? String)
         "list_orders" -> okList("orders") { core.listOrders() }

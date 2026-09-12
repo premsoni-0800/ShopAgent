@@ -10,8 +10,15 @@ import java.nio.file.Paths
 const val APP_NAME = "PrintlyAgentKt"
 const val DEFAULT_BACKEND_BASE_URL = "https://printly-3fa8.onrender.com"
 
+// The widget id is not a secret - it ships inside every Printly client (same
+// value as PrintlyShopDashboard's VITE_MSG91_WIDGET_ID and Printlypartner's
+// MSG91_WIDGET_ID, and the Python agent's own DEFAULT_MSG91_WIDGET_ID). The
+// MSG91 auth key stays server-side; only the API ever holds it.
+const val DEFAULT_MSG91_WIDGET_ID = "366961726a63303938373737"
+
 data class Settings(
     val backendBaseUrl: String,
+    val msg91WidgetId: String,
     val appDataDir: Path,
     val dbPath: Path,
     val logDir: Path,
@@ -39,6 +46,7 @@ fun loadSettings(): Settings {
 
     return Settings(
         backendBaseUrl = (System.getenv("PRINTLY_BACKEND_URL") ?: DEFAULT_BACKEND_BASE_URL).trimEnd('/'),
+        msg91WidgetId = System.getenv("PRINTLY_MSG91_WIDGET_ID") ?: DEFAULT_MSG91_WIDGET_ID,
         appDataDir = appDataDir,
         dbPath = appDataDir.resolve("agent.db"),
         logDir = logDir,

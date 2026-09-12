@@ -10,12 +10,15 @@ import java.awt.Graphics2D
 import java.awt.print.PageFormat
 import java.awt.print.Printable
 import java.awt.print.PrinterJob
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 import java.util.UUID
 import javax.print.PrintService
 import javax.print.attribute.HashPrintRequestAttributeSet
 import javax.print.attribute.standard.Chromaticity
 import javax.print.attribute.standard.Copies
+import javax.print.attribute.standard.Destination
 import javax.print.attribute.standard.JobName
 import javax.print.attribute.standard.MediaSizeName
 import javax.print.attribute.standard.Sides
@@ -94,6 +97,20 @@ fun printPdf(service: PrintService, pdfPath: Path, options: PrintOptions, docume
         attributes.add(if (options.duplexMode == DuplexMode.DOUBLE_SIDED) Sides.DUPLEX else Sides.ONE_SIDED)
         PAPER_SIZE_TO_MEDIA[options.paperSize]?.let { attributes.add(it) }
 
+        // A "print-to-file" driver (Microsoft Print to PDF, XPS Document
+        // Writer, ...) asks the OS for a destination filename via a native
+        // Save-As dialog on every job unless one is supplied up front - fatal
+        // for an unattended agent, since nothing is there to click it. Only
+        // such drivers advertise support for this attribute at all (a real
+        // physical printer does not), so this is a no-op everywhere else.
+        // Doubles as this project's virtual-printer output for dev/testing -
+        // see the master prompt's "Virtual Printer -> Output PDF" step.
+        if (service.isAttributeCategorySupported(Destination::class.java)) {
+            val outputDir = virtualPrinterOutputDir()
+            Files.createDirectories(outputDir)
+            attributes.add(Destination(outputDir.resolve("$jobNameToken.pdf").toUri()))
+        }
+
         try {
             printerJob.print(attributes)
         } catch (exc: Exception) {
@@ -104,6 +121,13 @@ fun printPdf(service: PrintService, pdfPath: Path, options: PrintOptions, docume
     }
 
     return jobNameToken
+}
+
+/** Where a print-to-file driver's output actually lands - not a secret, not customer data retention (it's the agent's own already-printed copy, in its own app-data folder, not a shop-browsable location). */
+internal fun virtualPrinterOutputDir(): Path {
+    val base = System.getenv("LOCALAPPDATA")?.let { Paths.get(it) }
+        ?: Paths.get(System.getProperty("user.home"), ".printlyagentkt")
+    return base.resolve("PrintlyAgentKt").resolve("virtual-printer-output")
 }
 
 /** 1-based page numbers, e.g. "1-5,8" -> [1,2,3,4,5,8]. Never trusts a range past [documentPageCount]. */
