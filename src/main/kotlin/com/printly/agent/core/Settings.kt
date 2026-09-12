@@ -37,14 +37,20 @@ data class Settings(
     /**
      * How many print jobs may be in flight at once.
      *
-     * More than one because a morning backlog is the normal case, and printing
-     * it strictly one at a time means the last student waits for every job
-     * ahead of theirs to download, print *and* have its outcome confirmed by
-     * the spooler. Bounded because the gain flattens quickly: a shop has a
-     * handful of physical printers, and jobs beyond that just queue in the
-     * driver while still each holding a downloaded document in the temp dir.
+     * One by default, because a shop has one printer.
+     *
+     * Concurrency here only buys anything when there is somewhere for the
+     * extra work to go. Against a file writer it is a real win - 100 jobs ran
+     * at 37/min four at a time against 17/min one at a time, because the
+     * rendering overlaps. Against a single physical printer there is no such
+     * gain: the driver serialises them anyway, so all four slots do is hold
+     * four downloaded documents in the temp dir and blur which job the spooler
+     * is actually reporting on.
+     *
+     * Raise it to the number of printers the shop really has, via
+     * PRINTLY_MAX_CONCURRENT_PRINT_JOBS. Beyond that it costs and does not pay.
      */
-    val maxConcurrentPrintJobs: Int = 4,
+    val maxConcurrentPrintJobs: Int = 1,
     val reconnectBaseDelaySeconds: Double = 1.0,
     val reconnectMaxDelaySeconds: Double = 60.0,
     val downloadTimeoutSeconds: Long = 60,
@@ -68,6 +74,13 @@ fun loadSettings(): Settings {
     return Settings(
         backendBaseUrl = (System.getenv("PRINTLY_BACKEND_URL") ?: DEFAULT_BACKEND_BASE_URL).trimEnd('/'),
         msg91WidgetId = System.getenv("PRINTLY_MSG91_WIDGET_ID") ?: DEFAULT_MSG91_WIDGET_ID,
+        // A shop that genuinely has more than one printer can say so without a
+        // rebuild. Nonsense values fall back rather than starting an agent
+        // that prints nothing (0) or thrashes the temp dir (300).
+        maxConcurrentPrintJobs = System.getenv("PRINTLY_MAX_CONCURRENT_PRINT_JOBS")
+            ?.toIntOrNull()
+            ?.takeIf { it in 1..16 }
+            ?: 1,
         appDataDir = appDataDir,
         dbPath = appDataDir.resolve("agent.db"),
         logDir = logDir,
