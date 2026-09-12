@@ -82,7 +82,7 @@ class OrderEventsClient(
             }
         }
 
-        val eventSource = EventSources.createFactory(api.http).newEventSource(request, listener)
+        val eventSource = EventSources.createFactory(api.sseHttp).newEventSource(request, listener)
         try {
             done.await()
         } finally {

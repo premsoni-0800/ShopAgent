@@ -3,7 +3,6 @@ package com.printly.agent.net
 import com.printly.agent.credentials.CredentialStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import okhttp3.Response
@@ -12,7 +11,14 @@ import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import java.util.logging.Logger
 
-typealias JobReferenceHandler = suspend (jobId: String, orderId: String, orderCode: String?) -> Unit
+/**
+ * Deliberately not a `suspend` function. A handler here is called from
+ * OkHttp's SSE reader thread, and anything it waits for is time that
+ * connection spends reading nothing - so the contract is that a handler
+ * queues the work and returns, never that it does the work. See
+ * [com.printly.agent.jobs.JobDispatcher].
+ */
+typealias JobReferenceHandler = (jobId: String, orderId: String, orderCode: String?) -> Unit
 
 /**
  * SSE client for `/api/v1/print-agent/events`, with reconnect and
@@ -72,7 +78,7 @@ class PrintJobSseClient(
                     val payload: Map<String, Any?> = api.mapper.readValue(data, Map::class.java) as Map<String, Any?>
                     val jobId = payload["jobId"] as? String ?: return
                     val orderId = payload["orderId"] as? String ?: return
-                    runBlocking { onJobReference(jobId, orderId, null) }
+                    onJobReference(jobId, orderId, null)
                 } catch (exc: Exception) {
                     log.warning("sse_malformed_event: $exc")
                 }
@@ -89,7 +95,7 @@ class PrintJobSseClient(
             }
         }
 
-        val eventSource = EventSources.createFactory(api.http).newEventSource(request, listener)
+        val eventSource = EventSources.createFactory(api.sseHttp).newEventSource(request, listener)
         try {
             done.await()
         } finally {

@@ -3,8 +3,10 @@ package com.printly.agent.core
 import com.printly.agent.credentials.CredentialStore
 import com.printly.agent.db.Database
 import com.printly.agent.jobs.JobContext
+import com.printly.agent.jobs.JobDispatcher
 import com.printly.agent.jobs.handleJobReference
 import com.printly.agent.jobs.processDueScheduledJobs
+import com.printly.agent.jobs.resumeInterruptedJobs
 import com.printly.agent.net.ApiError
 import com.printly.agent.net.OrderEventsClient
 import com.printly.agent.net.PrintJobSseClient
@@ -55,6 +57,8 @@ class AgentCore(val settings: Settings) {
     private val scope = CoroutineScope(Dispatchers.Default + supervisorJob)
     private var jobs: List<Job> = emptyList()
 
+    private val dispatcher = JobDispatcher(scope, settings.maxConcurrentPrintJobs)
+
     private val sse = PrintJobSseClient(api, { agentCredential }, ::onJobReference)
     private val orderEvents = OrderEventsClient(api, { ownerSession }, ::onOrdersChanged, ::refreshOwnerSession)
 
@@ -75,6 +79,7 @@ class AgentCore(val settings: Settings) {
             scope.launch { orderEvents.runForever() },
             scope.launch { scheduledJobsLoop() },
             scope.launch { jobReconcileLoop() },
+            scope.launch { resumeInterruptedJobsOnce() },
         )
     }
 
@@ -262,10 +267,28 @@ class AgentCore(val settings: Settings) {
         }
     }
 
-    private suspend fun onJobReference(jobId: String, orderId: String, orderCode: String?) {
+    /**
+     * Hands the job to [dispatcher] and returns at once.
+     *
+     * Returning immediately is the point, not a detail. This is called from
+     * OkHttp's SSE reader thread and from the reconciliation loop, and both
+     * used to *await* the whole pipeline - download, print, and up to five
+     * minutes of watching the spooler - before doing anything else. While that
+     * ran, the stream read no further events and the poll loop's interval had
+     * not even started counting, so a second order placed during a print was
+     * not merely printed late, it was not delivered at all until the first one
+     * finished.
+     *
+     * [computeScheduledPrintAt] moves inside the dispatched block for the same
+     * reason: it makes its own HTTP call, which has no business happening on a
+     * socket reader thread.
+     */
+    private fun onJobReference(jobId: String, orderId: String, orderCode: String?) {
         val credential = agentCredential ?: return
-        val scheduledPrintAt = computeScheduledPrintAt(orderId)
-        handleJobReference(jobContext(credential), jobId, orderId, orderCode, scheduledPrintAt)
+        dispatcher.submit(jobId) {
+            val scheduledPrintAt = computeScheduledPrintAt(orderId)
+            handleJobReference(jobContext(credential), jobId, orderId, orderCode, scheduledPrintAt)
+        }
     }
 
     private fun onJobProgress() {
@@ -316,12 +339,35 @@ class AgentCore(val settings: Settings) {
             val credential = agentCredential
             if (credential != null) {
                 try {
-                    processDueScheduledJobs(jobContext(credential))
+                    processDueScheduledJobs(jobContext(credential), dispatcher)
                 } catch (exc: Exception) {
                     log.log(Level.SEVERE, "scheduled_jobs_check_failed", exc)
                 }
             }
             delay(scheduledJobCheckInterval.toMillis())
+        }
+    }
+
+    /**
+     * Picks up whatever the last run was in the middle of when it stopped.
+     *
+     * A job the agent had already recorded locally is invisible to every other
+     * path: the SSE push and the reconciliation poll both funnel into
+     * [handleJobReference], which drops any id already in the database as a
+     * duplicate. That is correct - it is what stops a document printing twice -
+     * but it means a job interrupted between "recorded" and "printed" is
+     * stranded permanently unless something goes looking for it once, here.
+     *
+     * Waits for the first heartbeat so a resumed job is not attempted while
+     * the backend is still unreachable, which would just burn its retries.
+     */
+    private suspend fun resumeInterruptedJobsOnce() {
+        delay(settings.heartbeatIntervalSeconds * 1000)
+        val credential = agentCredential ?: return
+        try {
+            resumeInterruptedJobs(jobContext(credential), dispatcher)
+        } catch (exc: Exception) {
+            log.log(Level.SEVERE, "resume_interrupted_jobs_failed", exc)
         }
     }
 

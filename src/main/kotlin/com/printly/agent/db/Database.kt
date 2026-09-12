@@ -10,8 +10,21 @@ import java.time.Instant
  * handled this job", direct port of the Python agent's `db.py`. Every write
  * is a plain committed statement, never buffered in memory only, so it
  * survives a crash, a Windows restart, or a network outage.
+ *
+ * Every public method holds [lock], because more than one print job now runs
+ * at a time (see [com.printly.agent.jobs.JobDispatcher]) and they all share
+ * the one [connection]. A JDBC `Connection` is not safe to drive from several
+ * threads at once, and the specific thing that would break is the one that
+ * matters most: [insertJobReference] is the *entire* duplicate-print
+ * protection, and it is only a guard while "check and insert" stays
+ * indivisible. Serialising here costs nothing worth measuring - SQLite
+ * serialises writes internally regardless, and these critical sections are
+ * microseconds of local I/O - whereas the failure it prevents is printing a
+ * customer's document twice.
  */
 class Database(dbPath: Path) : AutoCloseable {
+
+    private val lock = Any()
 
     private val connection: Connection = DriverManager.getConnection("jdbc:sqlite:$dbPath").also {
         it.autoCommit = true
@@ -72,18 +85,18 @@ class Database(dbPath: Path) : AutoCloseable {
         }
     }
 
-    override fun close() = connection.close()
+    override fun close() = synchronized(lock) { connection.close() }
 
     // --- agent_state ---
 
-    fun getState(key: String): String? {
+    fun getState(key: String): String? = synchronized(lock) {
         connection.prepareStatement("SELECT value FROM agent_state WHERE key = ?").use { ps ->
             ps.setString(1, key)
             ps.executeQuery().use { rs -> return if (rs.next()) rs.getString("value") else null }
         }
     }
 
-    fun setState(key: String, value: String) {
+    fun setState(key: String, value: String) = synchronized(lock) {
         connection.prepareStatement(
             "INSERT INTO agent_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         ).use { ps ->
@@ -115,7 +128,7 @@ class Database(dbPath: Path) : AutoCloseable {
      * entire duplicate-print protection: nothing downstream decides whether
      * to print twice, this insert already decided it.
      */
-    fun insertJobReference(jobId: String, orderId: String, orderCode: String?, scheduledPrintAt: String? = null): Boolean {
+    fun insertJobReference(jobId: String, orderId: String, orderCode: String?, scheduledPrintAt: String? = null): Boolean = synchronized(lock) {
         connection.prepareStatement(
             "INSERT OR IGNORE INTO print_jobs " +
                 "(job_id, order_id, order_code, state, attempt_count, received_at, updated_at, scheduled_print_at) " +
@@ -132,7 +145,7 @@ class Database(dbPath: Path) : AutoCloseable {
         }
     }
 
-    fun getJob(jobId: String): JobRow? {
+    fun getJob(jobId: String): JobRow? = synchronized(lock) {
         connection.prepareStatement("SELECT * FROM print_jobs WHERE job_id = ?").use { ps ->
             ps.setString(1, jobId)
             ps.executeQuery().use { rs -> return if (rs.next()) rs.toJobRow() else null }
@@ -145,7 +158,7 @@ class Database(dbPath: Path) : AutoCloseable {
         printerWindowsName: String? = null,
         lastError: String? = null,
         incrementAttempt: Boolean = false,
-    ) {
+    ) = synchronized(lock) {
         connection.prepareStatement(
             "UPDATE print_jobs SET state = ?, printer_windows_name = COALESCE(?, printer_windows_name), " +
                 "last_error = ?, attempt_count = attempt_count + ?, updated_at = ? WHERE job_id = ?",
@@ -160,7 +173,7 @@ class Database(dbPath: Path) : AutoCloseable {
         }
     }
 
-    fun unresolvedJobs(): List<JobRow> {
+    fun unresolvedJobs(): List<JobRow> = synchronized(lock) {
         connection.prepareStatement(
             "SELECT * FROM print_jobs WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')",
         ).use { ps ->
@@ -172,8 +185,34 @@ class Database(dbPath: Path) : AutoCloseable {
         }
     }
 
+    /**
+     * Jobs a restart interrupted that it is *safe* to simply run again.
+     *
+     * Only the states before anything reached a printer qualify. Once a job is
+     * SUBMITTED or PRINTING the spooler may already have put ink on paper, and
+     * nothing readable afterwards distinguishes "died before printing" from
+     * "died after printing" - so those are deliberately left alone for a human
+     * to resolve via [unresolvedJobs] rather than reprinted on a guess. Same
+     * rule as the pipeline's UNKNOWN outcome, and for the same reason.
+     *
+     * Excludes anything still held back for a future slot; that is
+     * [dueScheduledJobs]' job, and running it now would print it early.
+     */
+    fun resumableJobs(): List<JobRow> = synchronized(lock) {
+        connection.prepareStatement(
+            "SELECT * FROM print_jobs WHERE state IN ('RECEIVED', 'VALIDATING', 'DOWNLOADING', 'DOWNLOADED') " +
+                "AND scheduled_print_at IS NULL",
+        ).use { ps ->
+            ps.executeQuery().use { rs ->
+                val rows = mutableListOf<JobRow>()
+                while (rs.next()) rows.add(rs.toJobRow())
+                return rows
+            }
+        }
+    }
+
     /** RECEIVED jobs held back for a future print time whose time has now arrived. */
-    fun dueScheduledJobs(nowIso: String): List<JobRow> {
+    fun dueScheduledJobs(nowIso: String): List<JobRow> = synchronized(lock) {
         connection.prepareStatement(
             "SELECT * FROM print_jobs WHERE state = 'RECEIVED' " +
                 "AND scheduled_print_at IS NOT NULL AND scheduled_print_at <= ?",
@@ -189,7 +228,7 @@ class Database(dbPath: Path) : AutoCloseable {
 
     // --- job_events ---
 
-    fun recordEvent(jobId: String, event: String, detail: String? = null) {
+    fun recordEvent(jobId: String, event: String, detail: String? = null) = synchronized(lock) {
         connection.prepareStatement("INSERT INTO job_events (job_id, at, event, detail) VALUES (?, ?, ?, ?)").use { ps ->
             ps.setString(1, jobId)
             ps.setString(2, Instant.now().toString())
@@ -209,7 +248,7 @@ class Database(dbPath: Path) : AutoCloseable {
         paperSizes: String,
         status: String,
         isSystemDefault: Boolean,
-    ) {
+    ) = synchronized(lock) {
         connection.prepareStatement(
             "INSERT INTO printers (windows_printer_name, display_name, color_capable, duplex_capable, paper_sizes, " +
                 "status, is_system_default, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +

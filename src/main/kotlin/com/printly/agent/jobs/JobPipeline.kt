@@ -129,11 +129,41 @@ suspend fun handleJobReference(
     processJob(ctx, jobId)
 }
 
-/** Prints every job whose held-back time has now arrived - see `handleJobReference`'s [scheduledPrintAt]. */
-suspend fun processDueScheduledJobs(ctx: JobContext) {
+/**
+ * Prints every job whose held-back time has now arrived - see
+ * `handleJobReference`'s [scheduledPrintAt].
+ *
+ * Dispatches rather than awaiting: several scheduled slots commonly come due
+ * in the same tick, and printing them one after another would make the last
+ * one late by however long all the others took.
+ */
+fun processDueScheduledJobs(ctx: JobContext, dispatcher: JobDispatcher) {
     for (row in ctx.db.dueScheduledJobs(nowIso())) {
         log.info("scheduled_print_job_due job=${row.jobId} order=${row.orderId}")
-        processJob(ctx, row.jobId)
+        dispatcher.submit(row.jobId) { processJob(ctx, row.jobId) }
+    }
+}
+
+/**
+ * Re-runs the jobs a restart left stranded partway through.
+ *
+ * Without this they are stuck for good: the local row exists, so
+ * [Database.insertJobReference] drops every later redelivery of that id as a
+ * duplicate, and nothing else ever looks at it again. See
+ * [Database.resumableJobs] for why only the pre-printing states qualify.
+ */
+fun resumeInterruptedJobs(ctx: JobContext, dispatcher: JobDispatcher) {
+    for (row in ctx.db.resumableJobs()) {
+        log.info("resuming_interrupted_job job=${row.jobId} state=${row.state}")
+        // Rewind to the start rather than continuing from where it stopped.
+        // [processJob] always begins by moving to VALIDATING, and the state
+        // machine has no edge back to it from DOWNLOADING or DOWNLOADED - so
+        // resuming in place would trip the illegal-transition guard and mark a
+        // job FAILED that has not even been attempted. Replaying from the top
+        // is safe precisely because none of these states has reached a
+        // printer; the download is simply done again.
+        ctx.db.updateJobState(row.jobId, RECEIVED)
+        dispatcher.submit(row.jobId) { processJob(ctx, row.jobId) }
     }
 }
 

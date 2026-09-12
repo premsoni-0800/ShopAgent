@@ -34,6 +34,17 @@ data class Settings(
      * the local database, so it never re-prints anything.
      */
     val jobReconcileIntervalSeconds: Long = 10,
+    /**
+     * How many print jobs may be in flight at once.
+     *
+     * More than one because a morning backlog is the normal case, and printing
+     * it strictly one at a time means the last student waits for every job
+     * ahead of theirs to download, print *and* have its outcome confirmed by
+     * the spooler. Bounded because the gain flattens quickly: a shop has a
+     * handful of physical printers, and jobs beyond that just queue in the
+     * driver while still each holding a downloaded document in the temp dir.
+     */
+    val maxConcurrentPrintJobs: Int = 4,
     val reconnectBaseDelaySeconds: Double = 1.0,
     val reconnectMaxDelaySeconds: Double = 60.0,
     val downloadTimeoutSeconds: Long = 60,

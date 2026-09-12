@@ -32,6 +32,31 @@ class PrintlyApiClient(val baseUrl: String) {
         .callTimeout(Duration.ofSeconds(30))
         .build()
 
+    /**
+     * The client every SSE stream must use - [http]'s timeouts are correct for
+     * a request/response call and fatal for a long-lived one.
+     *
+     * `callTimeout` bounds the *whole* call, response body included, so a
+     * stream opened with [http] is killed 30 seconds in no matter how healthy
+     * it is. Worse, OkHttp's default 10s `readTimeout` fires in the first
+     * quiet gap: the backend's broadcasters ping every 15s
+     * (`OrderEventBroadcaster.HEARTBEAT_INTERVAL_MS`), so a well-behaved idle
+     * stream is *guaranteed* to be torn down 5 seconds before the keepalive
+     * that would have proved it alive. The reconnect loop then reopens it and
+     * the same thing happens again - a permanent flap that looks like a flaky
+     * network and quietly costs every event that lands in the gap.
+     *
+     * So: no call timeout at all, and a read timeout at four pings' worth.
+     * Silence that long is a genuinely dead link, not an idle one, and
+     * reconnecting is the right answer. `pingInterval` adds HTTP/2 PING frames
+     * underneath, which notice a half-open socket without waiting for that.
+     */
+    val sseHttp: OkHttpClient = http.newBuilder()
+        .callTimeout(Duration.ZERO)
+        .readTimeout(Duration.ofSeconds(60))
+        .pingInterval(Duration.ofSeconds(20))
+        .build()
+
     val mapper: ObjectMapper = jacksonObjectMapper()
         .registerModule(JavaTimeModule())
         .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
