@@ -21,7 +21,12 @@ import java.util.logging.Logger
  * order 31 watched 47 come out.
  *
  * Ordering is by the number in the order code - `HH-000032` sorts as 32 - so
- * the queue matches what is written on the receipt. Anything with no readable
+ * the queue matches what is written on the receipt. Ahead of all of it sits
+ * in-shop priority: a student who has walked to the counter and scanned the
+ * shop's QR is standing there waiting, and the backend has already agreed to
+ * serve them next. Without this the agent quietly overruled that - the backend
+ * hands out priority jobs first, and sorting the whole queue by order number
+ * put them straight back behind everything else. Anything with no readable
  * number sorts last rather than first: unknown should wait behind known, never
  * jump the counter. Ties break on job id so the order is total and stable.
  *
@@ -87,14 +92,14 @@ class PrintQueue(
      * returns immediately either way. Never throws: callers are event
      * listeners and polling loops with nowhere to put an exception.
      */
-    fun enqueue(jobId: String, orderCode: String?, work: suspend () -> Unit): Boolean {
+    fun enqueue(jobId: String, orderCode: String?, priority: Boolean = false, work: suspend () -> Unit): Boolean {
         if (!known.add(jobId)) {
             log.fine("job_already_queued job=$jobId")
             return false
         }
-        pending.add(Entry(orderSequence(orderCode), jobId, orderCode, work))
+        pending.add(Entry(orderSequence(orderCode), jobId, orderCode, priority, work))
         signal.trySend(Unit)
-        log.info("print_job_queued job=$jobId order=${orderCode ?: "?"} depth=${known.size}")
+        log.info("print_job_queued job=$jobId order=${orderCode ?: "?"} priority=$priority depth=${known.size}")
         onDepthChanged()
         return true
     }
@@ -112,10 +117,26 @@ class PrintQueue(
         val sequence: Long,
         val jobId: String,
         val orderCode: String?,
+        val priority: Boolean,
         val work: suspend () -> Unit,
     ) : Comparable<Entry> {
+        /**
+         * Priority first, then the number on the receipt, then the job id so
+         * the order is total and stable.
+         *
+         * Priority is deliberately the outermost key rather than a bonus
+         * applied to the number: the point of it is that somebody is standing
+         * at the counter, and that outranks every order not yet collected,
+         * however low its number.
+         */
         override fun compareTo(other: Entry): Int =
-            compareValuesBy(this, other, { it.sequence }, { it.jobId })
+            compareValuesBy(
+                this,
+                other,
+                { if (it.priority) 0 else 1 },
+                { it.sequence },
+                { it.jobId },
+            )
     }
 }
 

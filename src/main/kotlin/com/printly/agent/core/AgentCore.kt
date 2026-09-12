@@ -374,10 +374,15 @@ class AgentCore(val settings: Settings) {
     private fun onJobReference(jobId: String, orderId: String, orderCode: String?) {
         val credential = agentCredential ?: return
         intake.submit(jobId) {
-            val plan = schedulePlanFor(orderScheduledSlotStart(orderId), scheduledPrintLeadTime, Instant.now())
-            when (plan) {
+            val lookup = orderScheduledSlotStart(orderId)
+            // Read off the same answer the schedule came from. The order lookup
+            // is an HTTP call this path already makes, and OrderResponse has
+            // carried inShopPriority all along - so knowing that a student is
+            // standing at the counter costs nothing extra.
+            val priority = (lookup as? ScheduleLookup.Known)?.priority == true
+            when (val plan = schedulePlanFor(lookup, scheduledPrintLeadTime, Instant.now())) {
                 is SchedulePlan.PrintAt ->
-                    handleJobReference(jobContext(credential), printQueue, jobId, orderId, orderCode, plan.at)
+                    handleJobReference(jobContext(credential), printQueue, jobId, orderId, orderCode, plan.at, priority)
                 // Deliberately records nothing. Recording the job means deciding
                 // when to print it, and that is the one thing this path could
                 // not find out - so it is left to the ten-second reconciliation
@@ -433,7 +438,11 @@ class AgentCore(val settings: Settings) {
         val order = withContext(Dispatchers.IO) {
             ownerRequest { s -> api.ownerGet(s, "/api/v1/shop/${s.shopId}/orders/$orderId") }
         }
-        ScheduleLookup.Known((order as? Map<String, Any?>)?.get("scheduledSlotStart") as? String)
+        val fields = order as? Map<String, Any?>
+        ScheduleLookup.Known(
+            slotStart = fields?.get("scheduledSlotStart") as? String,
+            priority = fields?.get("inShopPriority") == true,
+        )
     } catch (exc: CancellationException) {
         throw exc
     } catch (exc: ApiError) {
@@ -525,8 +534,12 @@ class AgentCore(val settings: Settings) {
 
 /** What the backend could tell the agent about an order's slot. */
 internal sealed interface ScheduleLookup {
-    /** The server answered. [slotStart] is null when the order genuinely has no slot. */
-    data class Known(val slotStart: String?) : ScheduleLookup
+    /**
+     * The server answered. [slotStart] is null when the order genuinely has no
+     * slot, and [priority] is true when the student has scanned the shop's QR
+     * at the counter and the backend has agreed to serve them next.
+     */
+    data class Known(val slotStart: String?, val priority: Boolean = false) : ScheduleLookup
 
     /** It could not be asked, and asking again shortly might work - a 5xx, a timeout, a dropped connection. */
     object Unavailable : ScheduleLookup

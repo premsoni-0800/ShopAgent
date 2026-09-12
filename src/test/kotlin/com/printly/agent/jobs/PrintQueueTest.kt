@@ -144,6 +144,67 @@ class PrintQueueTest {
         assertEquals(listOf(order(2)), printed)
     }
 
+    /**
+     * The student is standing at the counter, having scanned the shop's QR,
+     * and the backend has already agreed to serve them next. Sorting the whole
+     * queue by order number put them straight back behind everything else -
+     * the agent quietly overruling the thing the scan exists to do.
+     */
+    @Test
+    fun `a priority order prints before every number waiting`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val printed = Collections.synchronizedList(mutableListOf<String>())
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { gate.await() }
+        listOf(8, 12, 31).forEach { n ->
+            queue.enqueue("job-$n", order(n)) { printed.add(order(n)) }
+        }
+        // Arrives last, with the highest number, and still goes first.
+        queue.enqueue("job-99", order(99), priority = true) { printed.add(order(99)) }
+
+        assertEquals(
+            listOf(99, 8, 12, 31).map(::order),
+            queue.waiting(),
+            "priority outranks the number on the receipt, however low",
+        )
+
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+
+        assertEquals(listOf(99, 8, 12, 31).map(::order), printed)
+    }
+
+    /** Two people at the counter are still served in the order they queued. */
+    @Test
+    fun `priority orders are themselves ordered by number`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { gate.await() }
+        queue.enqueue("job-40", order(40), priority = true) {}
+        queue.enqueue("job-20", order(20), priority = true) {}
+        queue.enqueue("job-5", order(5)) {}
+
+        assertEquals(listOf(20, 40, 5).map(::order), queue.waiting())
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+    }
+
+    /** Nothing asked for priority, so nothing gets it. */
+    @Test
+    fun `an ordinary queue is unchanged`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { gate.await() }
+        listOf(47, 12, 31).forEach { n -> queue.enqueue("job-$n", order(n)) {} }
+
+        assertEquals(listOf(12, 31, 47).map(::order), queue.waiting())
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+    }
+
     @Test
     fun `an unreadable order code waits behind every readable one`() {
         assertEquals(32L, orderSequence("HH-000032"))

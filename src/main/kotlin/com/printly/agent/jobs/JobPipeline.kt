@@ -149,9 +149,10 @@ suspend fun handleJobReference(
     orderId: String,
     orderCode: String?,
     scheduledPrintAt: String? = null,
+    priority: Boolean = false,
 ) {
     if (registerJobReference(ctx, jobId, orderId, orderCode, scheduledPrintAt)) {
-        queue.enqueue(jobId, orderCode) { processJob(ctx, jobId) }
+        queue.enqueue(jobId, orderCode, priority) { processJob(ctx, jobId) }
     }
 }
 
