@@ -190,6 +190,16 @@ class PrintlyAgentApp : Application() {
         engine.load("http://127.0.0.1:$port/")
 
         primaryStage.title = "Printly Partner"
+        // The icon on the running window and in the taskbar, which is separate
+        // from the one jpackage stamps on the installed shortcut - a shop PC
+        // shows this one all day, and without it the window wears the stock
+        // Java mark. Best-effort: a missing or unreadable resource is not a
+        // reason to refuse to open the app.
+        runCatching {
+            PrintlyAgentApp::class.java.getResourceAsStream("/printly-icon.png")?.use { stream ->
+                primaryStage.icons.add(javafx.scene.image.Image(stream))
+            }
+        }.onFailure { log.fine("window_icon_unavailable: $it") }
         primaryStage.scene = Scene(webView, 1100.0, 720.0)
         primaryStage.setOnCloseRequest {
             core.stop()

@@ -130,6 +130,19 @@ abstract class JPackageTask @Inject constructor(private val execOps: ExecOperati
             "--vendor", "Printly",
             "--description", "Printly Print Agent - turns paid shop orders into physical prints",
         )
+
+        // The shop PC's Start menu, taskbar and desktop shortcut all take this.
+        // Without it jpackage falls back to the stock Java icon, which tells a
+        // shopkeeper looking for "the printing app" nothing at all. Generated
+        // by src/main/packaging/MakeIcon.java - see its comment for why the
+        // mark is drawn rather than converted from the SVG.
+        val icon = project.file("src/main/packaging/printly.ico")
+        if (icon.exists()) {
+            args += listOf("--icon", icon.absolutePath)
+        } else {
+            logger.warn("no icon at ${icon.path} - packaging with the default Java icon")
+        }
+
         if (type != "app-image") {
             args += listOf("--win-menu", "--win-shortcut", "--win-dir-chooser")
         }
