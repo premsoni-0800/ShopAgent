@@ -56,6 +56,9 @@ class JsBridge(private val core: AgentCore, private val executeScript: (String) 
 
     @Suppress("UNCHECKED_CAST")
     private fun dispatch(method: String, args: List<Any?>): Any? = when (method) {
+        "adopt_session" -> adoptSession(
+            args[0] as String, args[1] as String, args[2] as String, args.getOrNull(3) as? String,
+        )
         "sign_in_password" -> signInPassword(args[0] as String, args[1] as String)
         "sign_in_otp" -> signInOtp(args[0] as String)
         "set_password" -> ok { core.setPassword(args[0] as String) }
@@ -68,6 +71,25 @@ class JsBridge(private val core: AgentCore, private val executeScript: (String) 
         "list_printers" -> okList("printers") { core.listPrinters() }
         "set_auto_print" -> ok { core.setAutoPrint(args[0] as Boolean) }
         else -> mapOf("ok" to false, "error" to "unknown bridge method: $method")
+    }
+
+    /**
+     * The dashboard handing over the session it just signed in with, so this
+     * machine pairs itself without anyone typing a code.
+     *
+     * Reports [Auth.AnotherMachinePairedError] by its code rather than as a
+     * generic failure: it is the one outcome the page can act on, by telling
+     * the owner which PC currently holds the registration.
+     */
+    private fun adoptSession(accessToken: String, refreshToken: String, shopId: String, shopName: String?): Map<String, Any?> = try {
+        core.adoptOwnerSession(accessToken, refreshToken, shopId, shopName)
+        mapOf("ok" to true, "status" to core.status())
+    } catch (exc: Auth.AnotherMachinePairedError) {
+        mapOf("ok" to false, "code" to "ANOTHER_MACHINE_PAIRED", "error" to exc.message)
+    } catch (exc: ApiError) {
+        mapOf("ok" to false, "code" to exc.code, "error" to exc.message)
+    } catch (exc: Exception) {
+        mapOf("ok" to false, "error" to (exc.message ?: "Something went wrong"))
     }
 
     private fun signInPassword(identifier: String, password: String): Map<String, Any?> = try {

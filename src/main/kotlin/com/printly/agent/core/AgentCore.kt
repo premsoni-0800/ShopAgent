@@ -102,6 +102,32 @@ class AgentCore(val settings: Settings) {
         Auth.setPassword(api, requireSession(), password)
     }
 
+    /**
+     * Takes over the session the dashboard just signed in with, and pairs this
+     * machine on the strength of it.
+     *
+     * This is what removes the pairing code. A code exists to carry proof of
+     * ownership from a browser, where the owner is signed in, to a desktop app
+     * that has no way to know who they are - and typing six characters across
+     * that gap was the only reason it was ever asked for. In this app there is
+     * no gap: the dashboard in the window and the agent behind it are one
+     * process, so the session is simply handed over.
+     *
+     * Idempotent, because the page hands it over on every sign-in and on every
+     * reload: pairing an already-paired machine re-uses the registration it
+     * already holds (see [Auth.ensurePaired]), and [start] is a no-op once the
+     * loops are running.
+     *
+     * Still fails loudly if another machine holds this shop's registration -
+     * that is a real conflict a person has to resolve, not something to paper
+     * over by quietly stealing the pairing from the PC that has the printers.
+     */
+    fun adoptOwnerSession(accessToken: String, refreshToken: String, shopId: String, shopName: String?): CredentialStore.OwnerSession {
+        val session = CredentialStore.OwnerSession(accessToken, refreshToken, shopId, shopName)
+        CredentialStore.saveOwnerSession(session)
+        return afterSignIn(session)
+    }
+
     private fun afterSignIn(session: CredentialStore.OwnerSession): CredentialStore.OwnerSession {
         ownerSession = session
         agentCredential = Auth.ensurePaired(api, session)

@@ -318,8 +318,8 @@ class PrintlyAgentApp : Application() {
                   window.javaBridge.invoke(method, requestId, JSON.stringify(callArgs));
                 });
               }
-              var methods = ['sign_in_password','sign_in_otp','set_password','sign_out','status','get_config',
-                'unresolved_jobs','resolve_print_job','list_orders','list_printers','set_auto_print'];
+              var methods = ['adopt_session','sign_in_password','sign_in_otp','set_password','sign_out','status',
+                'get_config','unresolved_jobs','resolve_print_job','list_orders','list_printers','set_auto_print'];
               var api = {};
               methods.forEach(function(m) {
                 api[m] = function() { return call.apply(null, [m].concat(Array.prototype.slice.call(arguments))); };
