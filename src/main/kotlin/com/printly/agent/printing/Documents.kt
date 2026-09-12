@@ -19,7 +19,11 @@ data class ValidatedDocument(val path: Path, val pageCount: Int)
  */
 fun downloadDocument(http: OkHttpClient, url: String, tempDir: Path, timeoutSeconds: Long): Path {
     Files.createDirectories(tempDir)
-    val destination = tempDir.resolve("${UUID.randomUUID().toString().replace("-", "")}.pdf")
+    // Prefixed with this process's id so [sweepOrphanedDocuments] can tell a
+    // file another running agent is still printing from one abandoned by an
+    // agent that died.
+    val pid = ProcessHandle.current().pid()
+    val destination = tempDir.resolve("$pid-${UUID.randomUUID().toString().replace("-", "")}.pdf")
 
     val client = http.newBuilder().callTimeout(Duration.ofSeconds(timeoutSeconds)).build()
     val request = Request.Builder().url(url).build()
@@ -28,6 +32,37 @@ fun downloadDocument(http: OkHttpClient, url: String, tempDir: Path, timeoutSeco
         Files.newOutputStream(destination).use { out -> response.body?.byteStream()?.copyTo(out) }
     }
     return destination
+}
+
+/**
+ * Deletes customer documents left behind by an agent that did not shut down.
+ *
+ * The pipeline deletes each file in a `finally`, which covers every way a job
+ * can end - but not the ways the *process* can end. A crash, a kill from Task
+ * Manager, or the counter PC losing power leaves somebody's coursework sitting
+ * in the temp directory indefinitely, on a machine in a shop. The rule for
+ * these files is download, print, delete; this is what makes it true across a
+ * restart as well as across a job.
+ *
+ * Only sweeps files whose owning process is gone, so a second agent - or a
+ * long job still spooling in another instance - is never robbed of the
+ * document it is printing. A file whose name predates this scheme, or whose
+ * pid has since been recycled onto a live process, is left for the next run
+ * rather than risked.
+ */
+fun sweepOrphanedDocuments(tempDir: Path): Int {
+    if (!Files.isDirectory(tempDir)) return 0
+    var removed = 0
+    runCatching {
+        Files.newDirectoryStream(tempDir, "*.pdf").use { entries ->
+            entries.forEach { entry ->
+                val pid = entry.fileName.toString().substringBefore('-').toLongOrNull() ?: return@forEach
+                val ownerAlive = ProcessHandle.of(pid).map { it.isAlive }.orElse(false)
+                if (!ownerAlive && runCatching { Files.deleteIfExists(entry) }.getOrDefault(false)) removed++
+            }
+        }
+    }
+    return removed
 }
 
 /**

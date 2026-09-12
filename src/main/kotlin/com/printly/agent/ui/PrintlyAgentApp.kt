@@ -10,9 +10,11 @@ import javafx.concurrent.Worker
 import javafx.scene.Scene
 import javafx.scene.control.Alert
 import javafx.scene.control.ButtonType
+import javafx.scene.web.WebEngine
 import javafx.scene.web.WebView
 import javafx.stage.Stage
 import netscape.javascript.JSObject
+import java.awt.Desktop
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.URI
@@ -107,9 +109,24 @@ class PrintlyAgentApp : Application() {
         }
 
         val bridge = JsBridge(core) { script -> engine.executeScript(script) }
+        val uiPort = webUiServer.address.port
 
+        // The bridge is the whole agent: signInPassword, adoptSession, print
+        // control. It used to be handed to whatever finished loading, which is
+        // only safe while nothing but our own bundles can ever load - and that
+        // was not true. The dashboard previews customer-uploaded documents in
+        // an iframe, and a document that can reach `top.location` navigates
+        // this window anywhere it likes; the next SUCCEEDED would then have
+        // handed that page the bridge.
+        //
+        // Now the origin is checked first, so even a successful navigation
+        // away gets an ordinary browser window with no agent in it.
         engine.loadWorker.stateProperty().addListener { _, _, state ->
             if (state == Worker.State.SUCCEEDED) {
+                if (!isLocalUi(engine.location, uiPort)) {
+                    log.warning("bridge_withheld location=${engine.location}")
+                    return@addListener
+                }
                 try {
                     val window = engine.executeScript("window") as JSObject
                     window.setMember("javaBridge", bridge)
@@ -118,6 +135,36 @@ class PrintlyAgentApp : Application() {
                     log.log(Level.SEVERE, "bridge_injection_failed", exc)
                 }
             }
+        }
+
+        // Belt to that brace: refuse the navigation itself rather than only
+        // withholding the bridge afterwards. A page that cannot load cannot
+        // phish the shopkeeper for the password they are used to typing here
+        // either, which withholding the bridge alone would not prevent.
+        engine.locationProperty().addListener { _, previous, next ->
+            if (isLocalUi(next, uiPort)) return@addListener
+            log.warning("external_navigation_blocked url=$next")
+            val back = previous?.takeIf { isLocalUi(it, uiPort) } ?: "http://127.0.0.1:$uiPort/"
+            Platform.runLater {
+                engine.loadWorker.cancel()
+                engine.load(back)
+                openInSystemBrowser(next)
+            }
+        }
+
+        // target="_blank" and window.open returned null here, so every such
+        // link was simply dead - an invoice or a report that opened nothing.
+        // They now go to the real browser, which is also where anything
+        // outside this app belongs.
+        engine.setCreatePopupHandler { _ ->
+            val popup = WebEngine()
+            popup.locationProperty().addListener { _, _, url ->
+                if (!url.isNullOrBlank() && url != "about:blank") {
+                    openInSystemBrowser(url)
+                    Platform.runLater { popup.load(null) }
+                }
+            }
+            popup
         }
 
         // Best-effort UI push - same "push/SSE is a hint, always refetch
@@ -167,11 +214,38 @@ class PrintlyAgentApp : Application() {
         server.executor = Executors.newCachedThreadPool { runnable ->
             Thread(runnable, "printly-webui").apply { isDaemon = true }
         }
-        server.createContext("/api") { exchange -> proxyToBackend(exchange) }
-        server.createContext("/actuator") { exchange -> proxyToBackend(exchange) }
-        server.createContext("/") { exchange -> serveStatic(exchange) }
+        val port = server.address.port
+        server.createContext("/api") { exchange -> ifAddressedLocally(exchange, port) { proxyToBackend(exchange) } }
+        server.createContext("/actuator") { exchange -> ifAddressedLocally(exchange, port) { proxyToBackend(exchange) } }
+        server.createContext("/") { exchange -> ifAddressedLocally(exchange, port) { serveStatic(exchange) } }
         server.start()
         return server
+    }
+
+    /**
+     * Rejects anything not addressed to this server by name.
+     *
+     * Binding to 127.0.0.1 keeps other machines out, but not other *pages*: a
+     * site the shopkeeper happens to visit can point its own hostname at
+     * 127.0.0.1 (DNS rebinding) and then talk to this server as same-origin,
+     * reading the replies - which here means the dashboard and a proxy that
+     * forwards to the real backend. Such a request still carries the attacker's
+     * hostname in Host, so checking it is what closes the door.
+     *
+     * A missing Host is allowed through: HTTP/1.0 clients and some local tools
+     * omit it, and no browser ever does.
+     */
+    private fun ifAddressedLocally(exchange: HttpExchange, port: Int, handler: () -> Unit) {
+        val host = exchange.requestHeaders.getFirst("Host")
+        if (host != null && host != "127.0.0.1:$port" && host != "localhost:$port") {
+            log.warning("rejected_foreign_host host=$host path=${exchange.requestURI.path}")
+            runCatching {
+                exchange.sendResponseHeaders(403, -1)
+                exchange.close()
+            }
+            return
+        }
+        handler()
     }
 
     /**
@@ -222,6 +296,39 @@ class PrintlyAgentApp : Application() {
 
     private fun readResource(path: String): ByteArray? =
         javaClass.getResourceAsStream(path)?.use { it.readBytes() }
+
+    /**
+     * Whether a URL is this app's own UI, compared by parsed scheme/host/port
+     * rather than by prefix: `http://127.0.0.1:59249@evil.com/` and
+     * `http://127.0.0.1:59249.evil.com/` both start with the local origin as
+     * text, and neither is it.
+     *
+     * Blank and `about:blank` count as local - they are what the engine reports
+     * before the first load, and treating the startup state as foreign would
+     * withhold the bridge from the real UI.
+     */
+    private fun isLocalUi(location: String?, port: Int): Boolean {
+        if (location.isNullOrBlank() || location == "about:blank") return true
+        return runCatching {
+            val uri = URI(location)
+            uri.scheme == "http" && uri.host == "127.0.0.1" && uri.port == port
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Hands a URL to the system browser. Restricted to http(s) on purpose:
+     * `browse()` on a `file:` or a registered custom scheme asks Windows to
+     * launch whatever is associated with it, and the URLs reaching here come
+     * from pages this app has just decided it does not trust.
+     */
+    private fun openInSystemBrowser(url: String?) {
+        val target = url?.takeIf { it.startsWith("http://") || it.startsWith("https://") } ?: return
+        runCatching {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                Desktop.getDesktop().browse(URI(target))
+            }
+        }.onFailure { log.log(Level.WARNING, "open_external_failed url=$target", it) }
+    }
 
     /**
      * Forwards `/api` and `/actuator` to the real backend.

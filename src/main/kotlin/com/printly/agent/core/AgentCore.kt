@@ -12,6 +12,7 @@ import com.printly.agent.net.OrderEventsClient
 import com.printly.agent.net.PrintJobSseClient
 import com.printly.agent.net.PrintlyApiClient
 import com.printly.agent.printers.discoverPrinters
+import com.printly.agent.printing.sweepOrphanedDocuments
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -82,6 +83,15 @@ class AgentCore(val settings: Settings) {
     private val scheduledJobCheckInterval: Duration = Duration.ofSeconds(30)
 
     // --- lifecycle ---
+
+    init {
+        // Before anything else, and deliberately not inside start(): documents
+        // abandoned by a crashed agent are there whether or not this one is
+        // paired, and an agent that never finishes signing in would otherwise
+        // leave them sitting on the counter PC indefinitely.
+        val swept = sweepOrphanedDocuments(settings.tempDir)
+        if (swept > 0) log.info("orphaned_documents_removed count=$swept")
+    }
 
     fun start() {
         if (ownerSession == null || agentCredential == null || jobs.isNotEmpty()) return
