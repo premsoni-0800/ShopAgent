@@ -104,6 +104,8 @@ data class PrintJobStatusUpdateRequest(
     val status: PrintJobStatus,
     val error: String? = null,
     val reasonCode: PrintJobFailureReason? = null,
+    /** The Windows printer this job went to. Sent with PRINT_SUBMITTED so the shop's job list can name it. */
+    val printerName: String? = null,
 )
 
 data class PrintJobProgressRequest(val stage: PrintJobProgressStage)

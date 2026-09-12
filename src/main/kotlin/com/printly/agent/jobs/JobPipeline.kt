@@ -196,8 +196,14 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
             downloaded.values.forEach { it.toFile().delete() }
         }
 
-        transition(ctx, jobId, SUBMITTED, printerWindowsName = submissions.last().first)
-        withContext(Dispatchers.IO) { ctx.api.reportStatus(ctx.credential, jobId, PrintJobStatus.PRINT_SUBMITTED) }
+        // The printer is recorded locally and reported at the same moment, so
+        // the shop's own job list can say which machine took the order - and,
+        // when something goes wrong later, which one to go and look at.
+        val printerUsed = submissions.last().first
+        transition(ctx, jobId, SUBMITTED, printerWindowsName = printerUsed)
+        withContext(Dispatchers.IO) {
+            ctx.api.reportStatus(ctx.credential, jobId, PrintJobStatus.PRINT_SUBMITTED, printerName = printerUsed)
+        }
 
         // javax.print's blocking submit call only proves the driver accepted
         // the job - PRINTING's own outcome (COMPLETED/FAILED/UNKNOWN) is

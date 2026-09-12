@@ -179,10 +179,14 @@ class PrintlyApiClient(val baseUrl: String) {
         status: PrintJobStatus,
         error: String? = null,
         reasonCode: PrintJobFailureReason? = null,
+        printerName: String? = null,
     ) {
         request(
             Request.Builder().url(url("/api/v1/print-agent/jobs/$jobId/status"))
-                .post(mapper.writeValueAsString(PrintJobStatusUpdateRequest(status, error, reasonCode)).toRequestBody(JSON))
+                .post(
+                    mapper.writeValueAsString(PrintJobStatusUpdateRequest(status, error, reasonCode, printerName))
+                        .toRequestBody(JSON),
+                )
                 .headers(agentHeaders(credential)).build(),
         )
     }
