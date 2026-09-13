@@ -144,6 +144,53 @@ class PrintQueueTest {
         assertEquals(listOf(order(2)), printed)
     }
 
+    /**
+     * The shop's screen is told when the queue changes shape, not on a timer.
+     *
+     * AgentCore hangs the status push off this callback, so a queue that
+     * changed quietly would leave the counter looking at a stale list - and
+     * with it the colours that say what is printing and who is waiting.
+     */
+    @Test
+    fun `the queue says when its shape changes`(): Unit = runBlocking {
+        val notifications = AtomicInteger()
+        val queue = PrintQueue(scope, workers = 1, onDepthChanged = { notifications.incrementAndGet() })
+        val running = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("job-1", order(1)) { running.complete(Unit); gate.await() }
+        withTimeout(5_000) { running.await() }
+
+        // Counted across the whole job rather than between the steps: the
+        // worker can start - and notify - before the enqueueing thread has
+        // read the count back, so the ordering is not something to assert on.
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+
+        assertTrue(
+            notifications.get() >= 3,
+            "queued, started and finished are three changes worth telling the screen about (saw ${notifications.get()})",
+        )
+    }
+
+    /** A duplicate is not a change, and must not make the screen redraw for nothing. */
+    @Test
+    fun `a job already queued raises no change`(): Unit = runBlocking {
+        val notifications = AtomicInteger()
+        val queue = PrintQueue(scope, workers = 1, onDepthChanged = { notifications.incrementAndGet() })
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("job-1", order(1)) { gate.await() }
+        withTimeout(5_000) { while (notifications.get() == 0) delay(5) }
+        val settled = notifications.get()
+
+        assertFalse(queue.enqueue("job-1", order(1)) {}, "the duplicate guard should refuse it")
+        assertEquals(settled, notifications.get(), "a refused duplicate changed nothing")
+
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+    }
+
     @Test
     fun `an unreadable order code waits behind every readable one`() {
         assertEquals(32L, orderSequence("HH-000032"))
