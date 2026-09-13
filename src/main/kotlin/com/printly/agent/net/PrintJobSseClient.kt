@@ -9,6 +9,7 @@ import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
+import java.io.IOException
 import java.util.logging.Logger
 
 /**
@@ -89,9 +90,18 @@ class PrintJobSseClient(
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                if (!done.isCompleted) {
-                    if (t != null) done.completeExceptionally(t) else done.complete(Unit)
-                }
+                if (done.isCompleted) return
+                // A clean close arrives at onClosed, never here - so everything
+                // that reaches this is a failure, including the one that turns
+                // up with a null throwable. That is OkHttp's shape for "the
+                // server rejected the subscription with an HTTP error", and
+                // treating it as a clean close meant a per-route 503 or 429 on
+                // /events became a silent ~1.3/s connect-reject loop: jobs kept
+                // printing off the ten-second reconcile poll, so the only
+                // symptom was every order arriving late.
+                done.completeExceptionally(
+                    t ?: IOException("print job stream rejected: HTTP ${response?.code ?: "?"}")
+                )
             }
         }
 
