@@ -223,12 +223,18 @@ class Database(dbPath: Path) : AutoCloseable {
     /**
      * Jobs a restart interrupted that it is *safe* to simply run again.
      *
-     * Only the states before anything reached a printer qualify. Once a job is
-     * SUBMITTED or PRINTING the spooler may already have put ink on paper, and
+     * Only the states before anything reached a printer qualify. From
+     * SUBMITTING onwards the driver may already have put ink on paper, and
      * nothing readable afterwards distinguishes "died before printing" from
      * "died after printing" - so those are deliberately left alone for a human
      * to resolve via [unresolvedJobs] rather than reprinted on a guess. Same
      * rule as the pipeline's UNKNOWN outcome, and for the same reason.
+     *
+     * SUBMITTING is what makes DOWNLOADED safe to include here. Printing is a
+     * blocking call, so before that state existed a job stayed DOWNLOADED for
+     * the whole time it was printing, and this query could not tell a job that
+     * had merely finished downloading from one that was 150 pages into a
+     * 300-page order.
      *
      * Excludes anything still held back for a future slot; that is
      * [dueScheduledJobs]' job, and running it now would print it early.
