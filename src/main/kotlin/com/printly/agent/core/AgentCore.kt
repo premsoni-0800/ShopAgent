@@ -101,7 +101,9 @@ class AgentCore(val settings: Settings) {
     private val intake = JobDispatcher(scope, maxConcurrent = INTAKE_CONCURRENCY)
 
     /** Printing: one order at a time, lowest order number first. */
-    private val printQueue = PrintQueue(scope, settings.maxConcurrentPrintJobs) { onJobProgress() }
+    // A job the print queue must wait for is one intake has fetched but not
+    // yet handed over; that is exactly what the dispatcher is counting.
+    private val printQueue = PrintQueue(scope, settings.maxConcurrentPrintJobs, { intake.activeCount > 0 }) { onJobProgress() }
 
     private val sse = PrintJobSseClient(api, { agentCredential }, ::onJobReference)
     private val orderEvents = OrderEventsClient(api, { ownerSession }, ::onOrdersChanged, ::refreshOwnerSession)

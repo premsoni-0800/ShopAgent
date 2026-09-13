@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -253,6 +254,117 @@ class PrintQueueTest {
         assertEquals(listOf(12, 31, 47).map(::order), queue.waiting())
         gate.complete(Unit)
         withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+    }
+
+    /**
+     * The bug this was reported for. A backlog does not arrive all at once -
+     * intake fetches each order in turn - so the first reference registered
+     * used to be on the printer before the rest had been looked up. On the
+     * counter, HH-000108 came out of a backlog that started at HH-000025.
+     */
+    @Test
+    fun `a backlog still arriving is not printed until intake has handed it over`(): Unit = runBlocking {
+        val intakeBusy = AtomicBoolean(true)
+        val queue = PrintQueue(scope, workers = 1, intakeBusy = { intakeBusy.get() })
+        val printed = Collections.synchronizedList(mutableListOf<String>())
+
+        // Intake is working through the backlog; the high number happens to
+        // be looked up first.
+        queue.enqueue("job-108", order(108)) { printed.add(order(108)) }
+        delay(100)
+        queue.enqueue("job-25", order(25)) { printed.add(order(25)) }
+        queue.enqueue("job-26", order(26)) { printed.add(order(26)) }
+        intakeBusy.set(false)
+
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+
+        assertEquals(
+            listOf(order(25), order(26), order(108)),
+            printed,
+            "nothing should print while intake is still holding orders that might sort ahead of it",
+        )
+    }
+
+    /**
+     * The same backlog, arriving while the printer is busy - which is when a
+     * reconciliation sweep usually finds one. The queue being non-empty says
+     * nothing about whether intake has finished; only intake does.
+     */
+    @Test
+    fun `a backlog that lands while the printer is busy still prints in order`(): Unit = runBlocking {
+        val intakeBusy = AtomicBoolean(false)
+        val queue = PrintQueue(scope, workers = 1, intakeBusy = { intakeBusy.get() })
+        val printed = Collections.synchronizedList(mutableListOf<String>())
+        val running = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { running.complete(Unit); gate.await() }
+        withTimeout(5_000) { running.await() }
+
+        intakeBusy.set(true)
+        queue.enqueue("job-108", order(108)) { printed.add(order(108)) }
+        gate.complete(Unit)
+        delay(150) // the rest of the backlog is still being fetched
+        queue.enqueue("job-25", order(25)) { printed.add(order(25)) }
+        intakeBusy.set(false)
+
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+
+        assertEquals(listOf(order(25), order(108)), printed)
+    }
+
+    /**
+     * Orders arriving one at a time, each fetched and handed over before the
+     * next turns up. Intake is idle in between, so there is nothing to wait
+     * for and the printer must not pause at all.
+     */
+    @Test
+    fun `a trickle of orders is never held up`(): Unit = runBlocking {
+        val intakeBusy = AtomicBoolean(false)
+        val queue = PrintQueue(scope, workers = 1, intakeBusy = { intakeBusy.get() }, maxIntakeWaitMillis = 10_000)
+        val printed = AtomicInteger()
+
+        val elapsed = kotlin.system.measureTimeMillis {
+            repeat(5) { n ->
+                intakeBusy.set(true)
+                queue.enqueue("job-$n", order(n)) { printed.incrementAndGet() }
+                intakeBusy.set(false)
+                delay(100)
+            }
+            withTimeout(5_000) { while (printed.get() < 5) delay(10) }
+        }
+
+        assertTrue(elapsed < 2_000, "a trickle must not be made to wait out the cap each time (took ${elapsed}ms)")
+    }
+
+    /** Intake that somehow never finishes must not hold the printer for ever. */
+    @Test
+    fun `intake that never finishes does not hold the printer past the cap`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1, intakeBusy = { true }, maxIntakeWaitMillis = 300)
+        val done = CompletableDeferred<Unit>()
+
+        queue.enqueue("job-1", order(1)) { done.complete(Unit) }
+
+        withTimeout(3_000) { done.await() }
+    }
+
+    /**
+     * And once it has given up waiting, it keeps printing. Waiting again
+     * before every sheet would turn a busy intake into a stalled printer,
+     * which is worse than not waiting at all.
+     */
+    @Test
+    fun `once the wait is capped the queue keeps printing`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1, intakeBusy = { true }, maxIntakeWaitMillis = 400)
+        val printed = AtomicInteger()
+
+        repeat(5) { n -> queue.enqueue("job-$n", order(n)) { printed.incrementAndGet() } }
+
+        val elapsed = kotlin.system.measureTimeMillis {
+            withTimeout(5_000) { while (printed.get() < 5) delay(10) }
+        }
+
+        assertTrue(elapsed < 1_200, "the cap should have been paid once, not once per sheet (took ${elapsed}ms)")
     }
 
     @Test
