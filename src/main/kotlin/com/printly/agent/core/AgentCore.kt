@@ -323,7 +323,7 @@ class AgentCore(val settings: Settings) {
         while (true) {
             val credential = agentCredential
             if (credential != null) {
-                val before = lastHeartbeatOk to autoPrintEnabled
+                val before = connectionState()
                 try {
                     val result = withContext(Dispatchers.IO) { api.heartbeat(credential, Auth.AGENT_VERSION) }
                     autoPrintEnabled = result.autoPrintEnabled
@@ -336,8 +336,9 @@ class AgentCore(val settings: Settings) {
                     // longer holds - a different problem from not answering.
                     credentialRejected = (exc as? ApiError)?.statusCode in setOf(401, 403)
                 }
-                // Push only on an actual flip - not every tick.
-                if ((lastHeartbeatOk to autoPrintEnabled) != before) onEmit("status", status())
+                // Push only on an actual flip - not every tick - but on any
+                // flip that changes what the shop is being told.
+                if (connectionState() != before) pushStatus()
             }
             delay(settings.heartbeatIntervalSeconds * 1000)
         }
@@ -420,9 +421,41 @@ class AgentCore(val settings: Settings) {
         }
     }
 
+    /**
+     * What the heartbeat watches for a change worth telling the shop about.
+     *
+     * credentialRejected belongs here and was missing. A 500 followed by a 401
+     * leaves the other two untouched, so nothing was pushed - while the meaning
+     * had changed from "the server is not answering" to "this machine is no
+     * longer paired, re-pair it", which are different things to do next. The
+     * screen kept the first message until the page's own ten-second poll
+     * happened to notice.
+     */
+    private fun connectionState() = Triple(lastHeartbeatOk, autoPrintEnabled, credentialRejected)
+
+    /**
+     * Never lets a listener take the loop down with it.
+     *
+     * onEmit reaches a JavaFX WebView, and pushing into one that is on its way
+     * out throws. It used to be the one statement in the heartbeat's loop body
+     * outside the try, so that throw ended the loop for the life of the
+     * process - the supervisor kept every other loop running, and the agent
+     * went on printing while its screen quietly stopped being told anything.
+     */
+    private fun pushStatus() {
+        runCatching { onEmit("status", status()) }
+            .onFailure { log.log(Level.FINE, "status_push_failed", it) }
+    }
+
     private fun onJobProgress() {
         onEmit("jobs", emptyMap())
         onEmit("orders", emptyMap())
+        // The queue is in status() too - its depth, what is printing, and who
+        // jumped it by scanning at the counter. Those change as jobs move
+        // rather than as the connection flips, so without this the shop's
+        // screen showed a queue up to ten seconds out of date and colours that
+        // lagged the printer.
+        pushStatus()
     }
 
     private fun onOrdersChanged() {
