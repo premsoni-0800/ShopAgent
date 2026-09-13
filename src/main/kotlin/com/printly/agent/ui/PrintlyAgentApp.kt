@@ -374,6 +374,7 @@ class PrintlyAgentApp : Application() {
                 doInput = true
             }
 
+            val forwarded = mutableListOf<String>()
             exchange.requestHeaders.forEach { (name, values) ->
                 // Origin and Host belong to the local server, not the backend;
                 // forwarding Origin is exactly what would re-introduce the CORS
@@ -381,6 +382,7 @@ class PrintlyAgentApp : Application() {
                 if (!name.equals("Origin", true) && !name.equals("Host", true) &&
                     !name.equals("Connection", true) && !name.equals("Content-Length", true)
                 ) {
+                    forwarded += name
                     values.forEach { connection.addRequestProperty(name, it) }
                 }
             }
@@ -417,6 +419,25 @@ class PrintlyAgentApp : Application() {
             }
 
             val status = connection.responseCode
+            // A refusal is not an exception, so it used to pass through without
+            // a trace - and a shop reporting "the button does nothing" left
+            // nothing behind to look at. Reads are noisy and uninteresting;
+            // a write the server refused is the thing worth recording.
+            if (status >= 400 && !exchange.requestURI.path.endsWith("/events")) {
+                // Header NAMES only - never the values. Whether Authorization
+                // survived the hop is the whole question; what it contains is
+                // not something to write to a log file on a shop counter.
+                // Gathered while the headers were being set: asking the
+                // connection afterwards throws "Already connected".
+                val sent = forwarded.sorted().joinToString(",")
+                val came = exchange.requestHeaders.keys.sorted().joinToString(",")
+                log.warning(
+                    "api_proxy_refused method=${exchange.requestMethod} " +
+                        "path=${exchange.requestURI.path} status=$status " +
+                        "requestId=${connection.getHeaderField("x-request-id") ?: "-"} " +
+                        "from_page=[$came] forwarded=[$sent]",
+                )
+            }
             connection.headerFields.forEach { (name, values) ->
                 if (name != null && !name.equals("Content-Length", true) &&
                     !name.equals("Transfer-Encoding", true) && !name.equals("Connection", true)
