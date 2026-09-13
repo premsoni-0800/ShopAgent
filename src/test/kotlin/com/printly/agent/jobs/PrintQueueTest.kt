@@ -175,20 +175,70 @@ class PrintQueueTest {
         assertEquals(listOf(99, 8, 12, 31).map(::order), printed)
     }
 
-    /** Two people at the counter are still served in the order they queued. */
+    /**
+     * Two people at the counter are a queue of two people, and the one who
+     * scanned first is at the front of it. Their order numbers say only when
+     * they placed the orders, which may have been yesterday - 40 scanning
+     * before 20 must still print first.
+     */
     @Test
-    fun `priority orders are themselves ordered by number`(): Unit = runBlocking {
+    fun `priority orders print in the order they were scanned`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val printed = Collections.synchronizedList(mutableListOf<String>())
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { gate.await() }
+        // 40 scans first, then 20 - the higher number is at the front.
+        queue.enqueue("job-40", order(40), priority = true) { printed.add(order(40)) }
+        queue.enqueue("job-20", order(20), priority = true) { printed.add(order(20)) }
+        queue.enqueue("job-5", order(5)) { printed.add(order(5)) }
+
+        assertEquals(
+            listOf(40, 20, 5).map(::order),
+            queue.waiting(),
+            "scan order decides between two people at the counter, not the receipt",
+        )
+
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+        assertEquals(listOf(40, 20, 5).map(::order), printed)
+    }
+
+    /** Everything not at the counter is still the queue the receipts describe. */
+    @Test
+    fun `orders that did not scan keep their number order`(): Unit = runBlocking {
         val queue = PrintQueue(scope, workers = 1)
         val gate = CompletableDeferred<Unit>()
 
         queue.enqueue("blocker", order(1)) { gate.await() }
-        queue.enqueue("job-40", order(40), priority = true) {}
-        queue.enqueue("job-20", order(20), priority = true) {}
-        queue.enqueue("job-5", order(5)) {}
+        queue.enqueue("job-47", order(47)) {}
+        queue.enqueue("job-12", order(12)) {}
+        queue.enqueue("job-99", order(99), priority = true) {}
 
-        assertEquals(listOf(20, 40, 5).map(::order), queue.waiting())
+        assertEquals(listOf(99, 12, 47).map(::order), queue.waiting())
         gate.complete(Unit)
         withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+    }
+
+    /** What the shop's own screen colours: green for printing, blue for the counter. */
+    @Test
+    fun `the queue says what is printing and what jumped it`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val running = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { running.complete(Unit); gate.await() }
+        withTimeout(5_000) { running.await() }
+
+        queue.enqueue("job-30", order(30), priority = true) {}
+        queue.enqueue("job-8", order(8)) {}
+
+        assertEquals(listOf(order(1)), queue.printing(), "the one on the printer")
+        assertEquals(listOf(order(30)), queue.waitingPriority(), "the one at the counter")
+
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+        assertEquals(emptyList<String>(), queue.printing(), "nothing left on the printer")
     }
 
     /** Nothing asked for priority, so nothing gets it. */

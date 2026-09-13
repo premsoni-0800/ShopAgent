@@ -26,7 +26,15 @@ import java.util.logging.Logger
  * shop's QR is standing there waiting, and the backend has already agreed to
  * serve them next. Without this the agent quietly overruled that - the backend
  * hands out priority jobs first, and sorting the whole queue by order number
- * put them straight back behind everything else. Anything with no readable
+ * put them straight back behind everything else.
+ *
+ * Priority jobs are ordered among themselves by when they arrived here, not by
+ * their number. Two people at the counter are a queue of two people, and the
+ * one who scanned first is the one standing at the front of it - their order
+ * number says only when they placed the order, which may have been yesterday.
+ * Arrival is the closest thing the agent has to scan order: the backend serves
+ * priority jobs in the order it granted them, so that is the order they reach
+ * this queue in. Anything with no readable
  * number sorts last rather than first: unknown should wait behind known, never
  * jump the counter. Ties break on job id so the order is total and stable.
  *
@@ -62,6 +70,12 @@ class PrintQueue(
     /** One permit per queued job. Workers wait on this rather than spinning. */
     private val signal = Channel<Unit>(Channel.UNLIMITED)
 
+    /** Ticks once per enqueue, so priority jobs can be ordered by when they got here. */
+    private val arrivals = java.util.concurrent.atomic.AtomicLong()
+
+    /** Order code against job id, for everything printing right now - for the UI. */
+    private val runningOrders = ConcurrentHashMap<String, String>()
+
     init {
         repeat(workers.coerceAtLeast(1)) {
             scope.launch {
@@ -69,6 +83,7 @@ class PrintQueue(
                     signal.receive()
                     val entry = pending.poll() ?: continue
                     running.add(entry.jobId)
+                    runningOrders[entry.jobId] = entry.orderCode ?: entry.jobId
                     onDepthChanged()
                     try {
                         entry.work()
@@ -79,6 +94,7 @@ class PrintQueue(
                         log.log(Level.SEVERE, "print_queue_job_failed job=${entry.jobId}", exc)
                     } finally {
                         running.remove(entry.jobId)
+                        runningOrders.remove(entry.jobId)
                         known.remove(entry.jobId)
                         onDepthChanged()
                     }
@@ -97,7 +113,7 @@ class PrintQueue(
             log.fine("job_already_queued job=$jobId")
             return false
         }
-        pending.add(Entry(orderSequence(orderCode), jobId, orderCode, priority, work))
+        pending.add(Entry(orderSequence(orderCode), arrivals.incrementAndGet(), jobId, orderCode, priority, work))
         signal.trySend(Unit)
         log.info("print_job_queued job=$jobId order=${orderCode ?: "?"} priority=$priority depth=${known.size}")
         onDepthChanged()
@@ -113,30 +129,48 @@ class PrintQueue(
     /** Waiting order codes, in the order they will print. For the UI and for tests. */
     fun waiting(): List<String> = pending.sorted().map { it.orderCode ?: it.jobId }
 
+    /** The waiting order codes that jumped the queue by scanning at the counter. */
+    fun waitingPriority(): List<String> =
+        pending.sorted().filter { it.priority }.map { it.orderCode ?: it.jobId }
+
+    /** Order codes on a printer right now - what the shop's screen shows in green. */
+    fun printing(): List<String> = runningOrders.values.sorted()
+
     private class Entry(
         val sequence: Long,
+        val arrival: Long,
         val jobId: String,
         val orderCode: String?,
         val priority: Boolean,
         val work: suspend () -> Unit,
     ) : Comparable<Entry> {
         /**
-         * Priority first, then the number on the receipt, then the job id so
-         * the order is total and stable.
+         * Priority first. Then, within each group, the key that actually
+         * describes the queue those jobs are in.
          *
          * Priority is deliberately the outermost key rather than a bonus
          * applied to the number: the point of it is that somebody is standing
          * at the counter, and that outranks every order not yet collected,
          * however low its number.
+         *
+         * Among priority jobs the key is arrival, not the number. Two people at
+         * the counter are a queue of two people, and the one who scanned first
+         * is at the front of it; their order number says only when they placed
+         * the order, which may have been yesterday. Among everything else the
+         * key is still the number, because that is the queue the receipts
+         * describe.
+         *
+         * Job id breaks a tie either way, so the order is total and stable -
+         * which a PriorityBlockingQueue requires.
          */
-        override fun compareTo(other: Entry): Int =
-            compareValuesBy(
-                this,
-                other,
-                { if (it.priority) 0 else 1 },
-                { it.sequence },
-                { it.jobId },
-            )
+        override fun compareTo(other: Entry): Int {
+            if (priority != other.priority) return if (priority) -1 else 1
+            return if (priority) {
+                compareValuesBy(this, other, { it.arrival }, { it.jobId })
+            } else {
+                compareValuesBy(this, other, { it.sequence }, { it.jobId })
+            }
+        }
     }
 }
 

@@ -215,6 +215,11 @@ class AgentCore(val settings: Settings) {
         "queueDepth" to printQueue.depth,
         "printingNow" to printQueue.activeCount,
         "queuedOrders" to printQueue.waiting(),
+        // Which of those jumped the queue by scanning at the counter, and which
+        // are on a printer right now. The agent page colours them from this:
+        // green for the one coming out, blue for the people standing there.
+        "priorityOrders" to printQueue.waitingPriority(),
+        "printingOrders" to printQueue.printing(),
         "agentVersion" to Auth.AGENT_VERSION,
         "computerName" to runCatching { java.net.InetAddress.getLocalHost().hostName }.getOrDefault("-"),
     )
