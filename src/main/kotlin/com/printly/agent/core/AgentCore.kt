@@ -3,6 +3,7 @@ package com.printly.agent.core
 import com.printly.agent.credentials.CredentialStore
 import com.printly.agent.db.Database
 import com.printly.agent.jobs.JobContext
+import com.printly.agent.jobs.TERMINAL
 import com.printly.agent.jobs.JobDispatcher
 import com.printly.agent.jobs.PrintQueue
 import com.printly.agent.jobs.handleJobReference
@@ -38,6 +39,25 @@ import java.util.logging.Logger
  * through what is already there.
  */
 private const val INTAKE_CONCURRENCY = 4
+
+/**
+ * How many already-known jobs to re-ask the backend about per pass, looking
+ * for a counter scan that landed after the order was taken.
+ *
+ * Bounded on purpose. This used to happen for *every* outstanding job on
+ * every reconciliation pass - one order lookup each, every ten seconds, for
+ * as long as the backend considered the job outstanding. A shop with a
+ * backlog, or with a few jobs waiting on a human to resolve them, therefore
+ * sat at several requests a second against its own backend for ever, and
+ * everything else the agent needed to do - claiming a job, fetching a
+ * download URL, reporting an outcome, answering a button on the shop's own
+ * screen - queued behind that.
+ *
+ * A rotating batch keeps the cost flat no matter how long the queue gets: a
+ * shop with a handful of jobs waiting still has all of them re-checked every
+ * pass, and a shop with two hundred pays exactly the same as one with six.
+ */
+private const val PRIORITY_RECHECK_BATCH = 6
 
 /**
  * Wires the pieces together: heartbeat, printer sync, and the SSE job
@@ -80,6 +100,11 @@ class AgentCore(val settings: Settings) {
     /** Best-effort UI push - the JavaFX host wires this to `webEngine.executeScript(...)`. No-op headless. */
     var onEmit: (event: String, payload: Map<String, Any?>) -> Unit = { _, _ -> }
 
+    /** See [SharedRefresh] for what a refresh stampede costs. */
+    private val ownerRefresh = SharedRefresh({ ownerSession?.accessToken }) {
+        kotlinx.coroutines.runBlocking { refreshOwnerSession() }
+    }
+
     private val supervisorJob = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.Default + supervisorJob)
     private var jobs: List<Job> = emptyList()
@@ -101,12 +126,15 @@ class AgentCore(val settings: Settings) {
     private val intake = JobDispatcher(scope, maxConcurrent = INTAKE_CONCURRENCY)
 
     /** Printing: one order at a time, lowest order number first. */
-    // A job the print queue must wait for is one intake has fetched but not
-    // yet handed over; that is exactly what the dispatcher is counting.
-    private val printQueue = PrintQueue(scope, settings.maxConcurrentPrintJobs, { intake.activeCount > 0 }) { onJobProgress() }
+    // The print queue waits only for references the queue has never seen - see
+    // [JobDispatcher.holdsPrintingCount]. It used to wait for *any* intake
+    // activity, and the reconciliation poll keeps intake active almost
+    // continuously by re-examining references that are already in the queue.
+    private val printQueue =
+        PrintQueue(scope, settings.maxConcurrentPrintJobs, { intake.holdsPrintingCount > 0 }) { onJobProgress() }
 
     private val sse = PrintJobSseClient(api, { agentCredential }, ::onJobReference)
-    private val orderEvents = OrderEventsClient(api, { ownerSession }, ::onOrdersChanged, ::refreshOwnerSession)
+    private val orderEvents = OrderEventsClient(api, { ownerSession }, ::onOrdersChanged, ::refreshOwnerSessionShared)
 
     private val scheduledJobCheckInterval: Duration = Duration.ofSeconds(30)
 
@@ -130,6 +158,7 @@ class AgentCore(val settings: Settings) {
             scope.launch { orderEvents.runForever() }.also { orderEventsJob = it },
             scope.launch { scheduledJobsLoop() },
             scope.launch { jobReconcileLoop() },
+            scope.launch { priorityRecheckLoop() },
             scope.launch { resumeInterruptedJobsOnce() },
         )
     }
@@ -294,12 +323,21 @@ class AgentCore(val settings: Settings) {
             call(session)
         } catch (exc: ApiError) {
             if (exc.code != "TOKEN_EXPIRED" && exc.code != "TOKEN_INVALID") throw exc
-            runBlockingRefresh()
+            refreshPast(session.accessToken)
             call(requireSession())
         }
     }
 
-    private fun runBlockingRefresh() = kotlinx.coroutines.runBlocking { refreshOwnerSession() }
+    private fun refreshPast(expiredAccessToken: String) = ownerRefresh.past(expiredAccessToken)
+
+    /**
+     * The same coalescing, for the callers that hold a stream rather than a
+     * request. The order-events stream refreshes when its connection is
+     * rejected mid-flight, and that lands at exactly the moment every intake
+     * lookup is being rejected too - which is the stampede [refreshPast]
+     * exists to stop.
+     */
+    private suspend fun refreshOwnerSessionShared() = refreshPast(requireSession().accessToken)
 
     private suspend fun refreshOwnerSession() {
         val session = requireSession()
@@ -396,9 +434,24 @@ class AgentCore(val settings: Settings) {
      * reason: it makes its own HTTP call, which has no business happening on a
      * socket reader thread.
      */
-    private fun onJobReference(jobId: String, orderId: String, orderCode: String?) {
+    private fun onJobReference(jobId: String, orderId: String, orderCode: String?, rechecking: Boolean = false) {
         val credential = agentCredential ?: return
-        intake.submit(jobId) {
+
+        // What, if anything, asking the backend about this reference could
+        // still tell us. Checked *before* the request rather than after it:
+        // the duplicate guard downstream is what makes re-delivery safe, but
+        // it is reached only once the order lookup has already been paid for,
+        // and re-delivery is the common case, not the rare one.
+        val work = referenceWorkFor(db.getJob(jobId))
+        if (work == ReferenceWork.NONE) return
+        // Re-checking a known job for a late counter scan is the rotating
+        // batch's job, not the reconciliation pass's - see
+        // [PRIORITY_RECHECK_BATCH].
+        if (work == ReferenceWork.RECHECK && !rechecking) return
+
+        // Only a reference the print queue has never seen can change what
+        // prints next, so only that one holds a printer.
+        intake.submit(jobId, holdsPrinting = work == ReferenceWork.NEW) {
             val lookup = orderScheduledSlotStart(orderId)
             // Read off the same answer the schedule came from. The order lookup
             // is an HTTP call this path already makes, and OrderResponse has
@@ -525,6 +578,39 @@ class AgentCore(val settings: Settings) {
         ScheduleLookup.Unavailable
     }
 
+    /**
+     * Looks for a counter scan that landed after the order was already taken.
+     *
+     * This is the ordinary way in-shop priority happens - somebody orders
+     * ahead and then walks in - so the grant almost always arrives for a job
+     * the agent already has, and the only way to hear about it is to ask.
+     * Asking about every such job on every pass is what flooded the backend,
+     * so this asks about a rotating handful instead: flat cost whatever the
+     * queue looks like, and a shop with fewer than [PRIORITY_RECHECK_BATCH]
+     * jobs open still has every one of them checked every pass.
+     *
+     * The trade is that in a long backlog a scan can take a few passes to be
+     * noticed rather than one. That is worth having: the alternative on offer
+     * was an agent that noticed instantly and was too busy asking to print.
+     */
+    private suspend fun priorityRecheckLoop() {
+        var seen = 0
+        while (true) {
+            delay(settings.jobReconcileIntervalSeconds * 1000)
+            val credential = agentCredential ?: continue
+            try {
+                val batch = db.priorityCandidates(credential.shopId, PRIORITY_RECHECK_BATCH, seen)
+                // Round the cursor back when the rotation runs off the end,
+                // rather than leaving it stranded past a queue that has since
+                // drained and never checking anything again.
+                seen = if (batch.isEmpty()) 0 else seen + batch.size
+                for (row in batch) onJobReference(row.jobId, row.orderId, row.orderCode, rechecking = true)
+            } catch (exc: Exception) {
+                log.log(Level.FINE, "priority_recheck_failed", exc)
+            }
+        }
+    }
+
     private suspend fun scheduledJobsLoop() {
         while (true) {
             val credential = agentCredential
@@ -575,9 +661,15 @@ class AgentCore(val settings: Settings) {
      * rather than merely reactive - the worst case for any job becomes one
      * interval, not "until something else happens to wake the stream".
      *
-     * Safe to run as often as we like: [handleJobReference] keys off the local
-     * database, so a job id already seen is dropped before any printer is
-     * touched. A pass with nothing new costs one GET.
+     * Safe to run as often as we like, and now actually cheap enough for that
+     * to be true. The claim here was always "a pass with nothing new costs one
+     * GET" - it did not. Every job the backend still listed was handed to
+     * [onJobReference], which spent a full order lookup on it *before*
+     * reaching the duplicate guard that would drop it. A shop with a backlog,
+     * or with a handful of UNKNOWN jobs waiting on somebody to resolve them,
+     * paid that for every one of them every ten seconds indefinitely, and the
+     * shop's own screen queued behind it. [referenceWorkFor] answers from the
+     * local row instead, so a pass with nothing new costs one GET.
      */
     private suspend fun jobReconcileLoop() {
         while (true) {
@@ -595,6 +687,67 @@ class AgentCore(val settings: Settings) {
             }
         }
     }
+}
+
+/**
+ * Runs a token refresh once for however many callers hit the same expired
+ * token together.
+ *
+ * They do arrive together: intake looks orders up [INTAKE_CONCURRENCY] at a
+ * time, the shop's screen calls in on its own thread, the order-events stream
+ * is rejected mid-flight, and a token does not expire for one of them and not
+ * the others. Unsynchronised, each ran its own refresh with the same refresh
+ * token - and a backend that rotates refresh tokens honours the first and
+ * rejects the rest, which can take the whole session down with it. From there
+ * every order lookup fails, a failed lookup is read as "ask again later", and
+ * the agent goes on heartbeating happily while picking up nothing at all:
+ * whoever is looking at the screen sees an agent that says it is connected and
+ * is not printing.
+ *
+ * Comparing [current] against the token the failed call actually used is what
+ * makes waiting cheap. A caller queued behind the refresh finds the work
+ * already done and simply retries, rather than spending a second one.
+ */
+internal class SharedRefresh(
+    private val current: () -> String?,
+    private val refresh: () -> Unit,
+) {
+    private val lock = Any()
+
+    /** Refreshes unless [staleToken] has already been refreshed past. */
+    fun past(staleToken: String) = synchronized(lock) {
+        if (current() != staleToken) return
+        refresh()
+    }
+}
+
+/** What asking the backend about a delivered job reference could still tell the agent. */
+internal enum class ReferenceWork {
+    /** Never seen here. Look it up, and hold the printer until it is in the queue. */
+    NEW,
+
+    /** Known and still open. Nothing is new except, possibly, a counter scan. */
+    RECHECK,
+
+    /** Nothing left to learn - do not spend a request on it. */
+    NONE,
+}
+
+/**
+ * Decides what a re-delivered reference is worth, from the local row alone.
+ *
+ * The reconciliation poll re-lists every job the backend still considers
+ * outstanding, which includes every job waiting in the print queue and every
+ * job sitting in UNKNOWN waiting for a human to resolve it. Each of those used
+ * to cost a full order lookup on every pass, for ever. A terminal job has
+ * nothing left to decide, and one already granted priority has nothing left to
+ * learn; both are answered here, for free, off a row that is already local.
+ */
+internal fun referenceWorkFor(known: Database.JobRow?): ReferenceWork = when {
+    known == null -> ReferenceWork.NEW
+    known.state in TERMINAL -> ReferenceWork.NONE
+    known.priority -> ReferenceWork.NONE
+    else -> ReferenceWork.RECHECK
 }
 
 /** What the backend could tell the agent about an order's slot. */

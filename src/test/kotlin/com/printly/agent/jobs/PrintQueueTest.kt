@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.AfterEach
@@ -412,6 +413,166 @@ class PrintQueueTest {
 
         gate.complete(Unit)
         withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+    }
+
+    /**
+     * The student has scanned and is standing there. Intake is busy because
+     * the shop is busy, and the wait exists to get *numbers* in order - which
+     * cannot change what goes next when a scan is already in hand. Paying it
+     * anyway left them at the counter for up to twenty seconds.
+     */
+    @Test
+    fun `a scan at the counter does not wait out the intake drain`(): Unit = runBlocking {
+        // Intake never falls quiet: a shop taking orders steadily.
+        val queue = PrintQueue(scope, workers = 1, intakeBusy = { true }, maxIntakeWaitMillis = 10_000)
+        val printed = CompletableDeferred<Unit>()
+
+        val elapsed = kotlin.system.measureTimeMillis {
+            queue.enqueue("scan", order(90), priority = true) { printed.complete(Unit) }
+            withTimeout(5_000) { printed.await() }
+        }
+
+        assertTrue(elapsed < 1_000, "a person at the counter must not wait for orders nobody is waiting on (took ${elapsed}ms)")
+    }
+
+    /** And a scan that lands while the wait is already running ends it. */
+    @Test
+    fun `a scan landing mid-wait ends the wait`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1, intakeBusy = { true }, maxIntakeWaitMillis = 10_000)
+        val printed = Collections.synchronizedList(mutableListOf<String>())
+        val scanned = CompletableDeferred<Unit>()
+
+        queue.enqueue("ordinary", order(5)) { printed.add(order(5)) }
+        delay(150) // the worker is now sitting in the intake wait
+
+        val elapsed = kotlin.system.measureTimeMillis {
+            queue.enqueue("scan", order(90), priority = true) {
+                printed.add(order(90))
+                scanned.complete(Unit)
+            }
+            withTimeout(5_000) { scanned.await() }
+        }
+
+        assertEquals(order(90), printed.first(), "the counter goes first")
+        assertTrue(elapsed < 1_000, "the wait should have ended the moment the scan arrived (took ${elapsed}ms)")
+    }
+
+    /**
+     * The usual way in-shop priority happens: the student ordered ahead, so
+     * the job is already waiting here as an ordinary one by the time they
+     * walk in and scan. The grant used to reach a queue that had already
+     * refused the job as a duplicate, and went nowhere.
+     */
+    @Test
+    fun `an order already waiting is moved to the front when its student scans`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val printed = Collections.synchronizedList(mutableListOf<String>())
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { gate.await() }
+        listOf(8, 12, 90).forEach { n -> queue.enqueue("job-$n", order(n)) { printed.add(order(n)) } }
+        assertEquals(listOf(8, 12, 90).map(::order), queue.waiting())
+
+        assertTrue(queue.promote("job-90"), "the scan should have moved it")
+        assertEquals(listOf(90, 8, 12).map(::order), queue.waiting())
+        assertEquals(listOf(order(90)), queue.waitingPriority(), "the screen should colour them as being at the counter")
+
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+        assertEquals(listOf(90, 8, 12).map(::order), printed)
+    }
+
+    /**
+     * Scanning joins the back of the counter queue, not the front of it -
+     * somebody who scanned while this one was still walking over is ahead.
+     */
+    @Test
+    fun `a later scan queues behind one already at the counter`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { gate.await() }
+        queue.enqueue("job-40", order(40), priority = true) {}
+        queue.enqueue("job-20", order(20)) {}
+
+        assertTrue(queue.promote("job-20"))
+        assertEquals(listOf(40, 20).map(::order), queue.waiting(), "the lower number scanned second")
+
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+    }
+
+    @Test
+    fun `promoting refuses a job that is not waiting`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val running = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("printing", order(1)) { running.complete(Unit); gate.await() }
+        withTimeout(5_000) { running.await() }
+
+        assertFalse(queue.promote("printing"), "there is nothing left ahead of a job already on the printer")
+        assertFalse(queue.promote("never-heard-of-it"))
+
+        queue.enqueue("counter", order(9), priority = true) {}
+        assertFalse(queue.promote("counter"), "already at the front")
+
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+    }
+
+    /**
+     * Promotion takes an entry out of the heap and puts a new one back, and
+     * workers are woken by counted permits. Get that wrong and a job sits in
+     * the queue for ever with nothing left to wake a worker for it.
+     */
+    @Test
+    fun `a promoted queue still drains completely`(): Unit = runBlocking {
+        val queue = PrintQueue(scope, workers = 1)
+        val printed = AtomicInteger()
+        val gate = CompletableDeferred<Unit>()
+
+        queue.enqueue("blocker", order(1)) { gate.await() }
+        repeat(20) { n -> queue.enqueue("job-$n", order(n + 2)) { printed.incrementAndGet() } }
+        repeat(20) { n -> queue.promote("job-$n") }
+
+        gate.complete(Unit)
+        withTimeout(5_000) { while (queue.depth > 0) delay(10) }
+        assertEquals(20, printed.get(), "promotion must not strand a job with no permit to wake a worker")
+    }
+
+    /**
+     * Scans and the printer are not taking turns: people walk up to the
+     * counter while the queue is draining. Promotion takes an entry out of the
+     * heap and puts another back, and workers are woken by counted permits -
+     * a worker polling that gap would spend a permit on nothing and strand
+     * whatever the count no longer covers.
+     */
+    @Test
+    fun `scans arriving while the queue drains lose nothing and duplicate nothing`(): Unit = runBlocking {
+        repeat(5) { round ->
+            val queue = PrintQueue(scope, workers = 1)
+            val printed = Collections.synchronizedList(mutableListOf<String>())
+            val gate = CompletableDeferred<Unit>()
+
+            queue.enqueue("blocker-$round", order(1)) { gate.await() }
+            repeat(60) { n -> queue.enqueue("job-$n", order(n + 2)) { printed.add("job-$n") } }
+
+            // The counter and the printer working at the same time.
+            val scanning = launch {
+                repeat(60) { n ->
+                    queue.promote("job-$n")
+                    if (n % 7 == 0) delay(1)
+                }
+            }
+            gate.complete(Unit)
+            scanning.join()
+
+            withTimeout(10_000) { while (queue.depth > 0) delay(10) }
+
+            assertEquals(60, printed.size, "round $round: every order must print exactly once")
+            assertEquals(60, printed.toSet().size, "round $round: and none of them twice")
+        }
     }
 
     @Test

@@ -134,8 +134,13 @@ fun registerJobReference(
     orderId: String,
     orderCode: String?,
     scheduledPrintAt: String? = null,
+    priority: Boolean = false,
 ): Boolean {
-    val isNew = ctx.db.insertJobReference(jobId, orderId, orderCode, scheduledPrintAt, ctx.credential.shopId)
+    // [priority] is written down here rather than only handed to the queue
+    // because this call is the only moment the agent is told it. A held-back
+    // order is recorded now and enqueued when its slot comes due, by which
+    // time the lookup that knew about the counter is long gone.
+    val isNew = ctx.db.insertJobReference(jobId, orderId, orderCode, scheduledPrintAt, ctx.credential.shopId, priority)
     if (!isNew) {
         log.fine("duplicate_job_reference_ignored job=$jobId")
         return false
@@ -160,6 +165,15 @@ fun registerJobReference(
  * the queue was never ordered: there was never more than one thing in it to
  * sort. Intake now runs ahead of printing, and [PrintQueue] decides what
  * prints next by order number.
+ *
+ * A repeat delivery is not always nothing to do. In-shop priority is normally
+ * granted *after* the order reaches the agent - the student ordered ahead and
+ * has now walked in and scanned - so by the time the backend says so, the job
+ * is already in the queue and the reference is a duplicate. That path dropped
+ * the grant on the floor: the duplicate guard returned, and the person at the
+ * counter went on waiting behind every lower number. The reconciliation poll
+ * re-lists outstanding jobs every few seconds and looks the order up again,
+ * so it is that pass which brings the scan here to be acted on.
  */
 suspend fun handleJobReference(
     ctx: JobContext,
@@ -170,8 +184,22 @@ suspend fun handleJobReference(
     scheduledPrintAt: String? = null,
     priority: Boolean = false,
 ) {
-    if (registerJobReference(ctx, jobId, orderId, orderCode, scheduledPrintAt)) {
+    if (registerJobReference(ctx, jobId, orderId, orderCode, scheduledPrintAt, priority)) {
         queue.enqueue(jobId, orderCode, priority) { processJob(ctx, jobId) }
+        return
+    }
+    if (!priority) return
+
+    // Already known, and the student has since scanned. Written down first so
+    // that a job still held back for a later slot, or one a restart has yet to
+    // resume, keeps the grant it is too early to act on - and only then moved
+    // in the queue, if it is in one.
+    val row = ctx.db.getJob(jobId) ?: return
+    if (row.priority || row.state in TERMINAL) return
+    ctx.db.markPriority(jobId)
+    ctx.onEvent()
+    if (queue.promote(jobId)) {
+        log.info("in_shop_priority_granted job=$jobId order=$orderId")
     }
 }
 
@@ -182,10 +210,17 @@ suspend fun handleJobReference(
  * Dispatches rather than awaiting: several scheduled slots commonly come due
  * in the same tick, and printing them one after another would make the last
  * one late by however long all the others took.
+ *
+ * [Database.JobRow.priority] is carried through, and that is the whole reason
+ * it is a column. This path enqueued with the default - no priority - so an
+ * order whose student had scanned at the counter arrived in the queue as an
+ * ordinary one and went behind every lower number waiting. The scan had been
+ * read correctly half an hour earlier and then thrown away at the only point
+ * that could still act on it.
  */
 fun processDueScheduledJobs(ctx: JobContext, queue: PrintQueue) {
     for (row in ctx.db.dueScheduledJobs(nowIso(), ctx.credential.shopId)) {
-        if (queue.enqueue(row.jobId, row.orderCode) { processJob(ctx, row.jobId) }) {
+        if (queue.enqueue(row.jobId, row.orderCode, row.priority) { processJob(ctx, row.jobId) }) {
             log.info("scheduled_print_job_due job=${row.jobId} order=${row.orderId}")
         }
     }
@@ -218,7 +253,10 @@ fun resumeInterruptedJobs(ctx: JobContext, queue: PrintQueue) {
         // downloaded perfectly well and was never given the chance to print.
         // Startup is exactly when both happen at once: this sweep runs while
         // the stream is delivering today's jobs.
-        val accepted = queue.enqueue(row.jobId, row.orderCode) {
+        // Priority survives the restart with the row, for the same reason
+        // the scheduled path carries it: the order lookup that knew somebody
+        // was at the counter ran in the process that died.
+        val accepted = queue.enqueue(row.jobId, row.orderCode, row.priority) {
             ctx.db.updateJobState(row.jobId, RECEIVED)
             processJob(ctx, row.jobId)
         }

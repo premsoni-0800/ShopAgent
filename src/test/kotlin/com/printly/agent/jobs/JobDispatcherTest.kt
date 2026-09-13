@@ -126,4 +126,59 @@ class JobDispatcherTest {
         withTimeout(5_000) { while (dispatcher.activeCount > 0) delay(10) }
         assertEquals(1, completed.get())
     }
+
+    /**
+     * What the print queue waits for. It used to wait on [activeCount] - any
+     * intake at all - and the reconciliation poll keeps intake busy almost
+     * continuously by re-examining references that are already in the print
+     * queue. Those cannot sort ahead of anything, so waiting for them just
+     * left the printer idle between sheets, over and over, for the length of
+     * a backlog.
+     */
+    @Test
+    fun `only work marked as holding printing is counted against the printer`(): Unit = runBlocking {
+        val dispatcher = JobDispatcher(scope, maxConcurrent = 4)
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+
+        dispatcher.submit("recheck-1") { release.await() }
+        dispatcher.submit("recheck-2") { release.await() }
+        withTimeout(5_000) { while (dispatcher.activeCount < 2) delay(5) }
+
+        assertEquals(2, dispatcher.activeCount, "both are in flight")
+        assertEquals(0, dispatcher.holdsPrintingCount, "neither is anything the printer must wait for")
+
+        dispatcher.submit("brand-new", holdsPrinting = true) { started.complete(Unit); release.await() }
+        withTimeout(5_000) { started.await() }
+        assertEquals(1, dispatcher.holdsPrintingCount, "a reference the queue has never seen does hold it")
+
+        release.complete(Unit)
+        withTimeout(5_000) { while (dispatcher.activeCount > 0) delay(5) }
+        assertEquals(0, dispatcher.holdsPrintingCount)
+    }
+
+    /**
+     * A count left behind here holds the printer for ever - a worse failure
+     * than the one it exists to prevent - so it has to survive every way a
+     * submission can end.
+     */
+    @Test
+    fun `the printer hold is released however the work ends`(): Unit = runBlocking {
+        val dispatcher = JobDispatcher(scope, maxConcurrent = 4)
+
+        dispatcher.submit("explodes", holdsPrinting = true) { error("lookup blew up") }
+        dispatcher.submit("returns", holdsPrinting = true) {}
+
+        // A redelivery of an id already in flight is refused, and must not
+        // leave a hold behind on its way out either.
+        val running = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        assertTrue(dispatcher.submit("busy", holdsPrinting = true) { running.complete(Unit); release.await() })
+        withTimeout(5_000) { running.await() }
+        assertFalse(dispatcher.submit("busy", holdsPrinting = true) {}, "the duplicate guard should refuse it")
+        release.complete(Unit)
+
+        withTimeout(5_000) { while (dispatcher.activeCount > 0) delay(5) }
+        assertEquals(0, dispatcher.holdsPrintingCount, "nothing may be left holding the printer")
+    }
 }

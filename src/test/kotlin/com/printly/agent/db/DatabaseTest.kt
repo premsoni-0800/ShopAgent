@@ -157,4 +157,52 @@ class DatabaseTest {
             assertFalse(db.insertJobReference("job-x", "order-x", null, shopId = shopB))
         }
     }
+
+    /**
+     * The rotating batch that looks for a counter scan landing late. It has to
+     * skip everything a scan could no longer change, or the rotation spends
+     * its whole budget re-asking about jobs that finished days ago.
+     */
+    @Test
+    fun `priorityCandidates offers only the jobs a scan could still move`(@TempDir tempDir: Path) {
+        val shop = "11111111-1111-1111-1111-111111111111"
+        Database(tempDir.resolve("agent.db")).use { db ->
+            db.insertJobReference("job-open", "order-1", "HH-000001", shopId = shop)
+            db.insertJobReference("job-printing", "order-2", "HH-000002", shopId = shop)
+            db.updateJobState("job-printing", "PRINTING")
+            db.insertJobReference("job-done", "order-3", "HH-000003", shopId = shop)
+            db.updateJobState("job-done", "COMPLETED")
+            // Terminal locally, outstanding on the backend for as long as a
+            // human takes to resolve it - the one that used to be re-asked
+            // about for ever.
+            db.insertJobReference("job-unknown", "order-4", "HH-000004", shopId = shop)
+            db.updateJobState("job-unknown", "UNKNOWN")
+            db.insertJobReference("job-at-counter", "order-5", "HH-000005", shopId = shop, priority = true)
+            db.insertJobReference("job-other-shop", "order-6", "HH-000006", shopId = "22222222-2222-2222-2222-222222222222")
+
+            assertEquals(
+                listOf("job-open", "job-printing"),
+                db.priorityCandidates(shop, 10, 0).map { it.jobId },
+            )
+        }
+    }
+
+    /** Paged, so a long queue costs the backend exactly what a short one does. */
+    @Test
+    fun `priorityCandidates rotates through a backlog a page at a time`(@TempDir tempDir: Path) {
+        val shop = "11111111-1111-1111-1111-111111111111"
+        Database(tempDir.resolve("agent.db")).use { db ->
+            repeat(10) { n -> db.insertJobReference("job-$n", "order-$n", "HH-%06d".format(n), shopId = shop) }
+
+            val first = db.priorityCandidates(shop, 4, 0).map { it.jobId }
+            val second = db.priorityCandidates(shop, 4, 4).map { it.jobId }
+            val third = db.priorityCandidates(shop, 4, 8).map { it.jobId }
+
+            assertEquals(4, first.size)
+            assertEquals(4, second.size)
+            assertEquals(2, third.size, "the last page is short, and tells the cursor to start over")
+            assertEquals(10, (first + second + third).toSet().size, "the rotation must cover every job exactly once")
+            assertTrue(db.priorityCandidates(shop, 4, 10).isEmpty())
+        }
+    }
 }

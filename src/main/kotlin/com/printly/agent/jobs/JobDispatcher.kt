@@ -50,19 +50,46 @@ class JobDispatcher(
     private val slots = Semaphore(maxConcurrent)
     private val inFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
+    /**
+     * The subset of [inFlight] the print queue has to wait for.
+     *
+     * Tracked here rather than counted by the caller because this is the one
+     * place that already knows when a submission is over - and a count that
+     * can be left behind is worse than no count at all: it would hold the
+     * printer for ever, which is the failure it exists to prevent.
+     */
+    private val holding: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
     /** Visible for the UI and tests - how many jobs are running or queued right now. */
     val activeCount: Int get() = inFlight.size
+
+    /**
+     * How much in-flight work the print queue must wait for before it starts a
+     * sheet - see `PrintQueue.awaitIntakeDrained`.
+     *
+     * Deliberately not [activeCount], which is what the queue used to wait on.
+     * Intake re-examines references the queue has *already* got, over and over,
+     * for as long as the backend keeps listing them; none of that can change
+     * what prints next, and waiting for it left the printer standing idle for
+     * seconds at a time between sheets, all the way through a backlog.
+     */
+    val holdsPrintingCount: Int get() = holding.size
 
     /**
      * Queues [work] for [jobId] unless that id is already running, and returns
      * immediately either way. Never throws: a caller is an event listener or a
      * polling loop, and neither has anywhere sensible to put an exception.
+     *
+     * [holdsPrinting] marks work the print queue must not start a sheet ahead
+     * of - a reference it has never seen, which might still belong in front of
+     * what is waiting. Everything else runs without holding anything up.
      */
-    fun submit(jobId: String, work: suspend () -> Unit): Boolean {
+    fun submit(jobId: String, holdsPrinting: Boolean = false, work: suspend () -> Unit): Boolean {
         if (!inFlight.add(jobId)) {
             log.fine("job_already_in_flight job=$jobId")
             return false
         }
+        if (holdsPrinting) holding.add(jobId)
         scope.launch {
             try {
                 slots.withPermit { work() }
@@ -73,6 +100,7 @@ class JobDispatcher(
                 log.log(Level.SEVERE, "job_dispatch_failed job=$jobId", exc)
             } finally {
                 inFlight.remove(jobId)
+                holding.remove(jobId)
             }
         }
         return true

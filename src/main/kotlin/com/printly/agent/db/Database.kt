@@ -94,6 +94,19 @@ class Database(dbPath: Path) : AutoCloseable {
             // untouched. Already-present is the normal case on every run after
             // the first, so the duplicate-column error is expected, not a fault.
             runCatching { st.executeUpdate("ALTER TABLE print_jobs ADD COLUMN shop_id TEXT") }
+
+            // Whether a student was standing at the counter when this order
+            // was taken. Held in the row rather than only in the queue because
+            // the queue is not always where the job is enqueued from: an order
+            // held back for a later slot is written down now and enqueued
+            // half an hour later by [dueScheduledJobs], and one a restart
+            // interrupted is enqueued by [resumableJobs]. Both of those read
+            // the row and nothing else, so a priority that lived only in
+            // memory was silently dropped on exactly the orders that most
+            // needed it. Added by ALTER for the same reason as shop_id -
+            // installs predating it exist, and CREATE TABLE IF NOT EXISTS
+            // leaves those untouched.
+            runCatching { st.executeUpdate("ALTER TABLE print_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0") }
         }
     }
 
@@ -131,6 +144,8 @@ class Database(dbPath: Path) : AutoCloseable {
         val receivedAt: String,
         val updatedAt: String,
         val scheduledPrintAt: String?,
+        /** The order jumped the queue at the counter - see the `priority` column. */
+        val priority: Boolean = false,
     )
 
     /**
@@ -146,11 +161,12 @@ class Database(dbPath: Path) : AutoCloseable {
         orderCode: String?,
         scheduledPrintAt: String? = null,
         shopId: String? = null,
+        priority: Boolean = false,
     ): Boolean = synchronized(lock) {
         connection.prepareStatement(
             "INSERT OR IGNORE INTO print_jobs " +
-                "(job_id, order_id, order_code, state, attempt_count, received_at, updated_at, scheduled_print_at, shop_id) " +
-                "VALUES (?, ?, ?, 'RECEIVED', 0, ?, ?, ?, ?)",
+                "(job_id, order_id, order_code, state, attempt_count, received_at, updated_at, scheduled_print_at, shop_id, priority) " +
+                "VALUES (?, ?, ?, 'RECEIVED', 0, ?, ?, ?, ?, ?)",
         ).use { ps ->
             val now = Instant.now().toString()
             ps.setString(1, jobId)
@@ -160,8 +176,26 @@ class Database(dbPath: Path) : AutoCloseable {
             ps.setString(5, now)
             ps.setString(6, scheduledPrintAt)
             ps.setString(7, shopId)
+            ps.setInt(8, if (priority) 1 else 0)
             return ps.executeUpdate() == 1
         }
+    }
+
+    /**
+     * Records that this job's student has since scanned at the counter.
+     *
+     * Separate from [insertJobReference] because priority usually arrives
+     * *after* the reference does: somebody orders ahead, then walks in. The
+     * insert is a no-op by then - that is what stops the document printing
+     * twice - so without this the grant would only ever live in the running
+     * queue and be lost on the next restart.
+     */
+    fun markPriority(jobId: String) = synchronized(lock) {
+        connection.prepareStatement("UPDATE print_jobs SET priority = 1 WHERE job_id = ?").use { ps ->
+            ps.setString(1, jobId)
+            ps.executeUpdate()
+        }
+        Unit
     }
 
     fun getJob(jobId: String): JobRow? = synchronized(lock) {
@@ -274,6 +308,31 @@ class Database(dbPath: Path) : AutoCloseable {
         }
     }
 
+    /**
+     * Open jobs that have not been granted in-shop priority - the only ones a
+     * counter scan could still change - oldest first, a page at a time.
+     *
+     * Paged because the caller re-asks the backend about each one, and doing
+     * that for a whole backlog on a timer is what made the agent flood its own
+     * server. Oldest first so the rotation is stable: a page taken now and a
+     * page taken later walk the same list in the same direction.
+     */
+    fun priorityCandidates(shopId: String, limit: Int, offset: Int): List<JobRow> = synchronized(lock) {
+        connection.prepareStatement(
+            "SELECT * FROM print_jobs WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'UNKNOWN') " +
+                "AND priority = 0 AND shop_id = ? ORDER BY received_at, job_id LIMIT ? OFFSET ?",
+        ).use { ps ->
+            ps.setString(1, shopId)
+            ps.setInt(2, limit)
+            ps.setInt(3, offset)
+            ps.executeQuery().use { rs ->
+                val rows = mutableListOf<JobRow>()
+                while (rs.next()) rows.add(rs.toJobRow())
+                return rows
+            }
+        }
+    }
+
     // --- job_events ---
 
     fun recordEvent(jobId: String, event: String, detail: String? = null) = synchronized(lock) {
@@ -328,5 +387,6 @@ class Database(dbPath: Path) : AutoCloseable {
         receivedAt = getString("received_at"),
         updatedAt = getString("updated_at"),
         scheduledPrintAt = getString("scheduled_print_at"),
+        priority = getInt("priority") != 0,
     )
 }
