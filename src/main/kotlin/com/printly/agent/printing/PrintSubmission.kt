@@ -90,10 +90,31 @@ fun printPdf(service: PrintService, pdfPath: Path, options: PrintOptions, docume
         printerJob.printService = service
 
         printerJob.setPrintable(object : Printable {
+            // Java2D asks for every page at least twice - once through
+            // PeekGraphics, which draws nothing and exists only to find out what
+            // the page contains, and once for real - and more again if the job
+            // is banded. Rasterising a page costs about as much as everything
+            // else this method does, so doing it once per page instead of twice
+            // is close to halving the render time for nothing.
+            //
+            // One page held at a time: A4 at 150 DPI is roughly 8MB, and the
+            // pages are asked for in order, so keeping the last is all that is
+            // ever needed. Keeping more would be a way to run a 3,000-page job
+            // out of heap.
+            private var cachedPage = -1
+            private var cached: java.awt.image.BufferedImage? = null
+
             override fun print(graphics: Graphics, pageFormat: PageFormat, pageIndex: Int): Int {
                 if (pageIndex >= pages.size) return Printable.NO_SUCH_PAGE
                 val pageNumber = pages[pageIndex] // 1-based
-                val image = renderer.renderImageWithDPI(pageNumber - 1, 150f)
+                val image = if (cachedPage == pageIndex) {
+                    cached!!
+                } else {
+                    renderer.renderImageWithDPI(pageNumber - 1, 150f).also {
+                        cachedPage = pageIndex
+                        cached = it
+                    }
+                }
                 val g2d = graphics as Graphics2D
 
                 // Uniform scale - fit-to-page without distorting aspect ratio,
