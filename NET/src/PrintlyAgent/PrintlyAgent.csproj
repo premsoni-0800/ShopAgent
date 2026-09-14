@@ -1,0 +1,144 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The .NET port of the Printly print agent.
+
+    Mirrors the Kotlin build one setting at a time rather than taking .NET
+    defaults, because the two are meant to be comparable:
+
+      * net8.0-windows, because the agent is a Windows application end to end -
+        Windows Credential Manager, the Windows spooler, WebView2. There is no
+        cross-platform story to preserve and pretending otherwise would only
+        hide the P/Invoke.
+      * Nullable enabled, which is the closest thing to Kotlin's null safety.
+        The Kotlin source leans on it hard - LocalPrinter.colorCapable is a
+        Boolean? precisely because "the driver would not say" is a third answer
+        that must not collapse into false - and losing that distinction in the
+        port would change behaviour silently.
+      * Warnings as errors, matching a Kotlin build that compiles clean today.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>PrintlyAgent</RootNamespace>
+
+    <!--
+      Deliberately NOT "PrintlyAgent".
+
+      The Kotlin build ships an executable of that exact name, and while both
+      exist on this machine the two are indistinguishable to anything that works
+      by process name - which cost a running agent during testing, because
+      stopping "PrintlyAgent" stopped whichever one it found. A distinct name is
+      also the only way an operator can tell from Task Manager which build is
+      actually serving the counter.
+    -->
+    <AssemblyName>PrintlyAgentNet</AssemblyName>
+    <ApplicationIcon>printly.ico</ApplicationIcon>
+    <!--
+      WinForms, for two things and nothing else: the native print dialog the
+      manual print path shows, and the window the WebView2 control is hosted in.
+      Not a UI framework choice - the entire interface is the vendored dashboard
+      rendered in that control, exactly as the Kotlin build renders it in a
+      JavaFX WebView. WinForms is simply the lightest host available for it.
+    -->
+    <UseWindowsForms>true</UseWindowsForms>
+
+    <!--
+      WinExe, not Exe: a shop counter should not get a console window behind the
+      app. The logs still go to the console when one is attached, which is how
+      it is run during development.
+    -->
+    <OutputType>WinExe</OutputType>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <InformationalVersion>1.0.0</InformationalVersion>
+    <Product>Printly Print Agent</Product>
+    <Company>Printly</Company>
+    <Copyright>Copyright © Printly</Copyright>
+    <Description>Printly Print Agent - turns paid shop orders into physical prints</Description>
+
+    <!--
+      Release shape.
+
+      SelfContained with the runtime bundled, because the alternative is telling
+      a shop to install the .NET Desktop Runtime first - and the Kotlin build it
+      replaces bundled its own JRE, so anything less is a regression in what the
+      shop has to do. It costs about 150MB, which is the same order as the Java
+      build's own bundled runtime.
+
+      ReadyToRun because this is a counter app that gets launched and stared at:
+      the JIT cost shows up as the window taking noticeably longer to appear.
+
+      NOT trimmed and NOT single-file. Trimming breaks the reflection that
+      System.Drawing.Printing and the JSON serialiser rely on, and single-file
+      complicates the two native dependencies (pdfium, WebView2) for no benefit
+      a shop would ever notice - the app is installed, not carried about.
+    -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <PublishTrimmed>false</PublishTrimmed>
+    <PublishSingleFile>false</PublishSingleFile>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Kotlin's `internal` is module-scoped, and its test sources are part of the
+      same module - which is how PrintQueueTest calls orderSequence() directly.
+      InternalsVisibleTo is the faithful equivalent. Promoting those members to
+      public to make the tests compile would widen the real API surface to suit
+      the tests, which is the opposite of what `internal` was saying.
+    -->
+    <InternalsVisibleTo Include="PrintlyAgent.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The two vendored bundles, copied beside the executable and served from
+      there over the local origin.
+
+      Linked from the Kotlin project's own resources rather than duplicated:
+      they are built by the dashboard's own toolchain, and a second copy in this
+      tree would be one more thing to forget to rebuild. The same bundle the
+      Kotlin app serves is the bundle this one serves.
+    -->
+    <Content Include="..\..\..\src\main\resources\dashboard\**\*">
+      <Link>webcontent\dashboard\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\..\..\src\main\resources\webui\**\*">
+      <Link>webcontent\webui\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+
+  <ItemGroup>
+    <!--
+      The same icon again, this time as a resource the running app can read.
+      ApplicationIcon only stamps the .exe; a WinForms window keeps its own
+      default unless it is handed one, so without this the file in Explorer
+      carried the brand mark and the title bar and taskbar button did not.
+      Embedded rather than loaded from disk so it cannot go missing, and read
+      whole rather than through ExtractAssociatedIcon, which hands back a single
+      32px image that Windows then smears across a high-DPI taskbar.
+    -->
+    <EmbeddedResource Include="printly.ico" LogicalName="PrintlyAgent.printly.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Docnet.Core" Version="2.6.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
+  </ItemGroup>
+
+</Project>
