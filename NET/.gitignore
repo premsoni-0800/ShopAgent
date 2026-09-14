@@ -5,3 +5,6 @@ bin/
 obj/
 publish/
 TestResults/
+
+# Built installers. The MSI is a release artefact, not a source file.
+dist/

@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!--
+  The Windows installer for the .NET print agent.
+
+  Replaces what jpackage produced for the Kotlin build. jpackage is a Java tool
+  and there is no equivalent in the .NET SDK, so the MSI is authored directly -
+  which is what jpackage was generating underneath anyway, via the same WiX.
+
+  Deliberately a separate product from the Kotlin "PrintlyAgent" (v0.1.0), not
+  an upgrade of it: different executable, different data directory, different
+  upgrade code. An MSI can only replace something it shipped, and jpackage chose
+  that product's identity. Installing this does not remove the old one - see the
+  README beside this file.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <!--
+    Version comes from the build script, which reads it from the csproj, so the
+    assembly and the thing in Add/Remove Programs cannot drift apart.
+  -->
+  <?ifndef ProductVersion?>
+  <?define ProductVersion = "1.0.0"?>
+  <?endif?>
+
+  <!--
+    PublishDir is passed in rather than assumed, so the installer is always
+    built from a publish that was just produced rather than whatever happens to
+    be lying in the tree.
+  -->
+  <?ifndef PublishDir?>
+  <?error PublishDir must be passed with -d PublishDir=... ?>
+  <?endif?>
+
+  <Package
+      Name="Printly Print Agent"
+      Manufacturer="Printly"
+      Version="$(ProductVersion)"
+      Language="1033"
+      Codepage="1252"
+      Scope="perMachine"
+      Compressed="yes"
+      InstallerVersion="500"
+      UpgradeCode="48AC1696-66D5-412E-A1BA-96BF41BCBE7C">
+
+    <!--
+      That UpgradeCode is fixed forever. It is the only thing that lets a later
+      MSI recognise this one as the same product and upgrade it in place; change
+      it and every future version installs alongside rather than over.
+    -->
+
+    <SummaryInformation Description="Printly Print Agent - turns paid shop orders into physical prints" />
+
+    <!--
+      Removes the previous version before laying down the new one, and refuses
+      to go backwards. AfterInstallValidate so the old files are gone before the
+      new ones arrive: scheduling it later leaves both sets on disk at once,
+      which for a 158MB self-contained runtime is worth avoiding.
+    -->
+    <MajorUpgrade
+        Schedule="afterInstallValidate"
+        DowngradeErrorMessage="A newer version of Printly Print Agent is already installed. Remove it from Add or Remove Programs before installing this one." />
+
+    <!--
+      One embedded cab. The payload is a self-contained .NET runtime plus the
+      two native dependencies, so it does not compress to much less than it is.
+    -->
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!--
+      An upgrade over a running agent is the ordinary case, not the exception -
+      a shop counter leaves it up all day. Without this the installer finds its
+      own files locked, and the best it can offer is a reboot.
+
+      CloseMessage sends WM_CLOSE, which is the same thing as closing the window:
+      Program.cs shuts the loops down and closes the database on the way out, so
+      the agent is not killed mid-print.
+    -->
+    <util:CloseApplication
+        Id="CloseRunningAgent"
+        Target="PrintlyAgentNet.exe"
+        CloseMessage="yes"
+        RebootPrompt="no"
+        Timeout="20" />
+
+    <Icon Id="PrintlyIcon" SourceFile="src\PrintlyAgent\printly.ico" />
+    <Property Id="ARPPRODUCTICON" Value="PrintlyIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://printly-3fa8.onrender.com" />
+    <!--
+      No ARPNOMODIFY here: WixUI_Minimal already sets it, for the same reason -
+      there is no feature to choose, so "change" would open a dialog with
+      nothing in it.
+    -->
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Printly Print Agent" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="PrintlyMenuFolder" Name="Printly" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="Main" Title="Printly Print Agent" Level="1">
+      <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="Shortcuts" />
+      <ComponentRef Id="StartWithWindows" />
+    </Feature>
+
+    <!--
+      Every file from the publish directory, harvested rather than listed. The
+      output is 277 files - the app, a self-contained .NET runtime, pdfium, the
+      WebView2 loader and the two vendored web bundles - and a hand-written
+      manifest of that would be wrong by the next dependency change.
+    -->
+    <ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
+      <!--
+        The executable is declared by hand and excluded from the harvest below
+        purely so it has a stable id. Everything that has to point at it - the
+        shortcuts, the launch-when-finished action - needs a name that does not
+        change when the harvester reorders itself.
+      -->
+      <Component Id="MainExecutable" Guid="*">
+        <File Id="PrintlyAgentNetExe" Source="$(PublishDir)\PrintlyAgentNet.exe" KeyPath="yes" />
+      </Component>
+      <Files Include="$(PublishDir)\**">
+        <Exclude Files="$(PublishDir)\PrintlyAgentNet.exe" />
+      </Files>
+    </ComponentGroup>
+
+
+    <!--
+      Shortcuts, in a component of their own keyed on a per-user registry value.
+
+      This is the arrangement the validator insists on, and the reasoning is not
+      obvious: Windows Installer classifies a non-advertised shortcut as
+      per-user data whatever directory it lands in, so hanging one off a
+      per-machine file trips ICE38, ICE43 and ICE57 together. A per-user key
+      path makes the component consistently per-user, which is also honest about
+      what actually happens - the shortcuts are created for whoever runs the
+      installer, and Windows recreates them for another user on first use.
+
+      Targets are written as a formatted path rather than a [#file] reference so
+      the shortcut does not point into a different component (ICE69).
+    -->
+    <Component Id="Shortcuts" Directory="PrintlyMenuFolder" Guid="668970C1-4D75-4BB8-822C-77109A25A343">
+      <Shortcut
+          Id="StartMenuShortcut"
+          Name="Printly Print Agent"
+          Description="Turns paid shop orders into physical prints"
+          Target="[INSTALLFOLDER]PrintlyAgentNet.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="PrintlyIcon" />
+      <Shortcut
+          Id="DesktopShortcut"
+          Directory="DesktopFolder"
+          Name="Printly Print Agent"
+          Description="Turns paid shop orders into physical prints"
+          Target="[INSTALLFOLDER]PrintlyAgentNet.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="PrintlyIcon" />
+      <RemoveFolder Id="RemovePrintlyMenuFolder" Directory="PrintlyMenuFolder" On="uninstall" />
+      <RegistryValue
+          Root="HKCU" Key="Software\Printly\PrintAgent"
+          Name="Shortcuts" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!--
+      Started at login, because an agent that is not running prints nothing and
+      says nothing about it. A shop that reboots the counter PC and does not
+      notice the icon is gone would have orders sitting paid and unprinted with
+      no visible cause.
+
+      HKLM rather than HKCU: the counter is a shared machine and which staff
+      member happens to be logged in should not decide whether the shop prints.
+    -->
+    <Component Id="StartWithWindows" Directory="INSTALLFOLDER" Guid="*">
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="PrintlyPrintAgent"
+          Type="string"
+          Value="&quot;[INSTALLFOLDER]PrintlyAgentNet.exe&quot;"
+          KeyPath="yes" />
+    </Component>
+
+    <!--
+      WixUI_Minimal: one welcome page, a progress bar, and done. The shop owner
+      running this has no decision to make - there is no feature to choose, and
+      an install directory prompt for a background service is an invitation to
+      put it somewhere odd.
+    -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+
+    <!-- Offered, not forced: ticked by default, and the shop can untick it. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Start Printly Print Agent now" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <!--
+      [#FileId] rather than [INSTALLFOLDER]...: a property's value is not
+      expanded when it is read, so the literal text would be handed to
+      ShellExecute. A file reference is resolved to the installed path.
+    -->
+    <Property Id="WixShellExecTarget" Value="[#PrintlyAgentNetExe]" />
+    <CustomAction Id="LaunchAgent" BinaryRef="Wix4UtilCA_X64" DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
+    <UI>
+      <Publish
+          Dialog="ExitDialog"
+          Control="Finish"
+          Event="DoAction"
+          Value="LaunchAgent"
+          Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+
+  </Package>
+</Wix>
