@@ -73,7 +73,68 @@ public sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
 
         Controls.Add(_webView);
-        _ = InitialiseAsync();
+        _ = StartWebViewAsync();
+    }
+
+    /// <summary>
+    /// Brings the webview up, and says so plainly if it cannot.
+    ///
+    /// The interface is entirely inside that control, so a failure here is a
+    /// window with nothing in it. Unwrapped, the exception went to the
+    /// process-wide unobserved-task handler and the shop got a blank white
+    /// rectangle - technically logged, but nobody standing at a counter reads
+    /// a log to find out why the app they just installed looks broken.
+    ///
+    /// The case worth naming is a machine without the WebView2 runtime. It is
+    /// present on Windows 11 and on any Windows 10 that has had Edge updated,
+    /// which is nearly all of them - but "nearly" is doing real work there, and
+    /// the failure is one a shop can actually fix once it is told what it is.
+    /// </summary>
+    private async Task StartWebViewAsync()
+    {
+        try
+        {
+            await InitialiseAsync().ConfigureAwait(true);
+        }
+        catch (WebView2RuntimeNotFoundException exc)
+        {
+            _log.LogCritical(exc, "webview2_runtime_missing");
+            ShowStartupFailure(
+                "Microsoft Edge WebView2 is required",
+                "Printly Partner displays its screens using Microsoft Edge WebView2, "
+                + "which is not installed on this computer.\n\n"
+                + "Install the Microsoft Edge WebView2 Runtime, then start Printly "
+                + "Partner again. It is a free download from Microsoft:\n\n"
+                + "https://developer.microsoft.com/microsoft-edge/webview2/");
+        }
+        catch (Exception exc)
+        {
+            _log.LogCritical(exc, "webui_failed_to_start");
+            ShowStartupFailure(
+                "Printly Partner could not start",
+                "The application window could not be prepared.\n\n"
+                + exc.Message
+                + "\n\nThe log file has the details: "
+                + _core.Settings.LogDir);
+        }
+    }
+
+    /// <summary>
+    /// Replaces the empty webview with the reason it is empty, and closes when
+    /// dismissed - there is nothing this window can do without it.
+    /// </summary>
+    private void ShowStartupFailure(string caption, string detail)
+    {
+        if (IsDisposed) return;
+
+        void Show()
+        {
+            Controls.Remove(_webView);
+            MessageBox.Show(this, detail, caption, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Close();
+        }
+
+        if (InvokeRequired) BeginInvoke(Show); else Show();
     }
 
     private async Task InitialiseAsync()

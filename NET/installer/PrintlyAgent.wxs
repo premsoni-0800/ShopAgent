@@ -85,6 +85,63 @@
         RebootPrompt="no"
         Timeout="20" />
 
+    <!--
+      The one thing this package does not carry.
+
+      Everything else the agent needs is in the payload - the .NET runtime is
+      bundled, and pdfium and the WebView2 loader are statically linked against
+      the C runtime, so there is no Visual C++ redistributable to chase. The
+      exception is the Microsoft Edge WebView2 *runtime*, which is a shared
+      machine-wide component and cannot be bundled: the agent ships the loader,
+      not the browser engine it loads.
+
+      It is present on Windows 11, and on any Windows 10 whose Edge has updated
+      in the last few years - so this will rarely fire. It fires on the machines
+      where it matters: fresh images, LTSC and Server editions, and anywhere
+      Edge has been stripped out.
+
+      Checked in three places because the runtime registers in different ones
+      depending on how it was installed - per machine on 64-bit Windows the
+      EdgeUpdate key is under WOW6432Node, since the updater itself is 32-bit.
+
+      That first search says always64 while naming a WOW6432Node path, which
+      looks backwards and is deliberate: the 64-bit view is the unredirected
+      one, so the key is read exactly as written. Asking for the 32-bit view of
+      a path that already contains WOW6432Node means asking the redirector to
+      redirect an already-redirected path, and while that happens to resolve, it
+      resolves by a rule nobody should have to know.
+
+      Refusing the install is the kinder failure. The alternative is a shop
+      owner who installs successfully, launches, and gets a window with nothing
+      in it.
+    -->
+    <Property Id="WEBVIEW2WOW" Secure="yes">
+      <RegistrySearch
+          Id="WebView2PerMachineWow" Root="HKLM" Bitness="always64"
+          Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          Name="pv" Type="raw" />
+    </Property>
+    <Property Id="WEBVIEW2MACHINE" Secure="yes">
+      <RegistrySearch
+          Id="WebView2PerMachine" Root="HKLM" Bitness="always64"
+          Key="SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          Name="pv" Type="raw" />
+    </Property>
+    <Property Id="WEBVIEW2USER" Secure="yes">
+      <RegistrySearch
+          Id="WebView2PerUser" Root="HKCU"
+          Key="SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          Name="pv" Type="raw" />
+    </Property>
+
+    <!--
+      Not evaluated on uninstall: a machine that has since had the runtime
+      removed must still be able to take this program off.
+    -->
+    <Launch
+        Condition="Installed OR WEBVIEW2WOW OR WEBVIEW2MACHINE OR WEBVIEW2USER"
+        Message="This computer needs the Microsoft Edge WebView2 Runtime, which Printly Print Agent uses to display its screens. Install it from https://go.microsoft.com/fwlink/p/?LinkId=2124703 then run this installer again." />
+
     <Icon Id="PrintlyIcon" SourceFile="src\PrintlyAgent\printly.ico" />
     <Property Id="ARPPRODUCTICON" Value="PrintlyIcon" />
     <Property Id="ARPURLINFOABOUT" Value="https://printly-3fa8.onrender.com" />

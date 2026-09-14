@@ -53,6 +53,16 @@ if ($SkipPublish) {
     }
     Write-Host "  using the existing publish in $publishDir" -ForegroundColor Yellow
 } else {
+    # The publish directory is also where the agent is usually run from during
+    # development, and a running one holds its own files open. Left to itself
+    # that surfaces as "Access to the path 'Accessibility.dll' is denied", which
+    # says nothing about the actual cause.
+    $running = Get-Process PrintlyAgentNet -ErrorAction SilentlyContinue
+    if ($running) {
+        throw ("Printly Print Agent is running (pid $($running.Id -join ', ')) and is holding " +
+               "files in $publishDir open. Close it and run this again.")
+    }
+
     Write-Host '  publishing...'
     # Cleared first. dotnet publish overwrites but does not remove, so a file
     # dropped from the project would otherwise stay in the MSI forever.

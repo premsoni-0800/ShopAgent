@@ -51,6 +51,39 @@ msiexec /a .\dist\PrintlyPrintAgent-1.0.0-x64.msi /qn TARGETDIR=C:\some\empty\di
 An administrative install extracts the files and touches nothing else — no
 registry, no shortcuts, no uninstall entry.
 
+## What a target machine needs
+
+Nothing, on any current Windows - but the detail matters if you are deploying
+to machines you have not seen.
+
+| | |
+|---|---|
+| Windows | 10 version 1607 or newer, or 11. .NET 8 does not support 7 or 8.1 |
+| Architecture | 64-bit x64. Also runs on Windows 11 ARM64 under emulation; will not run on 32-bit Windows |
+| .NET runtime | **Not needed** - bundled in the package |
+| Visual C++ redistributable | **Not needed** - pdfium and the WebView2 loader are statically linked against the C runtime |
+| Microsoft Edge WebView2 Runtime | **Needed.** See below |
+
+WebView2 is the one genuine dependency, and it cannot be bundled: the agent
+ships the loader, not the browser engine the loader loads, and the engine is a
+shared machine-wide component.
+
+In practice it is already there. Windows 11 includes it; Windows 10 has had it
+delivered through Edge updates for years. It is missing on fresh or offline
+images, LTSC and Server editions, and machines where Edge has been stripped out.
+
+Both ends handle it being absent:
+
+* The installer refuses, naming the runtime and where to get it, rather than
+  installing a program that cannot draw its own window.
+* If it is removed *after* installation, the agent says so in a dialog instead
+  of opening a blank window.
+
+To pre-install it on a machine, or to script it across several:
+`https://go.microsoft.com/fwlink/p/?LinkId=2124703` is Microsoft's evergreen
+bootstrapper. `MicrosoftEdgeWebview2Setup.exe /silent /install` does it
+unattended.
+
 ## What it does to a machine
 
 | | |
