@@ -193,7 +193,7 @@ public sealed class MainForm : Form
         };
 
         _webView.Source = new Uri(_server.BaseUrl);
-        _log.LogInformation("webui_ready url={Url} dashboard=/ agentSetup=/agent", _server.BaseUrl);
+        _log.LogInformation("webui_ready url={Url} dashboard=/", _server.BaseUrl);
     }
 
     /// <summary>

@@ -228,13 +228,10 @@ public sealed class WebUiServer : IDisposable
 
     private void ServeStatic(HttpListenerContext context, string path)
     {
-        var resolved = path is "/" or "" ? "/dashboard/index.html"
-            : path is "/agent" or "/agent/" ? "/webui/index.html"
-            : null;
+        var resolved = path is "/" or "" ? "/dashboard/index.html" : null;
 
         var bytes = ReadContent(resolved)
             ?? ReadContent("/dashboard" + path)
-            ?? ReadContent("/webui" + path)
             // SPA fallback - but never for a file request, where a 404 is the
             // honest answer and handing back HTML would surface as a baffling
             // "unexpected token <" in the console instead.

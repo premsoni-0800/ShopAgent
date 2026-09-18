@@ -16,7 +16,7 @@ import java.util.logging.Logger
  * The JS-callable bridge object - equivalent of the Python agent's
  * `bridge.py` `js_api`. Exposed to the page as `window.javaBridge`; the shim
  * script [PrintlyAgentApp] injects wraps every call into the same Promise-
- * returning `window.pywebview.api.*` shape `webui/`'s own `bridge.js`
+ * returning `window.pywebview.api.*` shape the dashboard's own `bridge.js`
  * already expects, so that file needed zero changes.
  *
  * Every call is dispatched onto [Dispatchers.IO] - a bridge call may do

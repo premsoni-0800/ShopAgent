@@ -100,20 +100,16 @@
 
   <ItemGroup>
     <!--
-      The two vendored bundles, copied beside the executable and served from
+      The vendored dashboard, copied beside the executable and served from
       there over the local origin.
 
       Linked from the Kotlin project's own resources rather than duplicated:
-      they are built by the dashboard's own toolchain, and a second copy in this
-      tree would be one more thing to forget to rebuild. The same bundle the
-      Kotlin app serves is the bundle this one serves.
+      it is built by the dashboard's own toolchain (printlypartner-web), and a
+      second copy in this tree would be one more thing to forget to rebuild.
+      The same bundle the Kotlin app serves is the bundle this one serves.
     -->
     <Content Include="..\..\..\src\main\resources\dashboard\**\*">
       <Link>webcontent\dashboard\%(RecursiveDir)%(Filename)%(Extension)</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-    <Content Include="..\..\..\src\main\resources\webui\**\*">
-      <Link>webcontent\webui\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>

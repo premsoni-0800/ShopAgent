@@ -38,11 +38,13 @@ import java.util.logging.Logger
  *    settings), built from the `printlypartner` repo and vendored under
  *    `src/main/resources/dashboard/`. It talks to the real backend over HTTP
  *    like any browser would; [proxyToBackend] is what lets it.
- *  - `/agent` - this machine's own setup screen, vendored under
- *    `src/main/resources/webui/`. It does the things only the native side can:
- *    signing this PC in, pairing it, and storing the credential in Windows
- *    Credential Manager. See [JsBridge] and [SHIM_SCRIPT], which reproduce
- *    `window.pywebview` so that bundle runs unmodified.
+ *    The setup this machine needs - signing this PC in, pairing it, and storing
+ *    the credential in Windows Credential Manager - is a view inside that same
+ *    bundle, reached from the left nav. It used to be a second bundle served at
+ *    `/agent` from `src/main/resources/webui/`; the dashboard absorbed it, that
+ *    route went unvisited, and both have now been removed. See [JsBridge] and
+ *    [SHIM_SCRIPT], which reproduce `window.pywebview` so the bundle runs
+ *    unmodified.
  *
  * Served over `http://127.0.0.1` rather than as a `jar:`/classpath URL for a
  * reason inherited from the Python agent: Chromium-based webviews are
@@ -169,7 +171,7 @@ class PrintlyAgentApp : Application() {
 
         // Best-effort UI push - same "push/SSE is a hint, always refetch
         // authoritative state" pattern the rest of Printly's clients follow
-        // (see PRINTLY_ARCHITECTURE.md); webui's own `usePushData` hook
+        // (see PRINTLY_ARCHITECTURE.md); the dashboard's own `usePushData` hook
         // always refetches on this event rather than trusting a payload.
         core.onEmit = { event, payload ->
             Platform.runLater {
@@ -275,13 +277,11 @@ class PrintlyAgentApp : Application() {
             val path = exchange.requestURI.path
             val resolved = when {
                 path == "/" || path.isEmpty() -> "/dashboard/index.html"
-                path == "/agent" || path == "/agent/" -> "/webui/index.html"
                 else -> null
             }
 
             val bytes = resolved?.let { readResource(it) }
                 ?: readResource("/dashboard$path")
-                ?: readResource("/webui$path")
                 // SPA fallback - but never for a file request, where a 404 is
                 // the honest answer and handing back HTML would surface as a
                 // baffling "unexpected token <" in the console instead.

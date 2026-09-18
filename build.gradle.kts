@@ -44,7 +44,7 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.15.0")
     implementation("net.java.dev.jna:jna-platform:5.15.0")
 
-    // --- Desktop UI shell hosting the existing React webui/ unchanged
+    // --- Desktop UI shell hosting the vendored React dashboard/ unchanged
     // (replaces pywebview) ---
     implementation("org.openjfx:javafx-controls:21.0.5")
     implementation("org.openjfx:javafx-web:21.0.5")
