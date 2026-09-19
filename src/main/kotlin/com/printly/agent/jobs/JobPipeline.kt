@@ -741,7 +741,7 @@ private suspend fun downloadAll(ctx: JobContext, jobId: String, detail: PrintJob
         val url = byDocumentId[item.documentId]?.url
             ?: throw DocumentValidationError("no download URL returned for document ${item.documentId}")
         downloaded[item.itemId] = withContext(Dispatchers.IO) {
-            downloadDocument(ctx.api.http, url, ctx.tempDir, ctx.downloadTimeoutSeconds)
+            downloadDocument(ctx.api.http, url, ctx.tempDir, ctx.downloadTimeoutSeconds, key = item.itemId)
         }
     }
     return downloaded

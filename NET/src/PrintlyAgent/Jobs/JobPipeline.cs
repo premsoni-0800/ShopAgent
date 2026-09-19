@@ -1228,7 +1228,8 @@ public static class JobPipeline
             try
             {
                 downloaded[source.ItemId] = await Documents
-                    .DownloadDocumentAsync(ctx.Api.Http, source.Url, ctx.TempDir, ctx.DownloadTimeoutSeconds, cancellation)
+                    .DownloadDocumentAsync(
+                        ctx.Api.Http, source.Url, ctx.TempDir, ctx.DownloadTimeoutSeconds, cancellation, key: source.ItemId)
                     .ConfigureAwait(false);
             }
             finally

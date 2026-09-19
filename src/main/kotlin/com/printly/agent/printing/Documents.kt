@@ -6,6 +6,7 @@ import org.apache.pdfbox.Loader
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.time.Duration
 import java.util.UUID
 
@@ -18,13 +19,28 @@ data class ValidatedDocument(val path: Path, val pageCount: Int)
  * Python agent's `documents.py::download`. The caller is responsible for
  * deleting it once printing has finished, succeeded or not.
  */
-fun downloadDocument(http: OkHttpClient, url: String, tempDir: Path, timeoutSeconds: Long): Path {
+fun downloadDocument(
+    http: OkHttpClient,
+    url: String,
+    tempDir: Path,
+    timeoutSeconds: Long,
+    key: String? = null,
+): Path {
     Files.createDirectories(tempDir)
     // Prefixed with this process's id so [sweepOrphanedDocuments] can tell a
     // file another running agent is still printing from one abandoned by an
     // agent that died.
+    //
+    // [key] is what makes a retry resume instead of starting again. A name
+    // invented per call meant the second attempt at a 40MB document shared
+    // nothing with the first: a new name, a new part file, and the same bytes
+    // pulled over the same bad connection from zero - while the first attempt's
+    // partial sat in the directory with nothing left that knew its name. Given
+    // the item id, all three attempts are the same file and each one carries on
+    // from where the last stopped.
     val pid = ProcessHandle.current().pid()
-    val destination = tempDir.resolve("$pid-${UUID.randomUUID().toString().replace("-", "")}.pdf")
+    val name = key?.let(::sanitiseId) ?: UUID.randomUUID().toString().replace("-", "")
+    val destination = tempDir.resolve("$pid-$name.pdf")
     return downloadDocumentTo(http, url, destination, timeoutSeconds)
 }
 
@@ -41,12 +57,74 @@ fun downloadDocument(http: OkHttpClient, url: String, tempDir: Path, timeoutSeco
 fun downloadDocumentTo(http: OkHttpClient, url: String, destination: Path, timeoutSeconds: Long): Path {
     destination.parent?.let { Files.createDirectories(it) }
     val client = http.newBuilder().callTimeout(Duration.ofSeconds(timeoutSeconds)).build()
-    val request = Request.Builder().url(url).build()
-    client.newCall(request).execute().use { response ->
-        if (!response.isSuccessful) throw DocumentValidationError("download failed: HTTP ${response.code}")
-        Files.newOutputStream(destination).use { out -> response.body?.byteStream()?.copyTo(out) }
+
+    // Bytes land here first and are moved into place only once the transfer
+    // finishes. Two things fall out of that, and both matter on a shop counter:
+    // a half-written file is never mistaken for a document (the held store is
+    // read by name, by a process that did not write it, possibly days later),
+    // and what survives a dropped connection is a named, resumable remainder
+    // rather than rubbish to be deleted.
+    val part = destination.resolveSibling("${destination.fileName}.part")
+
+    var have = if (Files.exists(part)) runCatching { Files.size(part) }.getOrDefault(0L) else 0L
+    if (have > 0) {
+        // Ask for the rest. A signed URL that has since expired, or a store
+        // that ignores Range, is handled below rather than here - this is only
+        // the request.
+        val resumed = attempt(client, url, part, have, resume = true)
+        if (resumed) {
+            Files.move(part, destination, StandardCopyOption.REPLACE_EXISTING)
+            return destination
+        }
+        // The server would not, or could not, continue where we left off.
+        // Starting again is slower and always correct; carrying on from a
+        // partial the server did not agree to would splice two different
+        // responses into one file.
+        Files.deleteIfExists(part)
+        have = 0L
     }
+
+    attempt(client, url, part, 0L, resume = false)
+    Files.move(part, destination, StandardCopyOption.REPLACE_EXISTING)
     return destination
+}
+
+/**
+ * One transfer into [part], appending when [resume] and the server agreed to it.
+ *
+ * @return false when a resume was asked for and refused, which is the caller's
+ *   signal to start the file again. Any other failure throws: a download that
+ *   cannot happen at all is the retry loop's business, not this function's.
+ */
+private fun attempt(client: OkHttpClient, url: String, part: Path, from: Long, resume: Boolean): Boolean {
+    val request = Request.Builder().url(url)
+        .apply { if (resume && from > 0) header("Range", "bytes=$from-") }
+        .build()
+
+    client.newCall(request).execute().use { response ->
+        // 416 means the range is past the end of the object - the partial is as
+        // long as, or longer than, the file the server is offering. That is a
+        // stale or mismatched leftover, never something to append to.
+        if (resume && response.code == 416) return false
+
+        // 200 to a Range request means the store ignored it and is sending the
+        // whole object from byte zero. Appending that would double the file.
+        if (resume && response.code != 206) return false
+
+        if (!response.isSuccessful) throw DocumentValidationError("download failed: HTTP ${response.code}")
+
+        val body = response.body ?: throw DocumentValidationError("download failed: empty response")
+        val append = resume && response.code == 206
+        val options = if (append) {
+            arrayOf(StandardOpenOption.WRITE, StandardOpenOption.APPEND)
+        } else {
+            arrayOf(StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
+        }
+        if (append && !Files.exists(part)) throw DocumentValidationError("partial download vanished mid-resume")
+        if (!append) Files.deleteIfExists(part)
+        Files.newOutputStream(part, *options).use { out -> body.byteStream().copyTo(out) }
+        return true
+    }
 }
 
 /**
@@ -136,9 +214,18 @@ fun sweepOrphanedDocuments(tempDir: Path): Int {
     if (!Files.isDirectory(tempDir)) return 0
     var removed = 0
     runCatching {
-        Files.newDirectoryStream(tempDir, "*.pdf").use { entries ->
+        // Both the finished documents and the half-transferred ones. A `.part`
+        // is abandoned by exactly the same events - a crash, a kill, the
+        // counter PC losing power - and left out of this it is a customer's
+        // coursework accumulating in a temp directory for ever, just under a
+        // different extension. Held documents are not reached: they live under
+        // a sibling directory, and for them a dead owning process is the
+        // ordinary case rather than a leak.
+        Files.newDirectoryStream(tempDir).use { entries ->
             entries.forEach { entry ->
-                val pid = entry.fileName.toString().substringBefore('-').toLongOrNull() ?: return@forEach
+                val name = entry.fileName.toString()
+                if (!name.endsWith(".pdf") && !name.endsWith(".pdf.part")) return@forEach
+                val pid = name.substringBefore('-').toLongOrNull() ?: return@forEach
                 val ownerAlive = ProcessHandle.of(pid).map { it.isAlive }.orElse(false)
                 if (!ownerAlive && runCatching { Files.deleteIfExists(entry) }.getOrDefault(false)) removed++
             }

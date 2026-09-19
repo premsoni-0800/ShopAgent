@@ -78,7 +78,8 @@ public static class Documents
         string url,
         string tempDir,
         long timeoutSeconds,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? key = null)
     {
         // Prefixed with this process's id so SweepOrphanedDocuments can tell a
         // file another running agent is still printing from one abandoned by an
@@ -88,8 +89,16 @@ public static class Documents
         // parent of whatever path it is given, and doing it twice per document
         // is a second synchronous filesystem call on a path that runs once per
         // item of every order, concurrently.
+        //
+        // <paramref name="key"/> is what makes a retry resume instead of
+        // starting again. A name invented per call meant the second attempt at
+        // a 40MB document shared nothing with the first: a new name, a new part
+        // file, and the same bytes pulled over the same bad connection from
+        // zero. Given the item id, all three attempts are the same file and each
+        // carries on from where the last stopped.
         var pid = Environment.ProcessId;
-        var destination = Path.Combine(tempDir, $"{pid}-{Guid.NewGuid():N}.pdf");
+        var name = key is null ? Guid.NewGuid().ToString("N") : SanitiseId(key);
+        var destination = Path.Combine(tempDir, $"{pid}-{name}.pdf");
         return await DownloadDocumentToAsync(http, url, destination, timeoutSeconds, ct).ConfigureAwait(false);
     }
 
@@ -115,27 +124,101 @@ public static class Documents
         var parent = Path.GetDirectoryName(destination);
         if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
 
+        // Bytes land here first and are moved into place only once the transfer
+        // finishes. Two things fall out of that, and both matter on a shop
+        // counter: a half-written file is never mistaken for a document (the
+        // held store is read by name, by a process that did not write it,
+        // possibly days later), and what survives a dropped connection is a
+        // named, resumable remainder rather than rubbish to be deleted.
+        var part = destination + ".part";
+
+        var have = File.Exists(part) ? new FileInfo(part).Length : 0L;
+        if (have > 0)
+        {
+            var resumed = await TransferAsync(http, url, part, have, resume: true, timeoutSeconds, ct)
+                .ConfigureAwait(false);
+            if (resumed)
+            {
+                File.Move(part, destination, overwrite: true);
+                return destination;
+            }
+
+            // The server would not, or could not, continue where we left off.
+            // Starting again is slower and always correct; carrying on from a
+            // partial the server did not agree to would splice two different
+            // responses into one file.
+            File.Delete(part);
+        }
+
+        await TransferAsync(http, url, part, 0L, resume: false, timeoutSeconds, ct).ConfigureAwait(false);
+        File.Move(part, destination, overwrite: true);
+        return destination;
+    }
+
+    /// <summary>
+    /// One transfer into <paramref name="part"/>, appending when
+    /// <paramref name="resume"/> and the server agreed to it.
+    /// </summary>
+    /// <returns>
+    /// false when a resume was asked for and refused, which is the caller's
+    /// signal to start the file again. Any other failure throws: a download that
+    /// cannot happen at all is the retry loop's business, not this method's.
+    /// </returns>
+    private static async Task<bool> TransferAsync(
+        HttpClient http,
+        string url,
+        string part,
+        long from,
+        bool resume,
+        long timeoutSeconds,
+        CancellationToken ct)
+    {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        // TryAddWithoutValidation rather than Headers.Range, which would need
+        // System.Net.Http.Headers - not one of .NET 8's implicit usings. This is
+        // the same way WebUiServer forwards headers, and the wire format is the
+        // whole of what matters here.
+        if (resume && from > 0) request.Headers.TryAddWithoutValidation("Range", $"bytes={from}-");
+
         using var response = await http
             .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token)
             .ConfigureAwait(false);
 
+        var status = (int)response.StatusCode;
+
+        // 416 means the range is past the end of the object - the partial is as
+        // long as, or longer than, the file the server is offering. That is a
+        // stale or mismatched leftover, never something to append to.
+        if (resume && status == 416) return false;
+
+        // 200 to a Range request means the store ignored it and is sending the
+        // whole object from byte zero. Appending that would double the file.
+        if (resume && status != 206) return false;
+
         if (!response.IsSuccessStatusCode)
         {
             throw new DocumentFetchError(
-                (int)response.StatusCode,
-                $"the document could not be fetched: HTTP {(int)response.StatusCode}");
+                status,
+                $"the document could not be fetched: HTTP {status}");
         }
 
-        await using (var output = File.Create(destination))
+        var append = resume && status == 206;
+        if (append && !File.Exists(part))
+        {
+            throw new DocumentFetchError(status, "partial download vanished mid-resume");
+        }
+
+        await using (var output = append
+            ? new FileStream(part, FileMode.Append, FileAccess.Write)
+            : new FileStream(part, FileMode.Create, FileAccess.Write))
         {
             await response.Content.CopyToAsync(output, deadline.Token).ConfigureAwait(false);
         }
 
-        return destination;
+        return true;
     }
 
     /// <summary>
@@ -255,7 +338,14 @@ public static class Documents
         var removed = 0;
         try
         {
-            foreach (var entry in Directory.EnumerateFiles(tempDir, "*.pdf"))
+            // Both the finished documents and the half-transferred ones. A
+            // .part is abandoned by exactly the same events - a crash, a kill,
+            // the counter PC losing power - and left out of this it is a
+            // customer's coursework accumulating in a temp directory for ever,
+            // just under a different extension.
+            foreach (var entry in Directory.EnumerateFiles(tempDir, "*.pdf*")
+                         .Where(f => f.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)
+                                  || f.EndsWith(".pdf.part", StringComparison.OrdinalIgnoreCase)))
             {
                 var fileName = Path.GetFileName(entry);
                 // Kotlin's substringBefore('-') keeps the whole name when there
