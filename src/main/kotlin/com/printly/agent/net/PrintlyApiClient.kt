@@ -199,6 +199,26 @@ class PrintlyApiClient(val baseUrl: String) {
         )
     }
 
+    /**
+     * Says the documents for a held order are on this machine's disk.
+     *
+     * Next to [reportProgress] but emphatically not the same kind of call. A
+     * progress ping is ephemeral and never persisted - losing one costs a
+     * flicker of live tracing. This one is durable, and it is what lights
+     * "Order accepted" on the student's timeline, so it is only ever sent once
+     * the files are actually written, never when the download starts.
+     *
+     * Idempotent on the backend - the first report wins - which is what makes
+     * the release loop's repeat send free, and is the only reason a report lost
+     * to a dropped connection is recoverable at all.
+     */
+    fun reportCached(credential: CredentialStore.AgentCredential, jobId: String) {
+        request(
+            Request.Builder().url(url("/api/v1/print-agent/jobs/$jobId/cached"))
+                .post("".toRequestBody(null)).headers(agentHeaders(credential)).build(),
+        )
+    }
+
     // -------------------------------------------------------------------
 
     private fun ownerHeaders(session: CredentialStore.OwnerSession) =

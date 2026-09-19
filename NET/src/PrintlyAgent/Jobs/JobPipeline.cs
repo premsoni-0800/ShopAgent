@@ -44,6 +44,8 @@ public sealed record JobContext(
     PrintlyApiClient Api,
     Database Db,
     string TempDir,
+    /// <summary>Where documents fetched ahead of a student's arrival live - see <see cref="Settings.HeldDir"/>.</summary>
+    string HeldDir,
     int MaxRetryAttempts,
     long DownloadTimeoutSeconds,
     double JobStallSeconds,
@@ -119,6 +121,37 @@ public static class JobPipeline
     /// </summary>
     public const string SUBMITTING = "SUBMITTING";
 
+    /// <summary>
+    /// The documents are on this machine's disk, and nothing is going to print
+    /// until the student walks in.
+    ///
+    /// <para>
+    /// A shop can accept an order before its student arrives. The backend
+    /// creates a job for it anyway - marked
+    /// <see cref="PrintJobDetail.HoldForArrival"/> - precisely so the files can
+    /// be fetched early, so that the print which follows the counter scan starts
+    /// from a local copy rather than from a download begun at the worst possible
+    /// moment, with somebody standing there waiting for it.
+    /// </para>
+    ///
+    /// <para>
+    /// Deliberately not terminal. A held job has more to do than any other
+    /// non-printing state: it is waiting on a person, and
+    /// <see cref="ProcessHeldReleasesAsync"/> is what eventually moves it on. It
+    /// is also deliberately absent from <see cref="Database.ResumableJobs"/> -
+    /// see the long note there, because a held job looks exactly like an
+    /// interrupted one and replaying it would print into an empty shop.
+    /// </para>
+    ///
+    /// <para>
+    /// The only way out towards a printer is back through DOWNLOADED, which is
+    /// not a technicality. It means the release path re-joins the ordinary path
+    /// at the point the ordinary path starts from, so there is one piece of code
+    /// that hands documents to a driver and watches what happens, not two.
+    /// </para>
+    /// </summary>
+    public const string HELD = "HELD";
+
     public const string SUBMITTED = "SUBMITTED";
     public const string PRINTING = "PRINTING";
     public const string COMPLETED = "COMPLETED";
@@ -141,7 +174,14 @@ public static class JobPipeline
             // No edge to SUBMITTED: everything reaches it through SUBMITTING, so
             // the state machine itself enforces that a job is never recorded as
             // printing without first being recorded as about to.
-            [DOWNLOADED] = Set(SUBMITTING, FAILED, CANCELLED),
+            [DOWNLOADED] = Set(SUBMITTING, HELD, FAILED, CANCELLED),
+            // No edge from HELD to SUBMITTING, and that omission is the guard. A
+            // held job reaches a printer only by going back to DOWNLOADED first,
+            // which is the release path announcing itself in the one place that
+            // cannot be bypassed - a future shortcut straight to the printer
+            // would have to delete this line to compile, rather than quietly
+            // working.
+            [HELD] = Set(DOWNLOADED, FAILED, CANCELLED),
             [SUBMITTING] = Set(SUBMITTED, FAILED, CANCELLED, UNKNOWN),
             [SUBMITTED] = Set(PRINTING, FAILED),
             [PRINTING] = Set(COMPLETED, FAILED, UNKNOWN),
@@ -389,6 +429,15 @@ public static class JobPipeline
 
             var (detail, downloaded) = prepared.Value;
 
+            if (detail.HoldForArrival)
+            {
+                // The claim and the download have happened; the printing must
+                // not. Everything below this point assumes a student is waiting
+                // for these pages, and for a held order nobody is.
+                await HoldForArrivalAsync(ctx, jobId, detail, downloaded, cancellation).ConfigureAwait(false);
+                return;
+            }
+
             List<(string PrinterName, string JobNameToken)> submissions;
             try
             {
@@ -441,6 +490,11 @@ public static class JobPipeline
             finally
             {
                 DeleteDownloads(ctx, downloaded);
+                // A held order's files live in their own directory rather than
+                // in the temp dir, so deleting the files alone would leave the
+                // directory behind for every order a shop ever accepted early.
+                // A no-op for a job that was never held.
+                Documents.DiscardHeldDocuments(ctx.HeldDir, jobId);
                 ForgetPreparation(jobId);
             }
 
@@ -758,6 +812,278 @@ public static class JobPipeline
     /// </summary>
     internal static readonly ConcurrentDictionary<
         string, Task<(PrintJobDetail Detail, Dictionary<string, string> Downloaded)?>> Preparations = new();
+
+    /// <summary>
+    /// Puts a held order's documents somewhere durable, records that they are
+    /// there, and stops.
+    ///
+    /// <para>
+    /// The order of the three steps is the whole of the design. The files move
+    /// first, because everything afterwards is a claim that they exist. The
+    /// local state is written second, because that is what survives a restart
+    /// and what <see cref="ProcessHeldReleasesAsync"/> reads. The report to the
+    /// backend goes last and is allowed to fail, because it is the only one of
+    /// the three that somebody else owns.
+    /// </para>
+    ///
+    /// <para>
+    /// That last point deserves its reason in full: <c>/cached</c> is what
+    /// lights "Order accepted" on the student's timeline. A report that does not
+    /// land leaves them looking at step one for longer than they should, which
+    /// is a worse timeline and not a worse outcome - the pages are on this disk
+    /// either way and print the moment they scan. The release loop re-sends it
+    /// on every pass while the hold stands, so a lost report costs one interval
+    /// rather than being lost for good, and the backend takes the first report
+    /// and ignores the rest.
+    /// </para>
+    ///
+    /// <para>
+    /// The memoised preparation is released here as it is anywhere else a job
+    /// stops being in flight. The release path seeds a fresh one from the local
+    /// row, which is what it has to do anyway - the process that eventually
+    /// prints this is very often not this one.
+    /// </para>
+    ///
+    /// <para>Nothing here deletes anything. That is the point of the state.</para>
+    /// </summary>
+    private static async Task HoldForArrivalAsync(
+        JobContext ctx,
+        string jobId,
+        PrintJobDetail detail,
+        Dictionary<string, string> downloaded,
+        CancellationToken cancellation)
+    {
+        try
+        {
+            foreach (var item in detail.Items)
+            {
+                if (!downloaded.TryGetValue(item.ItemId, out var source)) continue;
+                Documents.StoreHeldDocument(source, ctx.HeldDir, jobId, item.ItemId);
+            }
+        }
+        catch (Exception exc) when (exc is not OperationCanceledException)
+        {
+            // The files could not be put somewhere they will survive a restart,
+            // so there is nothing to hold. Failing here is honest and safe -
+            // nothing has printed - and the shop is told why rather than being
+            // left with an order that claims to be ready and is not.
+            await FailAsync(
+                ctx, jobId, $"could not store the documents for collection: {exc.Message}",
+                PrintJobFailureReason.DOWNLOAD_FAILED, cancellation).ConfigureAwait(false);
+            ForgetPreparation(jobId);
+            return;
+        }
+
+        // Through DOWNLOADED rather than straight to HELD, because the download
+        // did finish and because HELD is deliberately reachable from nowhere
+        // else - the one edge into it is the same edge the ordinary path takes
+        // out of downloading, so a held job and a printable one are the same job
+        // until the moment this line runs. Going direct would need an edge from
+        // DOWNLOADING, and an edge into HELD from a state where the files are
+        // not yet on disk is exactly the thing that must not exist.
+        Transition(ctx, jobId, DOWNLOADED);
+        Transition(ctx, jobId, HELD);
+        ForgetPreparation(jobId);
+        ctx.Logger.LogInformation(
+            "print_job_held_for_arrival job={JobId} order={OrderId} items={Items}",
+            jobId, detail.OrderId, detail.Items.Count);
+        await ReportCachedAsync(ctx, jobId, cancellation).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Releases every held job whose student has since arrived, and re-reports
+    /// the ones still waiting.
+    ///
+    /// <para>
+    /// A poll rather than a push, and that is a decision rather than an
+    /// omission. The backend clears the hold when the student scans at the
+    /// counter and sends nothing to say so - but even if it did, this agent
+    /// could not afford to depend on it. An SSE connection can stop delivering
+    /// without closing, and a push dropped in that window would be an order that
+    /// never prints at all until somebody notices and restarts something, with
+    /// the student standing at the counter the entire time. Asking costs one
+    /// request per held job per interval and cannot be lost. It also covers the
+    /// case no push can: an agent that was switched off for the whole of the
+    /// scan picks the release up when it comes back, because the answer is a
+    /// fact about the job rather than an event that happened while nobody was
+    /// listening.
+    /// </para>
+    ///
+    /// <para>
+    /// A job still held gets <c>/cached</c> sent again. That is not noise - it
+    /// is how a student whose first report was lost to a flaky connection still
+    /// reaches step two, and the backend's own idempotence is what makes
+    /// repeating it free.
+    /// </para>
+    /// </summary>
+    public static async Task ProcessHeldReleasesAsync(
+        JobContext ctx, PrintQueue queue, CancellationToken cancellation = default)
+    {
+        foreach (var row in ctx.Db.HeldJobs(ctx.Credential.ShopId))
+        {
+            PrintJobDetail detail;
+            try
+            {
+                detail = await ctx.Api.JobDetailAsync(ctx.Credential, row.JobId, cancellation).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exc)
+            {
+                // Held jobs are asked about again on the next pass, so an
+                // unreachable backend costs a delay and never a state change.
+                // The documents are already on disk; nothing about them expires.
+                ctx.Logger.LogDebug(exc, "held_job_detail_failed job={JobId}", row.JobId);
+                continue;
+            }
+
+            if (detail.HoldForArrival)
+            {
+                await ReportCachedAsync(ctx, row.JobId, cancellation).ConfigureAwait(false);
+                continue;
+            }
+
+            // The student has scanned. Priority is not read from the row here:
+            // by definition this order's student is at the counter right now,
+            // which is the exact condition in-shop priority exists for, and the
+            // row may not have been told yet - the grant arrives through a
+            // separate lookup that this release has just overtaken.
+            var captured = detail;
+            var accepted = queue.Enqueue(
+                row.JobId, row.OrderCode, priority: true,
+                work: () => ReleaseHeldJobAsync(ctx, row.JobId, captured, cancellation));
+            if (accepted)
+            {
+                ctx.Logger.LogInformation("held_job_released job={JobId} order={OrderId}", row.JobId, row.OrderId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Prints a job whose hold has lifted, from the copy taken when the shop
+    /// accepted it.
+    ///
+    /// <para>
+    /// Seeds <see cref="Preparations"/> with the detail already fetched and the
+    /// files already on disk, then puts the job back to DOWNLOADED and hands it
+    /// to <see cref="ProcessJobAsync"/>. That is the whole release: the ordinary
+    /// path then runs with its claim already done and its documents already
+    /// present, and there is no second copy of the spooling and outcome-polling
+    /// code for the two paths to drift apart on. Printing the same document
+    /// twice is the failure this pipeline is built around, and a duplicated
+    /// print path is how that starts.
+    /// </para>
+    ///
+    /// <para>
+    /// Being replayable again from this moment is correct rather than a
+    /// regression: the job is DOWNLOADED, nothing has reached a printer, and
+    /// somebody is standing at the counter waiting for it - a restart now should
+    /// pick it straight back up, which is exactly what
+    /// <see cref="Database.ResumableJobs"/> will do.
+    /// </para>
+    /// </summary>
+    private static async Task ReleaseHeldJobAsync(
+        JobContext ctx, string jobId, PrintJobDetail detail, CancellationToken cancellation)
+    {
+        var row = ctx.Db.GetJob(jobId);
+        if (row is null || TERMINAL.Contains(row.State)) return;
+
+        Dictionary<string, string> files;
+        try
+        {
+            files = await EnsureHeldDocumentsAsync(ctx, jobId, detail, cancellation).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exc)
+        {
+            await FailAsync(
+                ctx, jobId, $"held documents could not be recovered: {exc.Message}",
+                PrintJobFailureReason.DOWNLOAD_FAILED, cancellation).ConfigureAwait(false);
+            return;
+        }
+
+        Transition(ctx, jobId, DOWNLOADED);
+        Preparations[jobId] = Task.FromResult<(PrintJobDetail Detail, Dictionary<string, string> Downloaded)?>((detail, files));
+        await ProcessJobAsync(ctx, jobId, cancellation).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The held files for a job, fetching again any that are no longer there.
+    ///
+    /// <para>
+    /// A held document can go missing between the shop accepting the order and
+    /// the student arriving, and none of the ways are exotic: a disk cleaner, a
+    /// policy that empties app data, a machine rebuilt over the weekend,
+    /// somebody tidying a folder. Failing the order in that moment would be the
+    /// worst possible answer - there is a person at the counter who has already
+    /// paid, and the file is still one signed URL away. A lost cache should cost
+    /// them the download they would have paid for anyway, not their order.
+    /// </para>
+    ///
+    /// <para>
+    /// Deliberately does no state transitions. This runs with the job in HELD,
+    /// on its way to DOWNLOADED, and the download states belong to the first
+    /// fetch. Moving through them again here would say something untrue about a
+    /// job that is being recovered rather than downloaded for the first time.
+    /// </para>
+    /// </summary>
+    private static async Task<Dictionary<string, string>> EnsureHeldDocumentsAsync(
+        JobContext ctx, string jobId, PrintJobDetail detail, CancellationToken cancellation)
+    {
+        var files = new Dictionary<string, string>(StringComparer.Ordinal);
+        var missing = new List<PrintJobItem>();
+        foreach (var item in detail.Items)
+        {
+            var path = Documents.HeldDocumentPath(ctx.HeldDir, jobId, item.ItemId);
+            if (File.Exists(path) && new FileInfo(path).Length > 0) files[item.ItemId] = path;
+            else missing.Add(item);
+        }
+
+        if (missing.Count == 0) return files;
+
+        ctx.Logger.LogWarning(
+            "held_documents_missing job={JobId} count={Count} - fetching them again", jobId, missing.Count);
+        var urls = await ctx.Api.DownloadUrlsAsync(ctx.Credential, jobId, cancellation).ConfigureAwait(false);
+        var byDocumentId = urls.Items.ToDictionary(item => item.DocumentId, StringComparer.Ordinal);
+        foreach (var item in missing)
+        {
+            if (!byDocumentId.TryGetValue(item.DocumentId, out var url))
+            {
+                throw new InvalidOperationException($"no download URL returned for document {item.DocumentId}");
+            }
+
+            files[item.ItemId] = await Documents.DownloadDocumentToAsync(
+                ctx.Api.Http,
+                url.Url,
+                Documents.HeldDocumentPath(ctx.HeldDir, jobId, item.ItemId),
+                ctx.DownloadTimeoutSeconds,
+                cancellation).ConfigureAwait(false);
+        }
+
+        return files;
+    }
+
+    /// <summary>Best-effort by design - see <see cref="HoldForArrivalAsync"/> for why a lost report is a worse timeline and not a worse outcome.</summary>
+    private static async Task ReportCachedAsync(JobContext ctx, string jobId, CancellationToken cancellation)
+    {
+        try
+        {
+            await ctx.Api.ReportCachedAsync(ctx.Credential, jobId, cancellation).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exc)
+        {
+            ctx.Logger.LogDebug(exc, "print_job_cached_report_failed job={JobId}", jobId);
+        }
+    }
 
     private static async Task<PrintJobDetail?> ClaimAsync(JobContext ctx, string jobId, CancellationToken cancellation)
     {

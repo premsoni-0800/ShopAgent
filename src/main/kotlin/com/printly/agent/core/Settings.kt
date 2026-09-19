@@ -23,6 +23,20 @@ data class Settings(
     val dbPath: Path,
     val logDir: Path,
     val tempDir: Path,
+    /**
+     * Where documents fetched ahead of a student's arrival are kept.
+     *
+     * A sibling of [tempDir] rather than a folder inside it, because the two
+     * have opposite lifetimes and one sweep runs over the other. [tempDir] is
+     * scratch: download, print, delete, and `sweepOrphanedDocuments` enforces
+     * that across a crash by deleting any file whose owning process is gone.
+     * A held document is the one case where an absent process means a restart
+     * rather than a leak - the shop accepted in the morning, the student walks
+     * in after lunch, and the agent may well have been restarted in between -
+     * so keeping these anywhere that sweep looks would delete exactly the files
+     * the feature exists to keep.
+     */
+    val heldDir: Path,
     val heartbeatIntervalSeconds: Long = 10,
     /**
      * How often to ask the backend outright for work, independently of the
@@ -66,10 +80,14 @@ fun loadSettings(): Settings {
     // Restricted, cleared-on-use scratch space for downloaded documents -
     // never a permanent copy, and never inside a user-browsable folder.
     val tempDir = appDataDir.resolve("tmp")
+    // Deliberately not under tempDir - see Settings.heldDir for why the orphan
+    // sweep must never be able to reach these.
+    val heldDir = appDataDir.resolve("held")
 
     Files.createDirectories(appDataDir)
     Files.createDirectories(logDir)
     Files.createDirectories(tempDir)
+    Files.createDirectories(heldDir)
 
     return Settings(
         backendBaseUrl = (System.getenv("PRINTLY_BACKEND_URL") ?: DEFAULT_BACKEND_BASE_URL).trimEnd('/'),
@@ -85,5 +103,6 @@ fun loadSettings(): Settings {
         dbPath = appDataDir.resolve("agent.db"),
         logDir = logDir,
         tempDir = tempDir,
+        heldDir = heldDir,
     )
 }

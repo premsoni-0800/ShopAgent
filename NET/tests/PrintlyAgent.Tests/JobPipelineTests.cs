@@ -252,6 +252,7 @@ public class JobPipelineTests : IAsyncLifetime
             Api: api,
             Db: db,
             TempDir: _tempDir,
+            HeldDir: Path.Combine(_tempDir, "..", "held"),
             MaxRetryAttempts: 3,
             DownloadTimeoutSeconds: 30,
             JobStallSeconds: 300.0,

@@ -15,10 +15,11 @@ namespace PrintlyAgent.Core;
 /// The agent itself: everything that keeps running whether or not anyone is
 /// looking at the window. Port of core/AgentCore.kt.
 ///
-/// Seven loops, started once both a signed-in owner and a paired machine exist:
+/// Nine loops, started once both a signed-in owner and a paired machine exist:
 /// heartbeat, printer sync, the print-job stream, the order stream, the
-/// scheduled-job check, the reconciliation poll, and a one-shot resume of
-/// whatever the last run was interrupted doing.
+/// scheduled-job check, the reconciliation poll, the in-shop priority re-check,
+/// the release of orders held for a student who has not arrived yet, and a
+/// one-shot resume of whatever the last run was interrupted doing.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class AgentCore : IAsyncDisposable
@@ -182,6 +183,7 @@ public sealed class AgentCore : IAsyncDisposable
         _loops.Add(Task.Run(() => ScheduledJobsLoopAsync(token), token));
         _loops.Add(Task.Run(() => JobReconcileLoopAsync(token), token));
         _loops.Add(Task.Run(() => PriorityRecheckLoopAsync(token), token));
+        _loops.Add(Task.Run(() => HeldReleaseLoopAsync(token), token));
         _loops.Add(Task.Run(() => ResumeInterruptedJobsOnceAsync(token), token));
     }
 
@@ -850,6 +852,7 @@ public sealed class AgentCore : IAsyncDisposable
         Api,
         Db,
         Settings.TempDir,
+        Settings.HeldDir,
         Settings.MaxRetryAttempts,
         Settings.DownloadTimeoutSeconds,
         Settings.JobStallSeconds,
@@ -860,6 +863,47 @@ public sealed class AgentCore : IAsyncDisposable
         // downloading when the app closes stops rather than finishing into a
         // database that is already shut.
         _shutdown.Token);
+
+    /// <summary>
+    /// Asks, over and over, whether any held order's student has walked in.
+    ///
+    /// <para>
+    /// Shares <see cref="Settings.JobReconcileIntervalSeconds"/> with the
+    /// reconcile and priority loops because it answers the same kind of question
+    /// and deserves the same urgency: somebody is at a counter waiting. The cost
+    /// is one request per held order per interval, which is bounded by how many
+    /// orders a shop accepted early and not by how long the agent has been
+    /// running - a released job leaves HELD and stops being asked about.
+    /// </para>
+    ///
+    /// <para>
+    /// See <see cref="JobPipeline.ProcessHeldReleasesAsync"/> for why this is a
+    /// poll and not a push. The short version is that the release is the one
+    /// event this agent cannot afford to miss, and a stream that has stopped
+    /// delivering without closing does not announce itself.
+    /// </para>
+    /// </summary>
+    private async Task HeldReleaseLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            if (!await DelayAsync(TimeSpan.FromSeconds(Settings.JobReconcileIntervalSeconds), ct).ConfigureAwait(false))
+            {
+                return;
+            }
+
+            var credential = _agentCredential;
+            if (credential is null) continue;
+
+            try
+            {
+                await JobPipeline.ProcessHeldReleasesAsync(JobContextFor(credential), _printQueue, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception exc) { _log.LogError(exc, "held_release_check_failed"); }
+        }
+    }
 
     private async Task ScheduledJobsLoopAsync(CancellationToken ct)
     {

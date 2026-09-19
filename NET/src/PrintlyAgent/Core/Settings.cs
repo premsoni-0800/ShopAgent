@@ -27,6 +27,23 @@ public sealed record Settings(
     string DbPath,
     string LogDir,
     string TempDir,
+    /// <summary>
+    /// Where documents fetched ahead of a student's arrival are kept.
+    ///
+    /// <para>
+    /// A sibling of <see cref="TempDir"/> rather than a folder inside it,
+    /// because the two have opposite lifetimes and one sweep runs over the
+    /// other. TempDir is scratch: download, print, delete, and
+    /// <c>Documents.SweepOrphanedDocuments</c> enforces that across a crash by
+    /// deleting any file whose owning process is gone. A held document is the
+    /// one case where an absent process means a restart rather than a leak -
+    /// the shop accepted in the morning, the student walks in after lunch, and
+    /// the agent may well have been restarted in between - so keeping these
+    /// anywhere that sweep looks would delete exactly the files the feature
+    /// exists to keep.
+    /// </para>
+    /// </summary>
+    string HeldDir,
     long HeartbeatIntervalSeconds = 10,
 
     /// <summary>
@@ -89,10 +106,14 @@ public static class SettingsLoader
         // Restricted, cleared-on-use scratch space for downloaded documents -
         // never a permanent copy, and never inside a user-browsable folder.
         var tempDir = Path.Combine(appDataDir, "tmp");
+        // Deliberately not under tempDir - see Settings.HeldDir for why the
+        // orphan sweep must never be able to reach these.
+        var heldDir = Path.Combine(appDataDir, "held");
 
         Directory.CreateDirectory(appDataDir);
         Directory.CreateDirectory(logDir);
         Directory.CreateDirectory(tempDir);
+        Directory.CreateDirectory(heldDir);
 
         return new Settings(
             BackendBaseUrl: (Environment.GetEnvironmentVariable("PRINTLY_BACKEND_URL")
@@ -103,6 +124,7 @@ public static class SettingsLoader
             DbPath: Path.Combine(appDataDir, "agent.db"),
             LogDir: logDir,
             TempDir: tempDir,
+            HeldDir: heldDir,
             // A shop that genuinely has more than one printer can say so without
             // a rebuild. Nonsense values fall back rather than starting an agent
             // that prints nothing (0) or thrashes the temp dir (300).

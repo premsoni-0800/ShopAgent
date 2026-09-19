@@ -303,6 +303,20 @@ public sealed class Database : IDisposable
     /// <see cref="DueScheduledJobs"/>' job, and running it now would print it
     /// early.
     ///
+    /// HELD is excluded, and of everything this query leaves out it is the one
+    /// that would do the most damage. A held job has claimed and downloaded and
+    /// not printed, which is precisely the shape this sweep is looking for -
+    /// DOWNLOADED, interrupted, safe to replay - and it is not safe to replay,
+    /// because nothing interrupted it. It is waiting on a student who has not
+    /// arrived. Replaying one prints somebody's coursework into an empty shop
+    /// hours early, and the shop has no way to un-print it. The list of states
+    /// here is an allow-list precisely so that a new state has to be added
+    /// deliberately to become resumable; HELD is named in this comment rather
+    /// than added to the SQL because the safe thing is already what happens,
+    /// and the next person to widen this list needs to know why.
+    /// <see cref="HeldJobs"/> is the query that does look at them, and it
+    /// releases them by asking the backend rather than by assuming.
+    ///
     /// Scoped to one shop because a machine can serve several over its life -
     /// each shop signs in with its own credentials and the agent re-pairs. A job
     /// left behind by the previous shop is not this one's to resume, and
@@ -333,6 +347,28 @@ public sealed class Database : IDisposable
     public List<JobRow> JobsStrandedAtThePrinter(string shopId) =>
         Query(
             "SELECT * FROM print_jobs WHERE state IN ('SUBMITTING', 'SUBMITTED', 'PRINTING') AND shop_id = $shopId",
+            command => command.Parameters.AddWithValue("$shopId", shopId));
+
+    /// <summary>
+    /// Jobs whose documents are on disk waiting for their student to walk in.
+    ///
+    /// <para>
+    /// Oldest first so a shop that accepted a morning's worth of orders
+    /// releases them in the order it took them, and so the rotation is stable
+    /// across passes - the same reason <see cref="PriorityCandidates"/> orders
+    /// the same way.
+    /// </para>
+    ///
+    /// <para>
+    /// Scoped to one shop for the same reason as <see cref="ResumableJobs"/>: a
+    /// machine serves different shops over its life, and a previous shop's held
+    /// order is not this one's to print. The credential this agent now holds
+    /// could not even ask the backend about it.
+    /// </para>
+    /// </summary>
+    public List<JobRow> HeldJobs(string shopId) =>
+        Query(
+            "SELECT * FROM print_jobs WHERE state = 'HELD' AND shop_id = $shopId ORDER BY received_at, job_id",
             command => command.Parameters.AddWithValue("$shopId", shopId));
 
     /// <summary>RECEIVED jobs held back for a future print time whose time has now arrived.</summary>

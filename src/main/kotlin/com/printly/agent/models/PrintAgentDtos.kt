@@ -86,6 +86,21 @@ data class PrintJobDetail(
     val orderCode: String,
     val status: PrintJobStatus,
     val items: List<PrintJobItem>,
+    /**
+     * The shop accepted this order before its student walked in: fetch the
+     * documents, say they are fetched, and print nothing.
+     *
+     * Defaulted to false rather than required, and that default is what lets
+     * this agent talk to a backend that predates the field. Jackson leaves an
+     * absent property at its default, so an older server - which sends no such
+     * field and creates no such job - produces exactly the behaviour this agent
+     * had before hold-for-arrival existed, with no version check anywhere.
+     *
+     * The backend clears it when the student scans at the counter, and there is
+     * no push for that; see `processHeldReleases` for why the agent goes and
+     * asks instead.
+     */
+    val holdForArrival: Boolean = false,
 )
 
 data class PrintJobSummary(
@@ -94,6 +109,8 @@ data class PrintJobSummary(
     val orderCode: String,
     val status: PrintJobStatus,
     val createdAt: Instant,
+    /** See [PrintJobDetail.holdForArrival] - same flag, carried on the list form. */
+    val holdForArrival: Boolean = false,
 )
 
 data class DownloadUrl(val documentId: String, val url: String, val expiresAt: Instant, val fileName: String)

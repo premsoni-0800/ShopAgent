@@ -86,6 +86,30 @@ public static class Documents
         // agent that died.
         var pid = Environment.ProcessId;
         var destination = Path.Combine(tempDir, $"{pid}-{Guid.NewGuid():N}.pdf");
+        return await DownloadDocumentToAsync(http, url, destination, timeoutSeconds, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The same download, to a caller-chosen path.
+    ///
+    /// <para>
+    /// Split out for the held-document store, whose filenames have to be worked
+    /// out rather than invented: the process that eventually prints a held order
+    /// is very often not the one that fetched it, so there is nobody left to
+    /// remember a random name. Kept as the one implementation both paths call
+    /// rather than a second copy, because "downloads a customer's document" is
+    /// not a thing worth having two of.
+    /// </para>
+    /// </summary>
+    public static async Task<string> DownloadDocumentToAsync(
+        HttpClient http,
+        string url,
+        string destination,
+        long timeoutSeconds,
+        CancellationToken ct = default)
+    {
+        var parent = Path.GetDirectoryName(destination);
+        if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
 
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
@@ -111,6 +135,88 @@ public static class Documents
     }
 
     /// <summary>
+    /// Where a held order's document lives: one directory per job, one file per
+    /// item, both named after ids the backend already gave us.
+    ///
+    /// <para>
+    /// Deterministic on purpose, and it is the whole reason this is a method
+    /// rather than a name chosen at download time. A held order is fetched in
+    /// the morning and printed after lunch, very often by a different process -
+    /// the shop closes the app, Windows updates, the counter PC is restarted.
+    /// Anything remembered only in memory is gone by then; anything random needs
+    /// an index to find it again, which is one more thing that can disagree with
+    /// the disk. The job id and the item id are both already in the local row
+    /// and in the job detail, so the path can simply be recomputed whenever it
+    /// is wanted.
+    /// </para>
+    /// </summary>
+    public static string HeldDocumentPath(string heldDir, string jobId, string itemId) =>
+        Path.Combine(heldDir, SanitiseId(jobId), SanitiseId(itemId) + ".pdf");
+
+    /// <summary>
+    /// Moves a freshly downloaded document into the held store.
+    ///
+    /// <para>
+    /// A move rather than a copy, so there is never a window in which the same
+    /// customer document exists twice on a shop's disk, and so the temp copy
+    /// cannot be left behind for the orphan sweep to find. Overwrite is on
+    /// because that is what makes re-fetching a missing held file idempotent.
+    /// </para>
+    /// </summary>
+    public static string StoreHeldDocument(string source, string heldDir, string jobId, string itemId)
+    {
+        var destination = HeldDocumentPath(heldDir, jobId, itemId);
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        File.Move(source, destination, overwrite: true);
+        return destination;
+    }
+
+    /// <summary>
+    /// Deletes a job's held directory once its pages have gone to a printer.
+    ///
+    /// <para>
+    /// Best-effort and silent: the documents have printed by the time this runs,
+    /// so a file that cannot be removed is a housekeeping problem, not something
+    /// to fail an order over. A job that was never held has no directory here,
+    /// which is why the normal print path can call this unconditionally.
+    /// </para>
+    /// </summary>
+    public static void DiscardHeldDocuments(string heldDir, string jobId)
+    {
+        try
+        {
+            var dir = Path.Combine(heldDir, SanitiseId(jobId));
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+        catch
+        {
+            // Nothing here is worth interrupting a finished print for.
+        }
+    }
+
+    /// <summary>
+    /// Keeps an id to the characters that are safe in a path segment.
+    ///
+    /// <para>
+    /// These ids are server-generated and have never been anything but hex and
+    /// dashes, so in practice this changes nothing - it is here because they are
+    /// used to build a filesystem path, and a path built from a value this
+    /// process did not choose is worth being uninteresting about. A stray
+    /// separator would otherwise write a customer's document somewhere other
+    /// than the held store.
+    /// </para>
+    /// </summary>
+    private static string SanitiseId(string id) =>
+        string.Create(id.Length, id, (span, source) =>
+        {
+            for (var i = 0; i < source.Length; i++)
+            {
+                var c = source[i];
+                span[i] = char.IsLetterOrDigit(c) || c == '-' || c == '_' ? c : '_';
+            }
+        });
+
+    /// <summary>
     /// Deletes customer documents left behind by an agent that did not shut down.
     ///
     /// <para>
@@ -128,6 +234,15 @@ public static class Documents
     /// document it is printing. A file whose name predates this scheme, or whose
     /// pid has since been recycled onto a live process, is left for the next run
     /// rather than risked.
+    /// </para>
+    ///
+    /// <para>
+    /// Reaches only <paramref name="tempDir"/> itself, and not one level down.
+    /// That is what keeps held documents safe without this method needing to
+    /// know they exist: they live under <c>Settings.HeldDir</c>, a sibling
+    /// directory, and for them a dead owning process means the agent was
+    /// restarted between the shop accepting an order and its student arriving -
+    /// which is the ordinary case, not a leak.
     /// </para>
     /// </summary>
     public static int SweepOrphanedDocuments(string tempDir)

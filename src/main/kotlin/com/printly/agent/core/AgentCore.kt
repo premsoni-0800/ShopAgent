@@ -8,6 +8,7 @@ import com.printly.agent.jobs.JobDispatcher
 import com.printly.agent.jobs.PrintQueue
 import com.printly.agent.jobs.handleJobReference
 import com.printly.agent.jobs.processDueScheduledJobs
+import com.printly.agent.jobs.processHeldReleases
 import com.printly.agent.jobs.resumeInterruptedJobs
 import com.printly.agent.net.ApiError
 import com.printly.agent.net.OrderEventsClient
@@ -159,6 +160,7 @@ class AgentCore(val settings: Settings) {
             scope.launch { scheduledJobsLoop() },
             scope.launch { jobReconcileLoop() },
             scope.launch { priorityRecheckLoop() },
+            scope.launch { heldReleaseLoop() },
             scope.launch { resumeInterruptedJobsOnce() },
         )
     }
@@ -519,6 +521,7 @@ class AgentCore(val settings: Settings) {
         api = api,
         db = db,
         tempDir = settings.tempDir,
+        heldDir = settings.heldDir,
         maxRetryAttempts = settings.maxRetryAttempts,
         downloadTimeoutSeconds = settings.downloadTimeoutSeconds,
         jobTimeoutSeconds = settings.jobTimeoutSeconds,
@@ -607,6 +610,33 @@ class AgentCore(val settings: Settings) {
                 for (row in batch) onJobReference(row.jobId, row.orderId, row.orderCode, rechecking = true)
             } catch (exc: Exception) {
                 log.log(Level.FINE, "priority_recheck_failed", exc)
+            }
+        }
+    }
+
+    /**
+     * Asks, over and over, whether any held order's student has walked in.
+     *
+     * Shares [Settings.jobReconcileIntervalSeconds] with the reconcile and
+     * priority loops because it answers the same kind of question and deserves
+     * the same urgency: somebody is at a counter waiting. The cost is one
+     * request per held order per interval, which is bounded by how many orders
+     * a shop accepted early and not by how long the agent has been running -
+     * a released job leaves HELD and stops being asked about.
+     *
+     * See [processHeldReleases] for why this is a poll and not a push. The
+     * short version is that the release is the one event this agent cannot
+     * afford to miss, and a stream that has stopped delivering without closing
+     * does not announce itself.
+     */
+    private suspend fun heldReleaseLoop() {
+        while (true) {
+            delay(settings.jobReconcileIntervalSeconds * 1000)
+            val credential = agentCredential ?: continue
+            try {
+                processHeldReleases(jobContext(credential), printQueue)
+            } catch (exc: Exception) {
+                log.log(Level.SEVERE, "held_release_check_failed", exc)
             }
         }
     }

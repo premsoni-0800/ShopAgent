@@ -123,6 +123,7 @@ public class ParallelDownloadTests : IDisposable
             Api: api,
             Db: db,
             TempDir: _tempDir,
+            HeldDir: Path.Combine(_tempDir, "..", "held"),
             MaxRetryAttempts: 1,
             DownloadTimeoutSeconds: 30,
             JobStallSeconds: 300.0,

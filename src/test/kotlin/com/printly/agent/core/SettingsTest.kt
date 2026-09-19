@@ -24,6 +24,7 @@ class SettingsTest {
             dbPath = java.nio.file.Paths.get("./x.db"),
             logDir = java.nio.file.Paths.get("."),
             tempDir = java.nio.file.Paths.get("."),
+            heldDir = java.nio.file.Paths.get("."),
         ).maxConcurrentPrintJobs)
     }
 

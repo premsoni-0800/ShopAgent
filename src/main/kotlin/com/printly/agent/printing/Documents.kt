@@ -5,6 +5,7 @@ import okhttp3.Request
 import org.apache.pdfbox.Loader
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.time.Duration
 import java.util.UUID
 
@@ -24,7 +25,21 @@ fun downloadDocument(http: OkHttpClient, url: String, tempDir: Path, timeoutSeco
     // agent that died.
     val pid = ProcessHandle.current().pid()
     val destination = tempDir.resolve("$pid-${UUID.randomUUID().toString().replace("-", "")}.pdf")
+    return downloadDocumentTo(http, url, destination, timeoutSeconds)
+}
 
+/**
+ * The same download, to a caller-chosen path.
+ *
+ * Split out for the held-document store, whose filenames have to be worked out
+ * rather than invented: the process that eventually prints a held order is very
+ * often not the one that fetched it, so there is nobody left to remember a
+ * random name. Kept as the one implementation both paths call rather than a
+ * second copy, because "downloads a customer's document" is not a thing worth
+ * having two of.
+ */
+fun downloadDocumentTo(http: OkHttpClient, url: String, destination: Path, timeoutSeconds: Long): Path {
+    destination.parent?.let { Files.createDirectories(it) }
     val client = http.newBuilder().callTimeout(Duration.ofSeconds(timeoutSeconds)).build()
     val request = Request.Builder().url(url).build()
     client.newCall(request).execute().use { response ->
@@ -33,6 +48,67 @@ fun downloadDocument(http: OkHttpClient, url: String, tempDir: Path, timeoutSeco
     }
     return destination
 }
+
+/**
+ * Where a held order's document lives: one directory per job, one file per
+ * item, both named after ids the backend already gave us.
+ *
+ * Deterministic on purpose, and it is the whole reason this is a function
+ * rather than a name chosen at download time. A held order is fetched in the
+ * morning and printed after lunch, very often by a different process - the
+ * shop closes the app, Windows updates, the counter PC is restarted. Anything
+ * remembered only in memory is gone by then; anything random needs an index to
+ * find it again, which is one more thing that can disagree with the disk. The
+ * job id and the item id are both already in the local row and in the job
+ * detail, so the path can simply be recomputed whenever it is wanted.
+ */
+fun heldDocumentPath(heldDir: Path, jobId: String, itemId: String): Path =
+    heldDir.resolve(sanitiseId(jobId)).resolve("${sanitiseId(itemId)}.pdf")
+
+/**
+ * Moves a freshly downloaded document into the held store.
+ *
+ * A move rather than a copy, so there is never a window in which the same
+ * customer document exists twice on a shop's disk, and so the temp copy cannot
+ * be left behind for the orphan sweep to find. ATOMIC_MOVE is not requested:
+ * both directories are under the same app-data root in every real install, but
+ * a move that cannot be atomic must still succeed rather than throw, and the
+ * replace is what makes re-fetching a missing file idempotent.
+ */
+fun storeHeldDocument(source: Path, heldDir: Path, jobId: String, itemId: String): Path {
+    val destination = heldDocumentPath(heldDir, jobId, itemId)
+    Files.createDirectories(destination.parent)
+    Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING)
+    return destination
+}
+
+/**
+ * Deletes a job's held directory once its pages have gone to a printer.
+ *
+ * Best-effort and silent: the documents have printed by the time this runs, so
+ * a file that cannot be removed is a housekeeping problem, not something to
+ * fail an order over. A job that was never held has no directory here, which is
+ * why the normal print path can call this unconditionally.
+ */
+fun discardHeldDocuments(heldDir: Path, jobId: String) {
+    val dir = heldDir.resolve(sanitiseId(jobId))
+    runCatching {
+        if (!Files.isDirectory(dir)) return
+        Files.newDirectoryStream(dir).use { entries -> entries.forEach { runCatching { Files.deleteIfExists(it) } } }
+        Files.deleteIfExists(dir)
+    }
+}
+
+/**
+ * Keeps an id to the characters that are safe in a path segment.
+ *
+ * These ids are server-generated and have never been anything but hex and
+ * dashes, so in practice this changes nothing - it is here because they are
+ * used to build a filesystem path, and a path built from a value this process
+ * did not choose is worth being uninteresting about. A stray separator would
+ * otherwise write a customer's document somewhere other than the held store.
+ */
+private fun sanitiseId(id: String): String = id.map { if (it.isLetterOrDigit() || it == '-' || it == '_') it else '_' }.joinToString("")
 
 /**
  * Deletes customer documents left behind by an agent that did not shut down.
@@ -49,6 +125,12 @@ fun downloadDocument(http: OkHttpClient, url: String, tempDir: Path, timeoutSeco
  * document it is printing. A file whose name predates this scheme, or whose
  * pid has since been recycled onto a live process, is left for the next run
  * rather than risked.
+ *
+ * Reaches only [tempDir] itself, and not one level down. That is what keeps
+ * held documents safe without this function needing to know they exist: they
+ * live under `Settings.heldDir`, a sibling directory, and for them a dead
+ * owning process means the agent was restarted between the shop accepting an
+ * order and its student arriving - which is the ordinary case, not a leak.
  */
 fun sweepOrphanedDocuments(tempDir: Path): Int {
     if (!Files.isDirectory(tempDir)) return 0

@@ -19,7 +19,11 @@ import com.printly.agent.printing.SpoolerOutcome
 import com.printly.agent.printing.PrintSubmissionError
 import com.printly.agent.printing.PrintSubmissionStalled
 import com.printly.agent.printing.SpoolerOutcomePoller
+import com.printly.agent.printing.discardHeldDocuments
 import com.printly.agent.printing.downloadDocument
+import com.printly.agent.printing.downloadDocumentTo
+import com.printly.agent.printing.heldDocumentPath
+import com.printly.agent.printing.storeHeldDocument
 import com.printly.agent.printing.printPdf
 import com.printly.agent.printing.validatePdf
 import kotlinx.coroutines.CancellationException
@@ -42,6 +46,7 @@ import javax.print.PrintServiceLookup
  *                   |              | (bounded retry)                           -> FAILED
  *                   v              v                                           -> UNKNOWN
  *                FAILED         FAILED
+ *                                            DOWNLOADED -> HELD -> DOWNLOADED (student arrived)
  *   any non-terminal state -> CANCELLED (backend/reconciliation says the job is gone)
  *
  * Retries are bounded and apply only to DOWNLOADING (a transient network
@@ -76,6 +81,32 @@ const val DOWNLOADED = "DOWNLOADED"
  * printed the whole thing again on top of what was already in the tray.
  */
 const val SUBMITTING = "SUBMITTING"
+
+/**
+ * The documents are on this machine's disk, and nothing is going to print
+ * until the student walks in.
+ *
+ * A shop can accept an order before its student arrives. The backend creates a
+ * job for it anyway - marked [com.printly.agent.models.PrintJobDetail.holdForArrival]
+ * - precisely so the files can be fetched early, so that the print which
+ * follows the counter scan starts from a local copy rather than from a download
+ * begun at the worst possible moment, with somebody standing there waiting for
+ * it.
+ *
+ * Deliberately not terminal. A held job has more to do than any other
+ * non-printing state: it is waiting on a person, and [processHeldReleases] is
+ * what eventually moves it on. It is also deliberately absent from
+ * [Database.resumableJobs] - see the long note there, because a held job looks
+ * exactly like an interrupted one and replaying it would print into an empty
+ * shop.
+ *
+ * The only way out towards a printer is back through DOWNLOADED, which is not
+ * a technicality. It means the release path re-joins the ordinary path at the
+ * point the ordinary path starts from, so there is one piece of code that
+ * hands documents to a driver and watches what happens, not two.
+ */
+const val HELD = "HELD"
+
 const val SUBMITTED = "SUBMITTED"
 const val PRINTING = "PRINTING"
 const val COMPLETED = "COMPLETED"
@@ -94,7 +125,13 @@ private val ALLOWED_NEXT: Map<String, Set<String>> = mapOf(
     // No edge to SUBMITTED: everything reaches it through SUBMITTING, so the
     // state machine itself enforces that a job is never recorded as printing
     // without first being recorded as about to.
-    DOWNLOADED to setOf(SUBMITTING, FAILED, CANCELLED),
+    DOWNLOADED to setOf(SUBMITTING, HELD, FAILED, CANCELLED),
+    // No edge from HELD to SUBMITTING, and that omission is the guard. A held
+    // job reaches a printer only by going back to DOWNLOADED first, which is
+    // the release path announcing itself in the one place that cannot be
+    // bypassed - a future shortcut straight to the printer would have to delete
+    // this line to compile, rather than quietly working.
+    HELD to setOf(DOWNLOADED, FAILED, CANCELLED),
     SUBMITTING to setOf(SUBMITTED, FAILED, CANCELLED, UNKNOWN),
     SUBMITTED to setOf(PRINTING, FAILED),
     PRINTING to setOf(COMPLETED, FAILED, UNKNOWN),
@@ -111,6 +148,8 @@ data class JobContext(
     val api: PrintlyApiClient,
     val db: Database,
     val tempDir: Path,
+    /** Where documents fetched ahead of a student's arrival live - see [com.printly.agent.core.Settings.heldDir]. */
+    val heldDir: Path,
     val maxRetryAttempts: Int,
     val downloadTimeoutSeconds: Long,
     val jobTimeoutSeconds: Double,
@@ -270,15 +309,57 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
     val row = ctx.db.getJob(jobId)
     if (row == null || row.state in TERMINAL) return
 
+    val detail = try {
+        claim(ctx, jobId) ?: return
+    } catch (exc: CancellationException) {
+        throw exc
+    } catch (exc: Exception) {
+        // Nothing has reached a printer yet, so the catch-all that used to sit
+        // around the whole of this function still applies here unchanged.
+        log.log(Level.SEVERE, "print_job_pipeline_error job=$jobId", exc)
+        fail(ctx, jobId, "unexpected error: $exc", PrintJobFailureReason.UNKNOWN)
+        return
+    }
+    val downloaded = downloadWithRetry(ctx, jobId, detail) ?: return
+
+    if (detail.holdForArrival) {
+        holdForArrival(ctx, jobId, detail, downloaded)
+        return
+    }
+
+    printDownloaded(ctx, jobId, detail, downloaded)
+}
+
+/**
+ * Everything from "the documents are on disk" to "the shop has been told what
+ * came out of the printer".
+ *
+ * Split from [processJob] so that the release of a held order can run it
+ * without a second copy existing. There is exactly one piece of code in this
+ * agent that hands a document to a driver and then works out what happened, and
+ * that is not tidiness: the duplicated version of it is how the same coursework
+ * gets printed twice, because two copies drift and the one that drifts is
+ * always the one nobody is testing. The held path arrives here having already
+ * claimed and already downloaded, which is precisely the state the ordinary
+ * path is in by the time it calls this.
+ *
+ * Both callers have their job in DOWNLOADED - the ordinary one having just
+ * finished downloading, the release having just come back from HELD - so the
+ * transition below is a no-op for one of them and the state machine's own
+ * idempotence covers it.
+ */
+private suspend fun printDownloaded(
+    ctx: JobContext,
+    jobId: String,
+    detail: PrintJobDetail,
+    downloaded: Map<String, Path>,
+) {
     // Whether anything has been handed to a printer driver yet. Past that
     // point no error may be reported as FAILED, however it arrives: the shop
     // reads FAILED as "print it again", and the pages are already out.
     var reachedPrinter = false
 
     try {
-        val detail = claim(ctx, jobId) ?: return
-        val downloaded = downloadWithRetry(ctx, jobId, detail) ?: return
-
         val submissions: List<Pair<String, String>>
         try {
             transition(ctx, jobId, DOWNLOADED)
@@ -313,6 +394,11 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
             return
         } finally {
             downloaded.values.forEach { it.toFile().delete() }
+            // A held order's files live in their own directory rather than in
+            // the temp dir, so deleting the files alone would leave the
+            // directory behind for every order a shop ever accepted early.
+            // A no-op for a job that was never held.
+            discardHeldDocuments(ctx.heldDir, jobId)
         }
 
         // The printer is recorded locally and reported at the same moment, so
@@ -403,6 +489,199 @@ suspend fun processJob(ctx: JobContext, jobId: String) {
         } else {
             fail(ctx, jobId, "unexpected error: $exc", PrintJobFailureReason.UNKNOWN)
         }
+    }
+}
+
+/**
+ * Puts a held order's documents somewhere durable, records that they are
+ * there, and stops.
+ *
+ * The order of the three steps is the whole of the design. The files move
+ * first, because everything afterwards is a claim that they exist. The local
+ * state is written second, because that is what survives a restart and what
+ * [processHeldReleases] reads. The report to the backend goes last and is
+ * allowed to fail, because it is the only one of the three that somebody else
+ * owns.
+ *
+ * That last point deserves its reason in full: `/cached` is what lights "Order
+ * accepted" on the student's timeline. A report that does not land leaves them
+ * looking at step one for longer than they should, which is a worse timeline
+ * and not a worse outcome - the pages are on this disk either way and print
+ * the moment they scan. The release loop re-sends it on every pass while the
+ * hold stands, so a lost report costs one interval rather than being lost for
+ * good, and the backend takes the first report and ignores the rest.
+ *
+ * Nothing here deletes anything. That is the point of the state.
+ */
+private suspend fun holdForArrival(
+    ctx: JobContext,
+    jobId: String,
+    detail: PrintJobDetail,
+    downloaded: Map<String, Path>,
+) {
+    try {
+        withContext(Dispatchers.IO) {
+            for (item in detail.items) {
+                val source = downloaded[item.itemId] ?: continue
+                storeHeldDocument(source, ctx.heldDir, jobId, item.itemId)
+            }
+        }
+    } catch (exc: CancellationException) {
+        throw exc
+    } catch (exc: Exception) {
+        // The files could not be put somewhere they will survive a restart, so
+        // there is nothing to hold. Failing here is honest and safe - nothing
+        // has printed - and the shop is told why rather than being left with an
+        // order that claims to be ready and is not.
+        fail(ctx, jobId, "could not store the documents for collection: $exc", PrintJobFailureReason.DOWNLOAD_FAILED)
+        return
+    }
+
+    // Through DOWNLOADED rather than straight to HELD, because the download did
+    // finish and because HELD is deliberately reachable from nowhere else - the
+    // one edge into it is the same edge the ordinary path takes out of
+    // downloading, so a held job and a printable one are the same job until the
+    // moment this line runs. Going direct would need an edge from DOWNLOADING,
+    // and an edge into HELD from a state where the files are not yet on disk is
+    // exactly the thing that must not exist.
+    transition(ctx, jobId, DOWNLOADED)
+    transition(ctx, jobId, HELD)
+    log.info("print_job_held_for_arrival job=$jobId order=${detail.orderId} items=${detail.items.size}")
+    reportCached(ctx, jobId)
+}
+
+/**
+ * Releases every held job whose student has since arrived, and re-reports the
+ * ones still waiting.
+ *
+ * A poll rather than a push, and that is a decision rather than an omission.
+ * The backend clears the hold when the student scans at the counter and sends
+ * nothing to say so - but even if it did, this agent could not afford to
+ * depend on it. An SSE connection can stop delivering without closing, and a
+ * push dropped in that window would be an order that never prints at all until
+ * somebody notices and restarts something, with the student standing at the
+ * counter the entire time. Asking costs one request per held job per interval
+ * and cannot be lost. It also covers the case no push can: an agent that was
+ * switched off for the whole of the scan picks the release up when it comes
+ * back, because the answer is a fact about the job rather than an event that
+ * happened while nobody was listening.
+ *
+ * A job still held gets `/cached` sent again. That is not noise - it is how a
+ * student whose first report was lost to a flaky connection still reaches step
+ * two, and the backend's own idempotence is what makes repeating it free.
+ */
+suspend fun processHeldReleases(ctx: JobContext, queue: PrintQueue) {
+    for (row in ctx.db.heldJobs(ctx.credential.shopId)) {
+        val detail = try {
+            withContext(Dispatchers.IO) { ctx.api.jobDetail(ctx.credential, row.jobId) }
+        } catch (exc: CancellationException) {
+            throw exc
+        } catch (exc: Exception) {
+            // Held jobs are asked about again on the next pass, so an
+            // unreachable backend costs a delay and never a state change. The
+            // documents are already on disk; nothing about them expires.
+            log.fine("held_job_detail_failed job=${row.jobId}: $exc")
+            continue
+        }
+
+        if (detail.holdForArrival) {
+            reportCached(ctx, row.jobId)
+            continue
+        }
+
+        // The student has scanned. Priority is not read from the row here: by
+        // definition this order's student is at the counter right now, which is
+        // the exact condition in-shop priority exists for, and the row may not
+        // have been told yet - the grant arrives through a separate lookup that
+        // this release has just overtaken.
+        val accepted = queue.enqueue(row.jobId, row.orderCode, priority = true) {
+            releaseHeldJob(ctx, row.jobId, detail)
+        }
+        if (accepted) log.info("held_job_released job=${row.jobId} order=${row.orderId}")
+    }
+}
+
+/**
+ * Prints a job whose hold has lifted, from the copy taken when the shop
+ * accepted it.
+ *
+ * Rejoins the ordinary path at DOWNLOADED rather than running a print of its
+ * own - see [printDownloaded]. The claim was done when the order was accepted
+ * and must not be repeated; the documents are already here.
+ */
+private suspend fun releaseHeldJob(ctx: JobContext, jobId: String, detail: PrintJobDetail) {
+    val row = ctx.db.getJob(jobId)
+    if (row == null || row.state in TERMINAL) return
+
+    val files = try {
+        ensureHeldDocuments(ctx, jobId, detail)
+    } catch (exc: CancellationException) {
+        throw exc
+    } catch (exc: Exception) {
+        fail(ctx, jobId, "held documents could not be recovered: $exc", PrintJobFailureReason.DOWNLOAD_FAILED)
+        return
+    }
+
+    transition(ctx, jobId, DOWNLOADED)
+    printDownloaded(ctx, jobId, detail, files)
+}
+
+/**
+ * The held files for a job, fetching again any that are no longer there.
+ *
+ * A held document can go missing between the shop accepting the order and the
+ * student arriving, and none of the ways are exotic: a disk cleaner, a policy
+ * that empties app data, a machine rebuilt over the weekend, somebody tidying
+ * a folder. Failing the order in that moment would be the worst possible
+ * answer - there is a person at the counter who has already paid, and the file
+ * is still one signed URL away. A lost cache should cost them the download
+ * they would have paid for anyway, not their order.
+ *
+ * Deliberately does no state transitions. This runs with the job in HELD, on
+ * its way to DOWNLOADED, and the download states belong to the first fetch.
+ * Moving through them again here would say something untrue about a job that
+ * is being recovered rather than downloaded for the first time.
+ */
+private suspend fun ensureHeldDocuments(
+    ctx: JobContext,
+    jobId: String,
+    detail: PrintJobDetail,
+): Map<String, Path> {
+    val existing = mutableMapOf<String, Path>()
+    val missing = mutableListOf<com.printly.agent.models.PrintJobItem>()
+    for (item in detail.items) {
+        val path = heldDocumentPath(ctx.heldDir, jobId, item.itemId)
+        if (java.nio.file.Files.isRegularFile(path) && path.toFile().length() > 0) existing[item.itemId] = path
+        else missing.add(item)
+    }
+    if (missing.isEmpty()) return existing
+
+    log.warning("held_documents_missing job=$jobId count=${missing.size} - fetching them again")
+    val urls = withContext(Dispatchers.IO) { ctx.api.downloadUrls(ctx.credential, jobId) }
+    val byDocumentId = urls.items.associateBy { it.documentId }
+    for (item in missing) {
+        val url = byDocumentId[item.documentId]?.url
+            ?: throw DocumentValidationError("no download URL returned for document ${item.documentId}")
+        existing[item.itemId] = withContext(Dispatchers.IO) {
+            downloadDocumentTo(
+                ctx.api.http,
+                url,
+                heldDocumentPath(ctx.heldDir, jobId, item.itemId),
+                ctx.downloadTimeoutSeconds,
+            )
+        }
+    }
+    return existing
+}
+
+/** Best-effort by design - see [holdForArrival] for why a lost report is a worse timeline and not a worse outcome. */
+private suspend fun reportCached(ctx: JobContext, jobId: String) {
+    try {
+        withContext(Dispatchers.IO) { ctx.api.reportCached(ctx.credential, jobId) }
+    } catch (exc: CancellationException) {
+        throw exc
+    } catch (exc: Exception) {
+        log.fine("print_job_cached_report_failed job=$jobId: $exc")
     }
 }
 

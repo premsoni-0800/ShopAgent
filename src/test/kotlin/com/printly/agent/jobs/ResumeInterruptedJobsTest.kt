@@ -43,6 +43,7 @@ class ResumeInterruptedJobsTest {
             api = PrintlyApiClient("https://example.invalid"),
             db = db,
             tempDir = temp,
+            heldDir = temp.resolve("held"),
             maxRetryAttempts = 3,
             downloadTimeoutSeconds = 30,
             jobTimeoutSeconds = 300.0,

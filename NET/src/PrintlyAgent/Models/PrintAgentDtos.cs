@@ -104,14 +104,36 @@ public sealed record PrintJobDetail(
     string OrderId,
     string OrderCode,
     PrintJobStatus Status,
-    List<PrintJobItem> Items);
+    List<PrintJobItem> Items,
+    /// <summary>
+    /// The shop accepted this order before its student walked in: fetch the
+    /// documents, say they are fetched, and print nothing.
+    ///
+    /// <para>
+    /// Optional with a false default rather than required, and that default is
+    /// what lets this agent talk to a backend that predates the field. A
+    /// constructor parameter the JSON does not mention keeps its default, so an
+    /// older server - which sends no such field and creates no such job -
+    /// produces exactly the behaviour this agent had before hold-for-arrival
+    /// existed, with no version check anywhere.
+    /// </para>
+    ///
+    /// <para>
+    /// The backend clears it when the student scans at the counter, and there
+    /// is no push for that; see <see cref="JobPipeline.ProcessHeldReleasesAsync"/>
+    /// for why the agent goes and asks instead.
+    /// </para>
+    /// </summary>
+    bool HoldForArrival = false);
 
 public sealed record PrintJobSummary(
     string JobId,
     string OrderId,
     string OrderCode,
     PrintJobStatus Status,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    /// <summary>See <see cref="PrintJobDetail.HoldForArrival"/> - same flag, carried on the list form.</summary>
+    bool HoldForArrival = false);
 
 public sealed record DownloadUrl(string DocumentId, string Url, DateTimeOffset ExpiresAt, string FileName);
 

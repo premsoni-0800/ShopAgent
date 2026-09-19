@@ -30,6 +30,7 @@ class InkOnPaperBoundaryTest {
         api = api,
         db = db,
         tempDir = temp,
+        heldDir = temp.resolve("held"),
         maxRetryAttempts = 1,
         downloadTimeoutSeconds = 5,
         jobTimeoutSeconds = 10.0,
