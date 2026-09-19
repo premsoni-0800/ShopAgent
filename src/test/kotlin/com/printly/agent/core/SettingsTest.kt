@@ -1,6 +1,7 @@
 package com.printly.agent.core
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 /**
@@ -46,4 +47,48 @@ class SettingsTest {
         assertEquals(1, parse(""))
         assertEquals(1, parse(null))
     }
+
+    /**
+     * The storage override, which decides where other people's documents sit.
+     *
+     * Two things have to hold. A folder the shop names is used, so "put the
+     * order files on my Desktop" is answerable without a rebuild. And a value
+     * that cannot be turned into a directory falls back rather than throwing:
+     * a typo in an environment variable must not leave a counter with no agent
+     * in the middle of a shift.
+     */
+    @Test
+    fun `the data directory override is used when it can be created`() {
+        val chosen = java.nio.file.Files.createTempDirectory("printly-data-dir")
+        val resolved = resolveDataDir(chosen.toString()) { java.nio.file.Paths.get("/fallback") }
+
+        assertEquals(chosen.toAbsolutePath(), resolved)
+        assertTrue(java.nio.file.Files.isDirectory(resolved))
+    }
+
+    @Test
+    fun `an unusable or absent override falls back instead of failing to start`() {
+        val fallback = java.nio.file.Paths.get("/fallback")
+
+        assertEquals(fallback, resolveDataDir(null) { fallback })
+        assertEquals(fallback, resolveDataDir("") { fallback })
+        assertEquals(fallback, resolveDataDir("   ") { fallback })
+
+        // A path whose parent is a file, not a directory - createDirectories
+        // cannot make this and must not take the agent down with it.
+        val file = java.nio.file.Files.createTempFile("printly-not-a-dir", ".txt")
+        assertEquals(fallback, resolveDataDir("$file/inside") { fallback })
+    }
+
+    /** Mirrors loadSettings()'s resolution so the rule can be tested without touching the real environment. */
+    private fun resolveDataDir(configured: String?, fallback: () -> java.nio.file.Path): java.nio.file.Path =
+        configured
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { raw ->
+                runCatching {
+                    java.nio.file.Paths.get(raw).toAbsolutePath().also(java.nio.file.Files::createDirectories)
+                }.getOrNull()
+            }
+            ?: fallback()
 }

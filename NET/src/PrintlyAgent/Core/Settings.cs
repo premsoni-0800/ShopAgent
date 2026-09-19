@@ -101,7 +101,41 @@ public static class SettingsLoader
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 "." + AppConstants.AppName.ToLowerInvariant());
 
+        // PRINTLY_DATA_DIR moves everything this agent keeps on disk - the
+        // database, the logs, the scratch space and the held documents - to a
+        // folder the shop chooses. Set it to something like
+        // C:\Users\you\Desktop\order files and the documents land where they
+        // can be watched arriving.
+        //
+        // The default is deliberately NOT such a folder. These are other
+        // people's coursework: the scratch copies are deleted the moment they
+        // have printed, and %LOCALAPPDATA% keeps them out of a directory that
+        // gets opened, backed up, screen-shared or synced to a cloud drive
+        // while they are there. Pointing this at the Desktop is a reasonable
+        // thing for a shop to want and an entirely different exposure, so it is
+        // a deliberate choice rather than the default.
+        //
+        // A path that cannot be created falls back rather than refusing to
+        // start: a typo in an environment variable must not leave a counter with
+        // no agent mid-shift. The fallback is logged loudly, because an agent
+        // silently writing somewhere other than where it was told is worse than
+        // either outcome.
+        var configured = Environment.GetEnvironmentVariable("PRINTLY_DATA_DIR");
         var appDataDir = Path.Combine(baseDir, AppConstants.AppName);
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            try
+            {
+                var resolved = Path.GetFullPath(configured.Trim());
+                Directory.CreateDirectory(resolved);
+                appDataDir = resolved;
+            }
+            catch (Exception exc) when (exc is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                Console.Error.WriteLine(
+                    $"PRINTLY_DATA_DIR '{configured}' could not be used ({exc.Message}); falling back to {appDataDir}");
+            }
+        }
         var logDir = Path.Combine(appDataDir, "logs");
         // Restricted, cleared-on-use scratch space for downloaded documents -
         // never a permanent copy, and never inside a user-browsable folder.
