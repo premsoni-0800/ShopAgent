@@ -4,3 +4,7 @@ build/
 *.iml
 .idea/
 out/
+
+# macOS Finder metadata. Never useful in a repo, and this one is built and
+# run on Windows - these only exist because it was browsed from a Mac.
+.DS_Store
