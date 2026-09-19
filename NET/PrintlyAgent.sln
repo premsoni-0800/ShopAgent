@@ -1,0 +1,36 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{FBE677BB-F2B8-4B7F-926E-09E5A4829989}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PrintlyAgent", "src\PrintlyAgent\PrintlyAgent.csproj", "{37F0B95F-7054-4180-8796-8C7CFF561FC9}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{C09A7650-4317-48EC-B1FD-D3B7A9A87E59}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PrintlyAgent.Tests", "tests\PrintlyAgent.Tests\PrintlyAgent.Tests.csproj", "{AA4F9972-5222-4A81-8FF0-BC13A8735225}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{37F0B95F-7054-4180-8796-8C7CFF561FC9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{37F0B95F-7054-4180-8796-8C7CFF561FC9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{37F0B95F-7054-4180-8796-8C7CFF561FC9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{37F0B95F-7054-4180-8796-8C7CFF561FC9}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AA4F9972-5222-4A81-8FF0-BC13A8735225}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AA4F9972-5222-4A81-8FF0-BC13A8735225}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AA4F9972-5222-4A81-8FF0-BC13A8735225}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AA4F9972-5222-4A81-8FF0-BC13A8735225}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{37F0B95F-7054-4180-8796-8C7CFF561FC9} = {FBE677BB-F2B8-4B7F-926E-09E5A4829989}
+		{AA4F9972-5222-4A81-8FF0-BC13A8735225} = {C09A7650-4317-48EC-B1FD-D3B7A9A87E59}
+	EndGlobalSection
+EndGlobal

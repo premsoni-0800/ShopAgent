@@ -36,6 +36,45 @@ public sealed class MainForm : Form
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
 
     /// <summary>
+    /// The window the shop gets on a screen with room for it, in device-
+    /// independent pixels - the size the dashboard's widest layout was drawn
+    /// for. It is a preference, not a promise: <see cref="FitToScreen"/> takes
+    /// whichever is smaller, this or the screen.
+    /// </summary>
+    private const int PreferredWidthDip = 1280;
+    private const int PreferredHeightDip = 860;
+
+    /// <summary>
+    /// The floor on dragging the window smaller - about not being able to lose
+    /// the window by shrinking it to a stub, rather than about the layout, which
+    /// <see cref="FitDashboardToWindow"/> handles on its own.
+    /// </summary>
+    private const int MinimumWidthDip = 720;
+    private const int MinimumHeightDip = 520;
+
+    /// <summary>
+    /// The width the vendored dashboard is actually drawn for.
+    ///
+    /// Below it the bundle has no layout that holds together: the stat row stays
+    /// five columns however narrow it gets, and the Details/Print buttons in a
+    /// queue row keep their full width and ride up over the filename and the
+    /// IN-SHOP PRIORITY badge beside them. It is visibly wrong by 1100px and
+    /// unusable well before the window reaches its minimum.
+    ///
+    /// That belongs in the dashboard's own repo (premsoni-0800/printlypartner,
+    /// built from ../printlypartner-web) and cannot be fixed from this side -
+    /// what this side can do is never ask the page to lay out narrower than the
+    /// one width it is known to be right at. See FitDashboardToWindow.
+    /// </summary>
+    private const int DashboardDesignWidthDip = 1280;
+
+    /// <summary>
+    /// How far down the page is allowed to be scaled before legibility loses to
+    /// layout. Only reachable on a window near its minimum.
+    /// </summary>
+    private const double MinimumZoom = 0.5;
+
+    /// <summary>
     /// The brand mark, for the title bar and the taskbar button.
     ///
     /// Read from the embedded copy rather than the .exe, so every size in the
@@ -68,12 +107,173 @@ public sealed class MainForm : Form
 
         Text = "Printly Partner";
         Icon = LoadAppIcon(log);
-        Width = 1280;
-        Height = 860;
-        StartPosition = FormStartPosition.CenterScreen;
+
+        // Placed by FitToScreen once the handle exists and the screen and its
+        // scaling are known. CenterScreen would centre the size asked for here,
+        // which is not necessarily the size the window ends up with.
+        StartPosition = FormStartPosition.Manual;
 
         Controls.Add(_webView);
         _ = StartWebViewAsync();
+    }
+
+    /// <summary>
+    /// The scaling of the screen this window is on, asked of Windows directly.
+    ///
+    /// Not <see cref="Control.DeviceDpi"/>, which still reads 96 this early in
+    /// the window's life however aware the process is - and a 96 here is not an
+    /// error that announces itself. It is simply a window that comes out at a
+    /// quarter of its intended area on a 200% screen, which is how the dashboard
+    /// ended up laying itself out for a 640px viewport inside what looked like a
+    /// 1280px window: text and toggles spilling out of cards built for a width
+    /// the page never had.
+    /// </summary>
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr hwnd);
+
+    /// <summary>
+    /// Falls back to the value WinForms has if the call fails, which is better
+    /// than dividing by zero over a window size.
+    /// </summary>
+    private int CurrentDpi
+    {
+        get
+        {
+            if (!IsHandleCreated) return DeviceDpi;
+            try
+            {
+                var dpi = GetDpiForWindow(Handle);
+                return dpi > 0 ? (int)dpi : DeviceDpi;
+            }
+            catch (Exception exc)
+            {
+                _log.LogDebug(exc, "window_dpi_unavailable");
+                return DeviceDpi;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Device-independent pixels to real ones, at this window's current scaling.
+    ///
+    /// Every size in this class is written at 96dpi and put through here,
+    /// because a shop counter is as likely to be a 4K screen at 200% as a
+    /// 1366x768 laptop at 100%, and a literal 1280 means two very different
+    /// windows on those two machines.
+    /// </summary>
+    private static int Scale(int dip, int dpi) => (int)Math.Round(dip * dpi / 96.0);
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+
+        var dpi = CurrentDpi;
+        ApplyMinimumSize(dpi);
+        FitToScreen(dpi);
+    }
+
+    /// <summary>
+    /// Opens the window at the size the dashboard wants, or at the size the
+    /// screen actually has, whichever is smaller - then centres what is left.
+    ///
+    /// The old fixed 1280x860 was bigger than the whole working area of a
+    /// 1366x768 counter PC, so the window opened with its bottom edge - and the
+    /// buttons along it - underneath the taskbar, on a machine nobody was going
+    /// to reach for a mouse and resize.
+    /// </summary>
+    private void FitToScreen(int dpi)
+    {
+        var work = Screen.FromHandle(Handle).WorkingArea;
+
+        var width = Math.Min(Scale(PreferredWidthDip, dpi), work.Width);
+        var height = Math.Min(Scale(PreferredHeightDip, dpi), work.Height);
+
+        Bounds = new Rectangle(
+            work.X + ((work.Width - width) / 2),
+            work.Y + ((work.Height - height) / 2),
+            width,
+            height);
+
+        _log.LogInformation(
+            "window_sized dpi={Dpi} size={Width}x{Height} work={WorkWidth}x{WorkHeight}",
+            dpi, width, height, work.Width, work.Height);
+    }
+
+    /// <summary>
+    /// Clamped to the working area as well as scaled, because a minimum larger
+    /// than the screen is a window Windows cannot show in one piece.
+    /// </summary>
+    private void ApplyMinimumSize(int dpi)
+    {
+        var work = Screen.FromHandle(Handle).WorkingArea;
+
+        MinimumSize = new Size(
+            Math.Min(Scale(MinimumWidthDip, dpi), work.Width),
+            Math.Min(Scale(MinimumHeightDip, dpi), work.Height));
+    }
+
+    /// <summary>
+    /// Scales the page so the dashboard is always laid out at the width it was
+    /// designed for, whatever size the window happens to be.
+    ///
+    /// A narrower window used to mean a narrower page, and a narrower page is
+    /// where the vendored bundle comes apart - see
+    /// <see cref="DashboardDesignWidthDip"/>. Zooming out instead keeps the
+    /// viewport at 1280 and makes everything in it smaller, so a half-screen
+    /// window shows the whole dashboard, just smaller: the toggles stay in their
+    /// cards and the Print button stays beside the filename rather than on top
+    /// of it.
+    ///
+    /// The zoom is expressed against the window's own scaling, not its pixels,
+    /// which is what keeps this right on a 200% screen - where the same window
+    /// has twice the pixels and needs exactly the same zoom.
+    ///
+    /// Above the design width it stays at 1 and the dashboard simply gets the
+    /// extra room, which is what the wide layout is for.
+    /// </summary>
+    private void FitDashboardToWindow()
+    {
+        if (_webView.CoreWebView2 is null) return;
+        if (WindowState == FormWindowState.Minimized) return;
+        if (ClientSize.Width <= 0) return;
+
+        var logicalWidth = ClientSize.Width * 96.0 / CurrentDpi;
+        var zoom = Math.Clamp(logicalWidth / DashboardDesignWidthDip, MinimumZoom, 1.0);
+
+        try
+        {
+            // Compared before assigning because this runs on every resize step,
+            // and every assignment is a relayout of the whole page - dragging an
+            // edge would otherwise be one relayout per mouse move.
+            if (Math.Abs(_webView.ZoomFactor - zoom) > 0.005) _webView.ZoomFactor = zoom;
+        }
+        catch (Exception exc)
+        {
+            // A webview on its way out, most likely. A window at the wrong zoom
+            // is not worth taking the app down for.
+            _log.LogDebug(exc, "zoom_failed");
+        }
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        FitDashboardToWindow();
+    }
+
+    /// <summary>
+    /// Follows the window onto a screen with different scaling.
+    ///
+    /// WinForms resizes the window itself under PerMonitorV2 and WebView2
+    /// re-renders at the new scale on its own; what neither does is revisit a
+    /// MinimumSize measured in the old screen's pixels, which would otherwise
+    /// act as a 150%-sized floor on a 100% screen.
+    /// </summary>
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        ApplyMinimumSize(e.DeviceDpiNew);
+        FitDashboardToWindow();
     }
 
     /// <summary>
@@ -191,6 +391,11 @@ public sealed class MainForm : Form
             }
             catch (Exception exc) { _log.LogDebug(exc, "emit_failed event={Event}", evt); }
         };
+
+        // The first one: OnResize has been firing since before there was a
+        // CoreWebView2 to set a zoom on, so without this the window opens at
+        // whatever zoom the control defaults to until it is next resized.
+        FitDashboardToWindow();
 
         _webView.Source = new Uri(_server.BaseUrl);
         _log.LogInformation("webui_ready url={Url} dashboard=/", _server.BaseUrl);

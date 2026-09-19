@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
 namespace PrintlyAgent.Ui;
@@ -159,7 +160,11 @@ public sealed class WebUiServer : IDisposable
                 return;
             }
 
-            if (path.StartsWith("/api", StringComparison.Ordinal)
+            if (path.StartsWith("/doc/", StringComparison.Ordinal))
+            {
+                await ProxyDocumentAsync(context, path, ct).ConfigureAwait(false);
+            }
+            else if (path.StartsWith("/api", StringComparison.Ordinal)
                 || path.StartsWith("/actuator", StringComparison.Ordinal))
             {
                 await ProxyToBackendAsync(context, ct).ConfigureAwait(false);
@@ -216,7 +221,15 @@ public sealed class WebUiServer : IDisposable
     internal static string ContentTypeFor(string path) => path switch
     {
         _ when path.EndsWith(".html", StringComparison.OrdinalIgnoreCase) => "text/html; charset=utf-8",
-        _ when path.EndsWith(".js", StringComparison.OrdinalIgnoreCase) => "application/javascript; charset=utf-8",
+        // .mjs alongside .js, and not as a nicety: the dashboard's PDF viewer
+        // starts its renderer with `new Worker(url, { type: "module" })`, and a
+        // module worker is refused outright unless the response is a JavaScript
+        // MIME type. Served as application/octet-stream it failed silently -
+        // the page simply reported that it could not preview the document, with
+        // nothing to connect that to a content type.
+        _ when path.EndsWith(".js", StringComparison.OrdinalIgnoreCase)
+            || path.EndsWith(".mjs", StringComparison.OrdinalIgnoreCase)
+            => "application/javascript; charset=utf-8",
         _ when path.EndsWith(".css", StringComparison.OrdinalIgnoreCase) => "text/css; charset=utf-8",
         _ when path.EndsWith(".json", StringComparison.OrdinalIgnoreCase) => "application/json; charset=utf-8",
         _ when path.EndsWith(".svg", StringComparison.OrdinalIgnoreCase) => "image/svg+xml",
@@ -266,6 +279,106 @@ public sealed class WebUiServer : IDisposable
     private static bool IsSafeToRetry(string method) =>
         method.Equals("GET", StringComparison.OrdinalIgnoreCase)
         || method.Equals("HEAD", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Serves one of an order's documents from this origin: GET
+    /// /doc/{shopId}/{orderId}/{itemId}.
+    ///
+    /// The page could already ask the backend for a link and open it - that is
+    /// what the preview does - but a link is a signed URL on the storage host,
+    /// and anything that has to *read* the bytes from script rather than hand
+    /// them to an &lt;iframe&gt; needs that host to allow this origin by CORS. It
+    /// does not, and a shop counter is the wrong place to discover it: page
+    /// thumbnails came up as "preview unavailable" with nothing to say why.
+    ///
+    /// So the bytes come back through here instead, which is same-origin and
+    /// needs no permission from anyone. The two hops are the ones the page would
+    /// have made itself - ask for the link, then fetch it - just made from this
+    /// side of the window.
+    ///
+    /// Note what is NOT proxied: a URL supplied by the page. The only address
+    /// fetched is the one this agent's own backend just returned, so a document
+    /// route cannot be talked into fetching something else. The ids are checked
+    /// as GUIDs before they are put into a path for the same reason.
+    /// </summary>
+    private async Task ProxyDocumentAsync(HttpListenerContext context, string path, CancellationToken ct)
+    {
+        var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 4
+            || !Guid.TryParse(parts[1], out var shopId)
+            || !Guid.TryParse(parts[2], out var orderId)
+            || !Guid.TryParse(parts[3], out var itemId))
+        {
+            context.Response.StatusCode = 404;
+            context.Response.Close();
+            return;
+        }
+
+        try
+        {
+            var linkUrl =
+                $"{_backendBaseUrl}/api/v1/shop/{shopId}/orders/{orderId}/items/{itemId}/download-url";
+
+            using var linkRequest = new HttpRequestMessage(HttpMethod.Get, linkUrl);
+            // The page's own credentials, not the agent's. This route reaches
+            // exactly the documents the signed-in shop could already reach.
+            var authorization = context.Request.Headers["Authorization"];
+            if (!string.IsNullOrEmpty(authorization))
+            {
+                linkRequest.Headers.TryAddWithoutValidation("Authorization", authorization);
+            }
+
+            using var linkResponse = await _upstream.SendAsync(linkRequest, ct).ConfigureAwait(false);
+            if (!linkResponse.IsSuccessStatusCode)
+            {
+                _log.LogWarning(
+                    "doc_proxy_link_refused status={Status} order={Order}",
+                    (int)linkResponse.StatusCode, orderId);
+                context.Response.StatusCode = (int)linkResponse.StatusCode;
+                context.Response.Close();
+                return;
+            }
+
+            var payload = await linkResponse.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            string? signed;
+            using (var document = JsonDocument.Parse(payload))
+            {
+                signed = document.RootElement.TryGetProperty("url", out var url) ? url.GetString() : null;
+            }
+
+            // Absolute http(s) only. The backend is ours, but a malformed answer
+            // should fail here rather than be handed to HttpClient.
+            if (!Uri.TryCreate(signed, UriKind.Absolute, out var target)
+                || target.Scheme is not ("http" or "https"))
+            {
+                _log.LogWarning("doc_proxy_bad_link order={Order}", orderId);
+                context.Response.StatusCode = 502;
+                context.Response.Close();
+                return;
+            }
+
+            using var fileRequest = new HttpRequestMessage(HttpMethod.Get, target);
+            using var fileResponse = await _upstream
+                .SendAsync(fileRequest, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+
+            context.Response.StatusCode = (int)fileResponse.StatusCode;
+            context.Response.ContentType =
+                fileResponse.Content.Headers.ContentType?.ToString() ?? "application/octet-stream";
+            // A customer's document, on a shared counter machine: held only for
+            // as long as the page is looking at it.
+            context.Response.Headers["Cache-Control"] = "no-store";
+            context.Response.SendChunked = true;
+
+            await using var source = await fileResponse.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            await source.CopyToAsync(context.Response.OutputStream, ct).ConfigureAwait(false);
+            context.Response.Close();
+        }
+        catch (Exception exc)
+        {
+            _log.LogWarning(exc, "doc_proxy_failed order={Order}", orderId);
+            try { context.Response.StatusCode = 502; context.Response.Close(); } catch (Exception) { }
+        }
+    }
 
     private async Task ProxyToBackendAsync(HttpListenerContext context, CancellationToken ct, bool retried = false)
     {

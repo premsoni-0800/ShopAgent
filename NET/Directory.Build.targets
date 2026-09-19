@@ -1,0 +1,28 @@
+<Project>
+
+  <!--
+    The WebView2 package ships a WinForms wrapper and a WPF one, and the WPF one
+    was built against WindowsBase 5.0 - which does not exist in .NET 8, whose own
+    WindowsBase is 4.0.0.0. MSBuild cannot reconcile the two and every build
+    reports MSB3277 "conflicts between different versions of WindowsBase that
+    could not be resolved".
+
+    Nothing here touches the WPF wrapper: the control is hosted in WinForms (see
+    MainForm). So the reference is dropped rather than left as a permanent
+    warning, because a build that always prints one warning is a build where the
+    next, real warning goes unread.
+
+    It has to happen here and not in a plain ItemGroup: @(Reference) is only
+    populated from the package once ResolvePackageAssets has run, and the
+    conflict is reported by ResolveAssemblyReferences - so this is the one window
+    in between.
+  -->
+  <Target Name="DropWebView2WpfWrapper"
+          AfterTargets="ResolvePackageAssets"
+          BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="'%(FileName)' == 'Microsoft.Web.WebView2.Wpf'" />
+    </ItemGroup>
+  </Target>
+
+</Project>

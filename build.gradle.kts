@@ -67,6 +67,14 @@ application {
     mainClass.set("com.printly.agent.ui.PrintlyAgentAppKt")
 }
 
+// A bare `gradlew` launches the Windows app, because that IS the product: the
+// dashboard under ../printlypartner-web is a source input that `run` builds and
+// vendors on the way through, never a thing to serve on its own. Testing it in a
+// browser tests something the shop never uses - the app's WebView answers
+// confirm() as false, proxies the API through itself, and keys its saved session
+// to its own local origin.
+defaultTasks("run")
+
 javafx {
     version = "21.0.5"
     modules = listOf("javafx.controls", "javafx.web")
@@ -168,10 +176,17 @@ fun registerJPackageTask(name: String, type: String) = tasks.register<JPackageTa
 // No WiX Toolset required - a runnable folder bundling its own JRE.
 registerJPackageTask("jpackageAppImage", "app-image")
 
-// Requires WiX Toolset installed on the build machine (jpackage shells out
-// to candle.exe/light.exe for both "msi" and "exe" on Windows) - fails with
-// jpackage's own clear error if it isn't.
+// Both require the WiX Toolset on the build machine: jpackage shells out to
+// candle.exe/light.exe for "msi" AND for "exe" on Windows, so neither is the
+// WiX-free option - that is jpackageAppImage above. Without WiX these fail with
+// jpackage's own clear error rather than producing anything.
+//
+// Two shapes of the same install, because they are not interchangeable to the
+// person receiving them: the .exe is what someone double-clicks on a shop
+// counter, and the .msi is what an IT department deploys from a script or a
+// group policy without anybody present to click through a wizard.
 registerJPackageTask("jpackageMsi", "msi")
+registerJPackageTask("jpackageExe", "exe")
 
 tasks.withType<Test> {
     useJUnitPlatform()

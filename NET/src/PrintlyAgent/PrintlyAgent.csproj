@@ -47,6 +47,23 @@
     <UseWindowsForms>true</UseWindowsForms>
 
     <!--
+      Not the WinForms default, which is SystemAware.
+
+      SystemAware means the window is laid out once for the scaling in force
+      when the session began, and from then on Windows stretches the bitmap
+      whenever the real scaling differs - on a second monitor at a different
+      percentage, or after the shopkeeper changes the scaling without signing
+      out. A stretched WebView2 is both blurry and the wrong size: the page is
+      never told its viewport changed, so it never reflows to fit.
+
+      PerMonitorV2 hands the window the new DPI instead, WinForms resizes it,
+      and WebView2 re-renders the dashboard at the scale of the screen it is
+      actually on. It suits this app particularly well because there is exactly
+      one control in the window - the webview - and it does its own scaling.
+    -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+
+    <!--
       WinExe, not Exe: a shop counter should not get a console window behind the
       app. The logs still go to the console when one is attached, which is how
       it is run during development.
