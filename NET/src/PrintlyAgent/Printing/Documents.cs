@@ -80,10 +80,14 @@ public static class Documents
         long timeoutSeconds,
         CancellationToken ct = default)
     {
-        Directory.CreateDirectory(tempDir);
         // Prefixed with this process's id so SweepOrphanedDocuments can tell a
         // file another running agent is still printing from one abandoned by an
         // agent that died.
+        //
+        // The directory is not created here: DownloadDocumentToAsync ensures the
+        // parent of whatever path it is given, and doing it twice per document
+        // is a second synchronous filesystem call on a path that runs once per
+        // item of every order, concurrently.
         var pid = Environment.ProcessId;
         var destination = Path.Combine(tempDir, $"{pid}-{Guid.NewGuid():N}.pdf");
         return await DownloadDocumentToAsync(http, url, destination, timeoutSeconds, ct).ConfigureAwait(false);
