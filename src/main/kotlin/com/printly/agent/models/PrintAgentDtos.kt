@@ -96,17 +96,20 @@ data class PrintJobDetail(
      * field and creates no such job - produces exactly the behaviour this agent
      * had before hold-for-arrival existed, with no version check anywhere.
      *
-     * NOT IMPLEMENTED SERVER-SIDE as of backend main@d646f08. The field is on
-     * no response, `/cached` is on no controller, and nothing creates a job
-     * marked to hold - so this deserialises false on every job and the hold
-     * branch in the pipeline is unreachable today. That is exactly what the
-     * default is for, and it is why this agent behaves as it always did.
+     * Implemented server-side as of backend main@a109e21, which is deployed.
+     * The flag is on both job responses, `POST /print-agent/jobs/{jobId}/cached`
+     * is served, and a shop accepting an order before its student arrives now
+     * gets a job created with this set - so the hold branch in the pipeline is
+     * live, where for its first several releases it was unreachable and never
+     * once ran. A backend older than that still sends no such field, and the
+     * false default still makes this agent behave exactly as it did then, with
+     * no version check anywhere.
      *
-     * Kept because the agent half is the half that is hard to get right, and
-     * because it costs nothing while the flag never arrives. When the backend
-     * grows it, the release must be discovered by ASKING - see
+     * The release is discovered by ASKING, and has to be - see
      * `processHeldReleases`. The agent SSE stream carries one event type,
      * print-job-available, and nothing about a student arriving reaches it.
+     * The backend clears the flag when the student scans and pushes nothing;
+     * the next poll of this job is what finds it cleared.
      */
     val holdForArrival: Boolean = false,
 )
