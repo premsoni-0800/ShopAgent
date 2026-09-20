@@ -53,6 +53,20 @@ public sealed class AgentCore : IAsyncDisposable
     private static readonly TimeSpan ScheduledJobCheckInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan PrinterSyncInterval = TimeSpan.FromSeconds(120);
 
+    /// <summary>
+    /// How long to let a freshly plugged-in printer settle before asking the
+    /// driver about it.
+    ///
+    /// The spooler announces the printer as soon as it exists, which is before
+    /// the driver behind it is necessarily ready to answer for it. Syncing on
+    /// the notification itself reported the new machine with UNKNOWN status and
+    /// no capabilities, and that answer would then stand for the next two
+    /// minutes - worse than not having noticed at all, because the selector
+    /// acts on it. It also coalesces the burst a single installation produces
+    /// into one sweep.
+    /// </summary>
+    private static readonly TimeSpan PrinterChangeSettleDelay = TimeSpan.FromSeconds(2);
+
     private readonly ILogger _log;
     private readonly ILoggerFactory _loggerFactory;
 
@@ -100,6 +114,21 @@ public sealed class AgentCore : IAsyncDisposable
     /// </summary>
     private readonly SharedRefresh _ownerRefresh;
     private readonly List<Task> _loops = new();
+
+    /// <summary>
+    /// Raised by <see cref="PrinterChangeWatcher"/> to bring the next printer
+    /// sweep forward.
+    ///
+    /// <para>
+    /// A semaphore capped at one, not a count: several notifications arriving
+    /// while a sweep is already due mean the same thing as one, and the sweep
+    /// re-reads the whole machine regardless of what changed. Releasing past
+    /// the cap is therefore a no-op rather than an error - see
+    /// <see cref="OnPrinterSetChanged"/> - and a burst of changes produces one
+    /// sweep instead of a queue of identical ones.
+    /// </para>
+    /// </summary>
+    private readonly SemaphoreSlim _printerChanged = new(0, 1);
 
     /// <summary>
     /// Held separately from the rest because it is the one loop that can stop on
@@ -279,6 +308,13 @@ public sealed class AgentCore : IAsyncDisposable
 
         _loops.Add(Task.Run(() => HeartbeatLoopAsync(token), token));
         _loops.Add(Task.Run(() => PrinterSyncLoopAsync(token), token));
+
+        // Started alongside the sweep rather than in place of it: this is what
+        // makes a printer appear in a second instead of in two minutes, and the
+        // sweep is what covers the machine when it cannot.
+        _loops.Add(new PrinterChangeWatcher(
+            _loggerFactory.CreateLogger<PrinterChangeWatcher>(), OnPrinterSetChanged).RunForeverAsync(token));
+
         _loops.Add(Task.Run(() => _sse.RunForeverAsync(token), token));
 
         _orderEventsLoop = Task.Run(() => _orderEvents.RunForeverAsync(_orderEventsShutdown.Token), token);
@@ -329,6 +365,7 @@ public sealed class AgentCore : IAsyncDisposable
         }
 
         _intake.Dispose();
+        _printerChanged.Dispose();
         Db.Dispose();
         Api.Dispose();
 
@@ -928,7 +965,56 @@ public sealed class AgentCore : IAsyncDisposable
                 }
             }
 
-            if (!await DelayAsync(PrinterSyncInterval, ct).ConfigureAwait(false)) return;
+            if (!await WaitForNextPrinterSweepAsync(ct).ConfigureAwait(false)) return;
+        }
+    }
+
+    /// <summary>
+    /// Waits for the sweep interval, or for the spooler to say the set of
+    /// printers changed - whichever comes first. False when shutdown cut the
+    /// wait short, so the caller can return.
+    /// </summary>
+    private async Task<bool> WaitForNextPrinterSweepAsync(CancellationToken ct)
+    {
+        bool changed;
+        try
+        {
+            changed = await _printerChanged.WaitAsync(PrinterSyncInterval, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+
+        // Only the early wake settles. Arriving here on the interval means
+        // nothing has changed, and there is nothing to wait to become ready.
+        return !changed || await DelayAsync(PrinterChangeSettleDelay, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A printer was added, removed, or failed to connect. Called on the
+    /// watcher's thread, so it does the least it can and hands the work to the
+    /// sweep.
+    /// </summary>
+    private void OnPrinterSetChanged()
+    {
+        // Before the release, not after, and not left to the sweep's own
+        // askDrivers pass: the capabilities are cached for two minutes and
+        // shared with the print path, so a job starting in the seconds between
+        // the notification and the sweep would otherwise be selected against
+        // the set of printers from before the change - including, if the
+        // printer it picks is the one just unplugged, onto a printer that is
+        // no longer there.
+        PrinterDiscovery.ForgetCachedPrinters();
+
+        try
+        {
+            _printerChanged.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            // A sweep is already pending. That sweep will re-read the whole
+            // machine, so this change is already accounted for.
         }
     }
 
