@@ -104,49 +104,14 @@ public sealed record PrintJobDetail(
     string OrderId,
     string OrderCode,
     PrintJobStatus Status,
-    List<PrintJobItem> Items,
-    /// <summary>
-    /// The shop accepted this order before its student walked in: fetch the
-    /// documents, say they are fetched, and print nothing.
-    ///
-    /// <para>
-    /// Optional with a false default rather than required, and that default is
-    /// what lets this agent talk to a backend that predates the field. A
-    /// constructor parameter the JSON does not mention keeps its default, so an
-    /// older server - which sends no such field and creates no such job -
-    /// produces exactly the behaviour this agent had before hold-for-arrival
-    /// existed, with no version check anywhere.
-    /// </para>
-    ///
-    /// <para>
-    /// Implemented server-side as of backend main@a109e21, which is deployed.
-    /// The flag is on both job responses, <c>POST /print-agent/jobs/{jobId}/cached</c>
-    /// is served, and a shop accepting an order before its student arrives now
-    /// gets a job created with this set - so the hold branch in the pipeline is
-    /// live, where for its first several releases it was unreachable and never
-    /// once ran. A backend older than that still sends no such field, and the
-    /// false default still makes this agent behave exactly as it did then, with
-    /// no version check anywhere.
-    /// </para>
-    ///
-    /// <para>
-    /// The release is discovered by ASKING, and has to be - see
-    /// <see cref="JobPipeline.ProcessHeldReleasesAsync"/>. The agent SSE stream
-    /// carries one event type, print-job-available, and nothing about a student
-    /// arriving reaches it. The backend clears the flag when the student scans
-    /// and pushes nothing; the next poll of this job is what finds it cleared.
-    /// </para>
-    /// </summary>
-    bool HoldForArrival = false);
+    List<PrintJobItem> Items);
 
 public sealed record PrintJobSummary(
     string JobId,
     string OrderId,
     string OrderCode,
     PrintJobStatus Status,
-    DateTimeOffset CreatedAt,
-    /// <summary>See <see cref="PrintJobDetail.HoldForArrival"/> - same flag, carried on the list form.</summary>
-    bool HoldForArrival = false);
+    DateTimeOffset CreatedAt);
 
 public sealed record DownloadUrl(string DocumentId, string Url, DateTimeOffset ExpiresAt, string FileName);
 

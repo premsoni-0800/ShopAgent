@@ -1,5 +1,6 @@
 using System.Runtime.Versioning;
 using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using PrintlyAgent.Credentials;
 using PrintlyAgent.Db;
@@ -15,11 +16,10 @@ namespace PrintlyAgent.Core;
 /// The agent itself: everything that keeps running whether or not anyone is
 /// looking at the window. Port of core/AgentCore.kt.
 ///
-/// Nine loops, started once both a signed-in owner and a paired machine exist:
+/// Seven loops, started once both a signed-in owner and a paired machine exist:
 /// heartbeat, printer sync, the print-job stream, the order stream, the
-/// scheduled-job check, the reconciliation poll, the in-shop priority re-check,
-/// the release of orders held for a student who has not arrived yet, and a
-/// one-shot resume of whatever the last run was interrupted doing.
+/// scheduled-job check, the reconciliation poll, and a one-shot resume of
+/// whatever the last run was interrupted doing.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class AgentCore : IAsyncDisposable
@@ -39,6 +39,16 @@ public sealed class AgentCore : IAsyncDisposable
     /// about a whole backlog on a timer is what flooded the backend before.
     /// </summary>
     private const int PriorityRecheckBatch = 6;
+
+    /// <summary>
+    /// How long to let order events pile up before sweeping.
+    ///
+    /// A counter scan moves the order's priority, its queue position, and the
+    /// position of everything behind it - so one student arriving produces a
+    /// burst of events about a single moment. Waiting briefly turns that burst
+    /// into one sweep.
+    /// </summary>
+    private static readonly TimeSpan OrderEventCoalesceDelay = TimeSpan.FromMilliseconds(400);
 
     private static readonly TimeSpan ScheduledJobCheckInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan PrinterSyncInterval = TimeSpan.FromSeconds(120);
@@ -163,9 +173,102 @@ public sealed class AgentCore : IAsyncDisposable
         // leave them sitting on the counter PC indefinitely.
         var swept = Documents.SweepOrphanedDocuments(settings.TempDir);
         if (swept > 0) _log.LogInformation("orphaned_documents_removed count={Count}", swept);
+
+        // And the files of students who never came.
+        //
+        // The held store keeps a real copy of somebody's documents from the
+        // upload until they walk in, which most of the time is the same day -
+        // but some orders are simply abandoned, and on a machine meant to sit on
+        // a counter for years those add up to a disk full of strangers'
+        // coursework. Swept on startup for the same reason as above: it has to
+        // happen whether or not this agent ever manages to sign in.
+        var abandoned = SweepAbandonedHeldFiles(settings, Db, _log);
+        if (abandoned > 0) _log.LogInformation("abandoned_held_orders_removed count={Count}", abandoned);
+    }
+
+    /// <summary>
+    /// How long a waiting student's files are kept before the shop PC forgets
+    /// them.
+    ///
+    /// Seven days is well past "they are coming this afternoon" and well short
+    /// of a term's worth of uploads. An order swept here is not lost - it is
+    /// still the shop's on the backend, and scanning for it downloads the files
+    /// again, exactly as it did before any of them were held locally.
+    /// </summary>
+    internal const int HeldFileRetentionDays = 7;
+
+    internal static int SweepAbandonedHeldFiles(Settings settings, Database db, ILogger log)
+    {
+        if (string.IsNullOrEmpty(settings.FilesDir)) return 0;
+
+        var cutoff = DateTime.UtcNow.AddDays(-HeldFileRetentionDays)
+            .ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+
+        var removed = 0;
+        foreach (var orderId in db.HeldOrdersOlderThan(cutoff))
+        {
+            try
+            {
+                db.DeleteHeldFiles(orderId);
+                var folder = Path.Combine(settings.FilesDir, JobPipeline.SafeFileStem(orderId));
+                if (Directory.Exists(folder)) Directory.Delete(folder, recursive: true);
+                removed++;
+            }
+            catch (Exception exc)
+            {
+                // Next run. A folder still open, or a permission problem, is not
+                // a reason to stop sweeping the rest.
+                log.LogDebug(exc, "abandoned_held_order_delete_failed order={OrderId}", orderId);
+            }
+        }
+        return removed;
     }
 
     // --- lifecycle -----------------------------------------------------------
+
+    /// <summary>
+    /// Pairs this machine when it is signed in but has no device credential.
+    ///
+    /// Pairing used to happen in exactly one place: the dashboard reaching into
+    /// the JS bridge with <c>adopt_session</c> after a sign-in. That is one
+    /// call, on a page, that has to land - and when it does not, or when the
+    /// pair itself throws, the result is a machine that is signed in, looks
+    /// connected, serves the dashboard perfectly well, and never claims a job.
+    /// Nothing about the screen says so. It is the failure this shop actually
+    /// hit: a stored owner session, no agent credential, and not one line in
+    /// the log about either.
+    ///
+    /// So the state is repaired here instead, from what is on disk, every time
+    /// the app starts. A credential is minted from the session we already have
+    /// rather than waiting to be asked. Signing in still pairs as before - this
+    /// only catches the case where that did not take.
+    ///
+    /// Best-effort by design: a failure leaves the app exactly as it was, still
+    /// signed in and still serving the dashboard, and is logged rather than
+    /// shown. The next launch tries again.
+    /// </summary>
+    public async Task EnsurePairedIfSignedInAsync()
+    {
+        if (_ownerSession is null || _agentCredential is not null) return;
+
+        try
+        {
+            _log.LogInformation("pairing_repair_starting shopId={ShopId}", _ownerSession.ShopId);
+            _agentCredential = await _auth.EnsurePairedAsync(Api, _ownerSession).ConfigureAwait(false);
+            Start();
+        }
+        catch (AnotherMachinePairedError exc)
+        {
+            // Another PC holds this shop's registration. Refusing is correct -
+            // two agents claiming the same jobs is worse than none - but it has
+            // to be visible, because the owner has to revoke the other one.
+            _log.LogWarning("pairing_repair_refused reason=ANOTHER_MACHINE_PAIRED {Message}", exc.Message);
+        }
+        catch (Exception exc)
+        {
+            _log.LogWarning(exc, "pairing_repair_failed");
+        }
+    }
 
     public void Start()
     {
@@ -183,7 +286,7 @@ public sealed class AgentCore : IAsyncDisposable
         _loops.Add(Task.Run(() => ScheduledJobsLoopAsync(token), token));
         _loops.Add(Task.Run(() => JobReconcileLoopAsync(token), token));
         _loops.Add(Task.Run(() => PriorityRecheckLoopAsync(token), token));
-        _loops.Add(Task.Run(() => HeldReleaseLoopAsync(token), token));
+        _loops.Add(Task.Run(() => ScanReleaseOnOrderEventLoopAsync(token), token));
         _loops.Add(Task.Run(() => ResumeInterruptedJobsOnceAsync(token), token));
     }
 
@@ -204,8 +307,14 @@ public sealed class AgentCore : IAsyncDisposable
             // A loop still inside a network call is left to process teardown.
             // Waiting on it forever is how a process fails to exit.
         }
-        _shutdown.Dispose();
-        _orderEventsShutdown?.Dispose();
+        // Not disposed here, though it reads naturally enough. Everything below
+        // still needs the token: JobContextFor reads _shutdown.Token, and
+        // CancellationTokenSource.Token throws once the source is disposed - so
+        // disposing it at this point threw straight out of the discard below,
+        // into a catch that logs at Debug, which the configured minimum level
+        // filters out. The result was silent and permanent: every shutdown left
+        // customers' prepared documents on the counter PC, and the log said
+        // nothing. The sources are disposed at the very end instead.
         await _printQueue.DisposeAsync().ConfigureAwait(false);
 
         // After the queue, never before: a worker still mid-submission is using
@@ -222,6 +331,11 @@ public sealed class AgentCore : IAsyncDisposable
         _intake.Dispose();
         Db.Dispose();
         Api.Dispose();
+
+        // Last, for the reason given above: everything that ran between the
+        // cancel and here needed a token off these.
+        _shutdown.Dispose();
+        _orderEventsShutdown?.Dispose();
     }
 
     // --- called from the UI bridge -------------------------------------------
@@ -337,16 +451,51 @@ public sealed class AgentCore : IAsyncDisposable
 
     // --- owner-session calls -------------------------------------------------
 
-    /// <summary>Paid orders only - matches the backend's own OrderStatus.isPaid.</summary>
+    /// <summary>
+    /// Orders the student actually placed - matching the backend's own
+    /// Order.isVisibleToShop.
+    ///
+    /// <para>
+    /// Keyed on <c>placedAt</c>, falling back to <c>paidAt</c>. There is no
+    /// online payment any more: a student uploads from wherever they are and
+    /// pays the shop in cash over the counter, so <c>paidAt</c> is null for the
+    /// whole of an ordinary order's life and filtering on it - which this did -
+    /// hid every single order from the shop.
+    /// </para>
+    ///
+    /// <para>
+    /// The fallback is not belt and braces, it is the normal case for months.
+    /// This agent is installed on a shop's PC and updates on its own schedule,
+    /// so it routinely talks to a backend older than itself - one that has never
+    /// heard of <c>placedAt</c> and sends only <c>paidAt</c>. Reading just the
+    /// new field would empty the shop's board the moment a counter updated ahead
+    /// of the server, which is precisely the wrong way round for a failure to
+    /// go. Either field means the same thing here: somebody placed this order.
+    /// </para>
+    ///
+    /// <para>
+    /// The null check is still worth keeping rather than dropping the filter:
+    /// an order row exists from before it is placed, and one left behind by an
+    /// upload somebody walked away from is not work this shop owes anyone.
+    /// </para>
+    /// </summary>
     public async Task<List<Dictionary<string, object?>>> ListOrdersAsync()
     {
         var result = await OwnerRequestAsync(s =>
             Api.OwnerGetAsync(s, $"/api/v1/shop/{s.ShopId}/orders")).ConfigureAwait(false);
 
-        return AsItemList(result)
-            .Where(item => item.TryGetValue("paidAt", out var paidAt) && paidAt is not null)
-            .ToList();
+        return AsItemList(result).Where(IsPlaced).ToList();
     }
+
+    /// <summary>
+    /// Whether the shop's order list says this order was actually placed.
+    ///
+    /// Reads whichever of the two fields the backend in front of it sends - see
+    /// <see cref="ListOrdersAsync"/> for why both have to work.
+    /// </summary>
+    internal static bool IsPlaced(IReadOnlyDictionary<string, object?> order) =>
+        (order.TryGetValue("placedAt", out var placedAt) && placedAt is not null)
+        || (order.TryGetValue("paidAt", out var paidAt) && paidAt is not null);
 
     public async Task<List<Dictionary<string, object?>>> ListPrintersAsync()
     {
@@ -363,6 +512,178 @@ public sealed class AgentCore : IAsyncDisposable
 
         _autoPrintEnabled = enabled;
         OnEmit("status", Status());
+    }
+
+    // --- files waiting for their student ------------------------------------
+
+    /// <summary>
+    /// Every order this machine is holding files for, ready for the Files
+    /// screen: who it belongs to, what they owe, and where each file is.
+    ///
+    /// <para>
+    /// Two sources, joined here rather than stored together. The files and their
+    /// paths are local - only this PC knows where it put them. Everything a
+    /// human reads off the card - the name, the mobile, the page count, the
+    /// money - comes from the shop's own order list, fetched fresh on every
+    /// call, because that is the one place any of it is true. Copying it into
+    /// the local table would be copying it into a second place that goes stale
+    /// and then gets read out to somebody at a counter.
+    /// </para>
+    ///
+    /// <para>
+    /// An order whose files are held but which the backend no longer lists is
+    /// left out entirely rather than shown with blanks: it has been cancelled,
+    /// or belongs to whoever had this machine before, and either way it is not
+    /// this shop's to hand over.
+    /// </para>
+    /// </summary>
+    public async Task<List<Dictionary<string, object?>>> HeldOrdersAsync()
+    {
+        var shopId = RequireSession().ShopId;
+        var held = Db.HeldFiles(shopId);
+        if (held.Count == 0) return new List<Dictionary<string, object?>>();
+
+        var orders = await ListOrdersAsync().ConfigureAwait(false);
+        var byUuid = new Dictionary<string, Dictionary<string, object?>>(StringComparer.Ordinal);
+        foreach (var order in orders)
+        {
+            if (order.TryGetValue("id", out var id) && id is not null) byUuid[id.ToString()!] = order;
+        }
+
+        return held
+            .GroupBy(row => row.OrderId, StringComparer.Ordinal)
+            .Where(group => byUuid.ContainsKey(group.Key))
+            .Select(group =>
+            {
+                var order = byUuid[group.Key];
+                var customer = order.TryGetValue("customer", out var c)
+                    ? c as IReadOnlyDictionary<string, object?>
+                    : null;
+
+                return new Dictionary<string, object?>
+                {
+                    // The order's real id, which every action is keyed on.
+                    ["orderUuid"] = group.Key,
+                    // What the counter says out loud: the customer's mobile's
+                    // last four digits. Not unique - see the backend's
+                    // OrderIdFormat - which is why the name and full number
+                    // below are on the card beside it and not optional.
+                    ["orderId"] = order.GetValueOrDefault("orderId"),
+                    ["customerName"] = customer?.GetValueOrDefault("name"),
+                    ["customerPhone"] = customer?.GetValueOrDefault("phone"),
+                    ["customerUid"] = customer?.GetValueOrDefault("id"),
+                    ["totalPages"] = order.GetValueOrDefault("totalPages"),
+                    ["totalAmount"] = order.GetValueOrDefault("totalAmount"),
+                    ["status"] = order.GetValueOrDefault("status"),
+                    ["placedAt"] = order.GetValueOrDefault("placedAt"),
+                    ["heldAt"] = group.Min(row => row.ReceivedAt),
+                    ["files"] = group
+                        .OrderBy(row => row.ReceivedAt, StringComparer.Ordinal)
+                        .Select(row => new Dictionary<string, object?>
+                        {
+                            ["itemId"] = row.ItemId,
+                            ["fileName"] = row.FileName,
+                            ["bytes"] = row.Bytes,
+                            // Served by this agent's own web server off the local
+                            // copy - see WebUiServer. A preview that went back to
+                            // the backend for a signed URL would be a network
+                            // round trip to show a file already on this disk.
+                            ["previewUrl"] = $"/local/files/{Uri.EscapeDataString(row.OrderId)}/{Uri.EscapeDataString(row.ItemId)}",
+                        })
+                        .ToList(),
+                };
+            })
+            .OrderBy(entry => entry["heldAt"] as string, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Prints everything this shop is holding for one person, now.
+    ///
+    /// <para>
+    /// The manual equivalent of the student scanning at the counter, and it goes
+    /// down exactly the same road rather than a second one: the job is marked
+    /// priority - which is persisted, so a restart mid-print does not lose it -
+    /// and then queued at priority. Anything else would be a second way to start
+    /// a printer, and the two would disagree about duplicate protection.
+    /// </para>
+    ///
+    /// <para>
+    /// The RECEIVED guard is load-bearing and is the same one the scan path
+    /// uses. A job a worker has already taken is not re-queued, because queueing
+    /// it again is how one order prints twice.
+    /// </para>
+    /// </summary>
+    public int PrintOrderNow(string orderUuid)
+    {
+        var credential = _agentCredential ?? throw new InvalidOperationException("This machine is not paired yet.");
+        var ctx = JobContextFor(credential);
+
+        var started = 0;
+        foreach (var row in Db.HeldForCounterScan(credential.ShopId))
+        {
+            if (!string.Equals(row.OrderId, orderUuid, StringComparison.Ordinal)) continue;
+            if (row.State != JobPipeline.RECEIVED) continue;
+
+            Db.MarkPriority(row.JobId);
+            if (_printQueue.Enqueue(
+                    row.JobId, row.OrderCode, priority: true,
+                    () => JobPipeline.ProcessJobAsync(ctx, row.JobId, _shutdown.Token)))
+            {
+                started++;
+                _log.LogInformation(
+                    "print_order_now job={JobId} order={OrderId} orderCode={OrderCode}",
+                    row.JobId, row.OrderId, row.OrderCode ?? "?");
+            }
+        }
+
+        if (started > 0) OnJobProgress();
+        return started;
+    }
+
+    /// <summary>The printers on this PC, as the routing dropdowns need them.</summary>
+    public async Task<List<Dictionary<string, object?>>> ListLocalPrintersAsync()
+    {
+        var printers = await Task.Run(() => PrinterDiscovery.DiscoverPrinters(_log)).ConfigureAwait(false);
+        return printers.Select(p => new Dictionary<string, object?>
+        {
+            ["windowsPrinterName"] = p.WindowsPrinterName,
+            ["displayName"] = p.DisplayName,
+            ["isSystemDefault"] = p.IsSystemDefault,
+            ["status"] = p.Status.ToString(),
+            ["colorCapable"] = p.ColorCapable,
+            ["duplexCapable"] = p.DuplexCapable,
+        }).ToList();
+    }
+
+    public PrinterRouting GetPrinterRouting() => PrinterRoutingStore.Read(Db);
+
+    public void SetPrinterRouting(string? colour, string? blackAndWhite)
+    {
+        PrinterRoutingStore.Write(Db, new PrinterRouting(colour, blackAndWhite));
+        _log.LogInformation(
+            "printer_routing_set colour={Colour} bw={Bw}",
+            colour ?? "(auto)", blackAndWhite ?? "(auto)");
+    }
+
+    /// <summary>
+    /// The local copy of one held file, for the preview.
+    ///
+    /// Resolved through the database rather than by building a path out of what
+    /// the page asked for: the page is not the authority on where this machine
+    /// keeps files, and a path assembled from its input is a path it can steer.
+    /// Null for anything this shop is not actually holding.
+    /// </summary>
+    public string? HeldFilePath(string orderUuid, string itemId)
+    {
+        var shopId = _agentCredential?.ShopId;
+        if (shopId is null) return null;
+
+        return Db.HeldFilesForOrder(orderUuid)
+            .Where(row => string.Equals(row.ItemId, itemId, StringComparison.Ordinal))
+            .Where(row => string.Equals(row.ShopId, shopId, StringComparison.Ordinal))
+            .Select(row => row.LocalPath)
+            .FirstOrDefault(File.Exists);
     }
 
     /// <summary>
@@ -678,7 +999,19 @@ public sealed class AgentCore : IAsyncDisposable
     /// the shop dashboard in a browser. Nothing local moved, so only the order
     /// list is told.
     /// </summary>
-    private void OnOrdersChanged() => OnEmit("orders", new Dictionary<string, object?>());
+    /// <summary>
+    /// Something in the shop's orders moved.
+    ///
+    /// Two readers, and the second is the one that prints. The dashboard wants
+    /// to redraw its list; the sweep wants to know whether one of those changes
+    /// was a student scanning at the counter, because under scan-at-counter
+    /// that is the event that starts a printer.
+    /// </summary>
+    private void OnOrdersChanged()
+    {
+        OnEmit("orders", new Dictionary<string, object?>());
+        _orderChangeSignal.Writer.TryWrite(true);
+    }
 
     private void OnJobProgress()
     {
@@ -827,20 +1160,29 @@ public sealed class AgentCore : IAsyncDisposable
             // so the real code is already in hand and costs nothing.
             orderCode ??= (lookup as ScheduleLookup.Known)?.OrderCode;
 
-            switch (Scheduling.PlanFor(lookup, DateTimeOffset.UtcNow))
+            switch (Scheduling.PlanFor(lookup))
             {
                 case SchedulePlan.PrintAt printAt:
                     JobPipeline.HandleJobReference(
                         JobContextFor(credential), _printQueue, jobId, orderId, orderCode, printAt.At, priority);
                     break;
 
+                // Paid, downloaded-able, and going nowhere near a printer: the
+                // student has not scanned at the counter yet. Recorded so the
+                // rotating recheck watches it - see JobPipeline.HoldForCounterScan
+                // for why recording and queueing are different things - and
+                // released by the scan, through the priority branch of
+                // HandleJobReference.
+                case SchedulePlan.AwaitCounterScan:
+                    JobPipeline.HoldForCounterScan(
+                        JobContextFor(credential), jobId, orderId, orderCode);
+                    break;
+
                 // Deliberately records nothing. Recording the job means deciding
-                // when to print it, and that is the one thing this path could
+                // what to do with it, and that is the one thing this path could
                 // not find out - so it is left to the ten-second reconciliation
                 // poll, which re-lists every outstanding job and brings this one
-                // back here to be asked again. Printing it now instead is what
-                // sent a six o'clock order out at eleven in the morning, to sit
-                // on the counter all day.
+                // back here to be asked again.
                 case SchedulePlan.Hold:
                     _log.LogWarning("scheduled_lookup_deferred job={JobId} order={OrderId}", jobId, orderId);
                     break;
@@ -848,11 +1190,34 @@ public sealed class AgentCore : IAsyncDisposable
         }, holdsPrinting: work == ReferenceWork.New);
     }
 
+    /// <summary>
+    /// Rings when the shop's order stream reports that something changed.
+    ///
+    /// Capacity one, dropping the oldest: the question it triggers is "has
+    /// anyone scanned?", which is the same question however many events
+    /// prompted it, so a backlog of them would only ask it repeatedly.
+    /// </summary>
+    /// <summary>
+    /// When this process started, as a round-trip UTC instant.
+    ///
+    /// The watermark that lets the stranded-at-the-printer sweep tell a
+    /// previous run's jobs from this one's - see
+    /// JobPipeline.ResolveJobsStrandedAtThePrinterAsync.
+    /// </summary>
+    private readonly string _startedAtIso =
+        DateTime.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+
+    private readonly Channel<bool> _orderChangeSignal =
+        Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+        });
+
     private JobContext JobContextFor(AgentCredential credential) => new(
         Api,
         Db,
         Settings.TempDir,
-        Settings.HeldDir,
+        Settings.FilesDir,
         Settings.MaxRetryAttempts,
         Settings.DownloadTimeoutSeconds,
         Settings.JobStallSeconds,
@@ -863,47 +1228,6 @@ public sealed class AgentCore : IAsyncDisposable
         // downloading when the app closes stops rather than finishing into a
         // database that is already shut.
         _shutdown.Token);
-
-    /// <summary>
-    /// Asks, over and over, whether any held order's student has walked in.
-    ///
-    /// <para>
-    /// Shares <see cref="Settings.JobReconcileIntervalSeconds"/> with the
-    /// reconcile and priority loops because it answers the same kind of question
-    /// and deserves the same urgency: somebody is at a counter waiting. The cost
-    /// is one request per held order per interval, which is bounded by how many
-    /// orders a shop accepted early and not by how long the agent has been
-    /// running - a released job leaves HELD and stops being asked about.
-    /// </para>
-    ///
-    /// <para>
-    /// See <see cref="JobPipeline.ProcessHeldReleasesAsync"/> for why this is a
-    /// poll and not a push. The short version is that the release is the one
-    /// event this agent cannot afford to miss, and a stream that has stopped
-    /// delivering without closing does not announce itself.
-    /// </para>
-    /// </summary>
-    private async Task HeldReleaseLoopAsync(CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            if (!await DelayAsync(TimeSpan.FromSeconds(Settings.JobReconcileIntervalSeconds), ct).ConfigureAwait(false))
-            {
-                return;
-            }
-
-            var credential = _agentCredential;
-            if (credential is null) continue;
-
-            try
-            {
-                await JobPipeline.ProcessHeldReleasesAsync(JobContextFor(credential), _printQueue, ct)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
-            catch (Exception exc) { _log.LogError(exc, "held_release_check_failed"); }
-        }
-    }
 
     private async Task ScheduledJobsLoopAsync(CancellationToken ct)
     {
@@ -960,7 +1284,7 @@ public sealed class AgentCore : IAsyncDisposable
         // never costs the resume above, and vice versa.
         try
         {
-            await JobPipeline.ResolveJobsStrandedAtThePrinterAsync(context, ct).ConfigureAwait(false);
+            await JobPipeline.ResolveJobsStrandedAtThePrinterAsync(context, _startedAtIso, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception exc) { _log.LogError(exc, "resolve_stranded_jobs_failed"); }
@@ -1024,6 +1348,107 @@ public sealed class AgentCore : IAsyncDisposable
         if (JobPipeline.TERMINAL.Contains(known.State)) return ReferenceWork.None;
         if (known.Priority) return ReferenceWork.None;
         return ReferenceWork.Recheck;
+    }
+
+    /// <summary>
+    /// Turns the shop's order stream into the thing that starts a printer.
+    ///
+    /// The rotating recheck below is the only other way a scan is ever noticed,
+    /// and it walks six held orders every ten seconds. That was sized for a
+    /// world where holding an order was rare - an order arrived, printed, and
+    /// left the pool. Under scan-at-counter every paid order sits in that pool
+    /// until its student walks in, so at a shop with thirty orders open the
+    /// rotation needs the best part of a minute to come round to the one person
+    /// actually standing at the counter. "Scan and it prints" cannot be built
+    /// on that.
+    ///
+    /// The stream already knows. A scan changes the order, and the shop's own
+    /// orders stream reports it - the agent has been receiving those events all
+    /// along and using them only to redraw a list.
+    ///
+    /// <para>
+    /// Strictly an accelerator. Everything it finds is released through the
+    /// ordinary path, and the rotation stays exactly as it was, so a backend
+    /// that turns out not to emit on a priority grant loses nothing: the scan
+    /// is noticed a little later, as it is today.
+    /// </para>
+    /// </summary>
+    private async Task ScanReleaseOnOrderEventLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await _orderChangeSignal.Reader.ReadAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { return; }
+
+            if (!await DelayAsync(OrderEventCoalesceDelay, ct).ConfigureAwait(false)) return;
+            while (_orderChangeSignal.Reader.TryRead(out _)) { }
+
+            try
+            {
+                await ReleaseScannedOrdersAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception exc)
+            {
+                // The rotation still covers this, so a failure here costs
+                // latency rather than correctness.
+                _log.LogDebug(exc, "scan_release_sweep_failed");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Asks, in one request, which of the held orders have been scanned.
+    ///
+    /// One request is the whole point. Asking per order is what the rotation
+    /// does and why it has to be rationed; the shop's orders list carries
+    /// inShopPriority for every order at once, so the cost of this is flat
+    /// whether one order is held or fifty.
+    ///
+    /// What comes back is used only to decide *which* orders are worth asking
+    /// about properly. The release itself goes through OnJobReference exactly
+    /// as the rotation's does - same lookup, same duplicate guard, same
+    /// authority - so the list is a filter and never a source of truth about
+    /// whether something may print.
+    /// </summary>
+    private async Task ReleaseScannedOrdersAsync(CancellationToken ct)
+    {
+        var credential = _agentCredential;
+        if (credential is null) return;
+
+        // Nothing held means nothing a scan could release, and no reason to
+        // spend a request finding that out. This is the common case on a quiet
+        // counter, where order events still arrive for ordinary traffic.
+        var held = Db.HeldForCounterScan(credential.ShopId);
+        if (held.Count == 0) return;
+
+        var orders = await ListOrdersAsync().ConfigureAwait(false);
+        if (ct.IsCancellationRequested) return;
+
+        var scanned = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var order in orders)
+        {
+            if (order.TryGetValue("inShopPriority", out var flag) && flag is true &&
+                order.TryGetValue("id", out var id) && id is string orderId &&
+                !string.IsNullOrEmpty(orderId))
+            {
+                scanned.Add(orderId);
+            }
+        }
+
+        if (scanned.Count == 0) return;
+
+        foreach (var row in held)
+        {
+            if (!scanned.Contains(row.OrderId)) continue;
+            _log.LogInformation(
+                "counter_scan_seen_on_order_event job={JobId} order={OrderCode}",
+                row.JobId, row.OrderCode ?? "?");
+            OnJobReference(row.JobId, row.OrderId, row.OrderCode, rechecking: true);
+        }
     }
 
     /// <summary>

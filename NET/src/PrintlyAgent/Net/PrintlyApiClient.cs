@@ -31,7 +31,7 @@ public sealed class ApiError : Exception
 /// print-agent device routes. Keeping them apart is not tidiness - sending an
 /// agent bearer at an owner route is a 401, and the reverse is worse.
 /// </summary>
-public sealed class PrintlyApiClient : IDisposable
+public sealed partial class PrintlyApiClient : IDisposable
 {
     public string BaseUrl { get; }
 
@@ -200,25 +200,19 @@ public sealed class PrintlyApiClient : IDisposable
                 new PrintJobProgressRequest(stage), AgentAuth(credential)), ct);
 
     /// <summary>
-    /// Says the documents for a held order are on this machine's disk.
+    /// The documents for this job are now on this agent's own disk.
     ///
-    /// <para>
-    /// Next to <see cref="ReportProgressAsync"/> but emphatically not the same
-    /// kind of call. A progress ping is ephemeral and never persisted - losing
-    /// one costs a flicker of live tracing. This one is durable, and it is what
-    /// lights "Order accepted" on the student's timeline, so it is only ever
-    /// sent once the files are actually written, never when the download
-    /// starts.
-    /// </para>
-    ///
-    /// <para>
-    /// Idempotent on the backend - the first report wins - which is what makes
-    /// the release loop's repeat send free, and is the only reason a report
-    /// lost to a dropped connection is recoverable at all.
-    /// </para>
+    /// Durable, unlike <see cref="ReportProgressAsync"/>, which is a live trace
+    /// the backend never persists. This is what lights "Order accepted" on the
+    /// student's timeline for an order accepted before they arrived, so it must
+    /// be sent only once the files are written and validated - not when the
+    /// download starts. Idempotent: the first report wins and later ones change
+    /// nothing, which is what makes it safe to send again after a restart.
     /// </summary>
-    public Task ReportCachedAsync(AgentCredential credential, string jobId, CancellationToken ct = default) =>
-        SendAsync(Post(Url($"/api/v1/print-agent/jobs/{jobId}/cached"), null, AgentAuth(credential)), ct);
+    public Task<PrintJobDetail> ReportCachedAsync(
+        AgentCredential credential, string jobId, CancellationToken ct = default) =>
+        SendAsync<PrintJobDetail>(
+            Post(Url($"/api/v1/print-agent/jobs/{jobId}/cached"), null, AgentAuth(credential)), ct);
 
     // -------------------------------------------------------------------------
 

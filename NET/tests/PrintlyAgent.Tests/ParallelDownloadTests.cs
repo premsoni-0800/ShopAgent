@@ -123,7 +123,11 @@ public class ParallelDownloadTests : IDisposable
             Api: api,
             Db: db,
             TempDir: _tempDir,
-            HeldDir: Path.Combine(_tempDir, "..", "held"),
+            // No held-files store: these tests are about the download and
+            // print path itself, and an empty FilesDir is what turns the
+            // prefetch and the local-copy reuse off, leaving exactly the
+            // behaviour they were written against.
+            FilesDir: "",
             MaxRetryAttempts: 1,
             DownloadTimeoutSeconds: 30,
             JobStallSeconds: 300.0,

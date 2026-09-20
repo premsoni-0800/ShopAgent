@@ -27,6 +27,35 @@ public sealed record LocalPrinter(
 public sealed record SelectionResult(LocalPrinter? Printer, string? Reason = null);
 
 /// <summary>
+/// Which printer the shop has said should take colour work, and which should
+/// take black and white.
+///
+/// <para>
+/// Two Windows printer names, or null for "decide it from the capabilities", and
+/// nothing more. It is deliberately not a rule engine: colour mode is the split
+/// a shop with two machines actually works to - the colour one and the cheap
+/// mono laser - and it is also the only print option the customer app lets
+/// anyone choose, so a rule keyed on anything else would sit unused.
+/// </para>
+///
+/// <para>
+/// A name here is a preference, never an override of physics: see
+/// <see cref="PrinterSelector.SelectPrinter"/>. A printer that has been unplugged,
+/// renamed, or cannot do the job is passed over rather than obeyed.
+/// </para>
+/// </summary>
+public sealed record PrinterRouting(string? Colour = null, string? BlackAndWhite = null)
+{
+    public static readonly PrinterRouting None = new();
+
+    /// <summary>The printer this shop has named for an item, if it named one.</summary>
+    public string? For(PrintJobItem item) =>
+        item.ColorMode == ColorMode.COLOR ? Blank(Colour) : Blank(BlackAndWhite);
+
+    private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+}
+
+/// <summary>
 /// Deterministic, explainable printer selection - port of
 /// printers/PrinterSelector.kt: exclude anything proven incompatible or
 /// unusable, score what is left, and never print with the wrong settings just
@@ -34,7 +63,10 @@ public sealed record SelectionResult(LocalPrinter? Printer, string? Reason = nul
 /// </summary>
 public static class PrinterSelector
 {
-    public static SelectionResult SelectPrinter(PrintJobItem item, IReadOnlyList<LocalPrinter> printers)
+    public static SelectionResult SelectPrinter(
+        PrintJobItem item,
+        IReadOnlyList<LocalPrinter> printers,
+        PrinterRouting? routing = null)
     {
         // Whether this machine has any real printer at all, judged across every
         // printer rather than only the usable ones - a shop whose only laser is
@@ -62,6 +94,24 @@ public static class PrinterSelector
             .ToList();
 
         if (candidates.Count == 0) return new SelectionResult(null, "PRINTER_INCOMPATIBLE");
+
+        // What the shop said, if it said anything and the machine is actually
+        // there and able to do the job.
+        //
+        // Chosen from the candidates rather than ahead of them on purpose: the
+        // filters above are about what is *possible*, and a preference cannot
+        // make an offline printer print or a mono laser produce colour. A named
+        // printer that has dropped off the machine - unplugged, renamed, out of
+        // paper - falls through to the scoring below and the order still comes
+        // out, which is a far better answer at a counter than refusing because a
+        // setting names something that is not there.
+        var named = routing?.For(item);
+        if (named is not null)
+        {
+            var preferred = candidates.FirstOrDefault(p =>
+                string.Equals(p.WindowsPrinterName, named, StringComparison.OrdinalIgnoreCase));
+            if (preferred is not null) return new SelectionResult(preferred);
+        }
 
         var best = candidates
             .OrderByDescending(p => Score(item, p))

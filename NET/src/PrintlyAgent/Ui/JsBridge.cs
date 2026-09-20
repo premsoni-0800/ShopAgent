@@ -51,6 +51,11 @@ public sealed class JsBridge
         "set_auto_print",
         "open_external",
         "print_document",
+        "list_held_files",
+        "print_order_now",
+        "list_local_printers",
+        "get_printer_routing",
+        "set_printer_routing",
     };
 
     private readonly ILogger _log;
@@ -91,6 +96,11 @@ public sealed class JsBridge
             "set_auto_print" => await OkAsync(() => _core.SetAutoPrintAsync(Bool(0))).ConfigureAwait(false),
             "open_external" => OpenExternal(Str(0)),
             "print_document" => await ManualPrint.PrintWithDialogAsync(Str(0), StrOrNull(1), _log).ConfigureAwait(false),
+            "list_held_files" => await ListHeldFilesAsync().ConfigureAwait(false),
+            "print_order_now" => await PrintOrderNowAsync(Str(0)).ConfigureAwait(false),
+            "list_local_printers" => ListLocalPrinters(),
+            "get_printer_routing" => GetPrinterRouting(),
+            "set_printer_routing" => SetPrinterRouting(StrOrNull(0), StrOrNull(1)),
             _ => new Dictionary<string, object?> { ["ok"] = false, ["error"] = $"unknown bridge method: {method}" },
         };
     }
@@ -99,6 +109,68 @@ public sealed class JsBridge
     {
         _core.SignOut();
         return new Dictionary<string, object?> { ["ok"] = true };
+    }
+
+    /// <summary>
+    /// The orders this machine is holding files for, for the Files screen.
+    /// </summary>
+    private Task<object> ListHeldFilesAsync() =>
+        OkListAsync("orders", () => _core.HeldOrdersAsync());
+
+    /// <summary>
+    /// Prints everything held for one person, now - the Print button on a Files
+    /// card.
+    ///
+    /// Reports how many jobs it actually started rather than a bare success, so
+    /// the page can say "nothing to print" instead of appearing to work and then
+    /// leaving the counter waiting on a printer that was never going to run.
+    /// </summary>
+    private async Task<object> PrintOrderNowAsync(string orderUuid)
+    {
+        try
+        {
+            var started = await Task.Run(() => _core.PrintOrderNow(orderUuid)).ConfigureAwait(false);
+            return new Dictionary<string, object?> { ["ok"] = true, ["started"] = started };
+        }
+        catch (Exception exc)
+        {
+            return Failure((exc as ApiError)?.Code, exc.Message);
+        }
+    }
+
+    /// <summary>
+    /// This PC's own printers, by the names Windows knows them by.
+    ///
+    /// Distinct from <c>list_printers</c>, which asks the backend what this shop
+    /// has registered. The routing settings have to offer the devices actually
+    /// attached to this machine, because those are the names the routing is
+    /// stored against and the ones the spooler will be handed.
+    /// </summary>
+    private Task<object> ListLocalPrinters() =>
+        OkListAsync("printers", () => _core.ListLocalPrintersAsync());
+
+    private object GetPrinterRouting()
+    {
+        var routing = _core.GetPrinterRouting();
+        return new Dictionary<string, object?>
+        {
+            ["ok"] = true,
+            ["colour"] = routing.Colour,
+            ["bw"] = routing.BlackAndWhite,
+        };
+    }
+
+    private object SetPrinterRouting(string? colour, string? blackAndWhite)
+    {
+        try
+        {
+            _core.SetPrinterRouting(colour, blackAndWhite);
+            return new Dictionary<string, object?> { ["ok"] = true };
+        }
+        catch (Exception exc)
+        {
+            return Failure(null, exc.Message);
+        }
     }
 
     /// <summary>
@@ -119,14 +191,17 @@ public sealed class JsBridge
         }
         catch (AnotherMachinePairedError exc)
         {
+            _log.LogWarning("adopt_session_failed reason=ANOTHER_MACHINE_PAIRED {Message}", exc.Message);
             return Failure("ANOTHER_MACHINE_PAIRED", exc.Message);
         }
         catch (ApiError exc)
         {
+            _log.LogWarning(exc, "adopt_session_failed code={Code}", exc.Code);
             return Failure(exc.Code, exc.Message);
         }
         catch (Exception exc)
         {
+            _log.LogWarning(exc, "adopt_session_failed");
             return Failure(null, exc.Message);
         }
     }

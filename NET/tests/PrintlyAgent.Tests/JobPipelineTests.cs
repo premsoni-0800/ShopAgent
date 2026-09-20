@@ -229,6 +229,171 @@ public class JobPipelineTests : IAsyncLifetime
         await DrainAsync(queue);
     }
 
+    // --- scan at counter -----------------------------------------------------
+
+    /// <summary>
+    /// The rule the whole scan-at-counter flow rests on: a paid order that has
+    /// arrived is written down and nothing else. Queueing it would be a promise
+    /// to print it, and nobody has scanned.
+    /// </summary>
+    [Fact(DisplayName = "an order awaiting a scan is recorded but never queued")]
+    public async Task AnOrderAwaitingAScanIsRecordedButNeverQueued()
+    {
+        var (ctx, db) = NewContext();
+        var queue = NewQueue(workers: 1);
+
+        HoldForCounterScan(ctx, "job-held", "order-held", "AA-000101");
+
+        var row = db.GetJob("job-held");
+        Assert.NotNull(row);
+        Assert.Equal(RECEIVED, row!.State);
+        Assert.False(row.Priority);
+
+        // Recorded is not queued. Nothing is going to a printer.
+        Assert.Empty(queue.Waiting());
+        Assert.Empty(queue.WaitingPriority());
+        Assert.Equal(0, queue.Depth);
+
+        await DrainAsync(queue);
+    }
+
+    /// <summary>
+    /// The student walked in and scanned. This is the only event that puts a
+    /// held order on a printer, and it has to work for a job that was never in
+    /// the queue to be promoted - which, under scan-at-counter, is every job.
+    /// </summary>
+    [Fact(DisplayName = "the counter scan releases a held order into the queue")]
+    public async Task TheCounterScanReleasesAHeldOrderIntoTheQueue()
+    {
+        var (ctx, db) = NewContext();
+        var queue = NewQueue(workers: 1);
+
+        // Occupy the one worker so a released job stays visible as pending
+        // rather than being taken the instant it lands.
+        var started = Gate();
+        var release = Gate();
+        queue.Enqueue("job-blocker", "AA-000100", false, async () =>
+        {
+            started.TrySetResult();
+            await release.Task;
+        });
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        HoldForCounterScan(ctx, "job-held", "order-held", "AA-000101");
+        Assert.Empty(queue.WaitingPriority());
+
+        HandleJobReference(ctx, queue, "job-held", "order-held", "AA-000101", null, priority: true);
+
+        // Queued, and queued as priority - the student is standing there.
+        Assert.Contains("AA-000101", queue.WaitingPriority());
+        Assert.True(db.GetJob("job-held")?.Priority);
+
+        release.SetResult();
+        await DrainAsync(queue);
+    }
+
+    /// <summary>
+    /// The one that would cost a customer their document twice.
+    ///
+    /// A scan can land for a job a worker has already taken - the recheck loop
+    /// is on a timer and does not stop for a printer. Promote answers false for
+    /// that job just as it does for a held one, so "not promotable" cannot be
+    /// read as "safe to queue". The state is what separates them: past RECEIVED
+    /// means a worker has it.
+    /// </summary>
+    [Fact(DisplayName = "a scan for a job already being worked on never re-queues it")]
+    public async Task AScanForAJobAlreadyBeingWorkedOnNeverRequeuesIt()
+    {
+        var (ctx, db) = NewContext();
+        var queue = NewQueue(workers: 1);
+
+        db.InsertJobReference("job-running", "order-running", "AA-000102", shopId: ShopId);
+        db.UpdateJobState("job-running", VALIDATING);
+        db.UpdateJobState("job-running", DOWNLOADING);
+
+        HandleJobReference(ctx, queue, "job-running", "order-running", "AA-000102", null, priority: true);
+
+        // The grant is still recorded - it is true, and it survives a restart -
+        // but nothing goes back on a printer.
+        Assert.True(db.GetJob("job-running")?.Priority);
+        Assert.Empty(queue.Waiting());
+        Assert.Empty(queue.WaitingPriority());
+        Assert.Equal(0, queue.Depth);
+
+        await DrainAsync(queue);
+    }
+
+    /// <summary>
+    /// The pre-existing path, still intact: a job already waiting is moved up
+    /// rather than added a second time.
+    /// </summary>
+    [Fact(DisplayName = "a scan for a job already queued promotes it rather than adding it twice")]
+    public async Task AScanForAJobAlreadyQueuedPromotesItRatherThanAddingItTwice()
+    {
+        var (ctx, db) = NewContext();
+        var queue = NewQueue(workers: 1);
+
+        var started = Gate();
+        var release = Gate();
+        queue.Enqueue("job-blocker", "AA-000100", false, async () =>
+        {
+            started.TrySetResult();
+            await release.Task;
+        });
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        db.InsertJobReference("job-waiting", "order-waiting", "AA-000103", shopId: ShopId);
+        queue.Enqueue("job-waiting", "AA-000103", false, () => Task.CompletedTask);
+        var depthBefore = queue.Depth;
+
+        HandleJobReference(ctx, queue, "job-waiting", "order-waiting", "AA-000103", null, priority: true);
+
+        Assert.Contains("AA-000103", queue.WaitingPriority());
+        Assert.Single(queue.WaitingPriority());
+        Assert.Equal(depthBefore, queue.Depth);
+
+        release.SetResult();
+        await DrainAsync(queue);
+    }
+
+    /// <summary>
+    /// A watermark far enough ahead that every row already written counts as a
+    /// previous run's - i.e. "sweep everything", which is what the tests above
+    /// are about.
+    /// </summary>
+    private static string SweepEverything =>
+        DateTime.UtcNow.AddMinutes(5).ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// The job the sweep must keep its hands off: one this run submitted
+    /// seconds ago and which is physically printing right now.
+    ///
+    /// The sweep fires ten seconds after start and had no way to tell such a
+    /// row from a previous run's, so it marked a live print UNKNOWN and told
+    /// the backend nobody could say whether it came out. The real outcome then
+    /// could not be recorded either - COMPLETED is unreachable from UNKNOWN -
+    /// so a perfectly good print ended on the errors list asking to be done
+    /// again.
+    /// </summary>
+    [Fact(DisplayName = "a job this run just sent to the printer is not swept as stranded")]
+    public async Task AJobThisRunJustSentToThePrinterIsNotSwept()
+    {
+        var (ctx, db) = NewContext();
+
+        // The watermark is taken first, exactly as the agent takes it at start.
+        var startedAt = DateTime.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+
+        db.InsertJobReference("job-live", "order-live", "AA-000300", shopId: ShopId);
+        db.UpdateJobState("job-live", VALIDATING);
+        db.UpdateJobState("job-live", DOWNLOADING);
+        db.UpdateJobState("job-live", DOWNLOADED);
+        db.UpdateJobState("job-live", SUBMITTING);
+
+        await ResolveJobsStrandedAtThePrinterAsync(ctx, startedAt, CancellationToken.None);
+
+        Assert.Equal(SUBMITTING, db.GetJob("job-live")?.State);
+    }
+
     // --- helpers -------------------------------------------------------------
 
     /// <summary>
@@ -252,7 +417,11 @@ public class JobPipelineTests : IAsyncLifetime
             Api: api,
             Db: db,
             TempDir: _tempDir,
-            HeldDir: Path.Combine(_tempDir, "..", "held"),
+            // No held-files store: these tests are about the download and
+            // print path itself, and an empty FilesDir is what turns the
+            // prefetch and the local-copy reuse off, leaving exactly the
+            // behaviour they were written against.
+            FilesDir: "",
             MaxRetryAttempts: 3,
             DownloadTimeoutSeconds: 30,
             JobStallSeconds: 300.0,
@@ -321,7 +490,7 @@ public class JobPipelineTests : IAsyncLifetime
             if (state == PRINTING) db.UpdateJobState(jobId, PRINTING);
         }
 
-        await ResolveJobsStrandedAtThePrinterAsync(ctx, CancellationToken.None);
+        await ResolveJobsStrandedAtThePrinterAsync(ctx, SweepEverything, CancellationToken.None);
 
         foreach (var jobId in new[] { "job-submitting", "job-submitted", "job-printing" })
         {
@@ -349,7 +518,7 @@ public class JobPipelineTests : IAsyncLifetime
 
         db.InsertJobReference("job-fresh", "order-fresh", "AA-000011", shopId: ShopId);
 
-        await ResolveJobsStrandedAtThePrinterAsync(ctx, CancellationToken.None);
+        await ResolveJobsStrandedAtThePrinterAsync(ctx, SweepEverything, CancellationToken.None);
 
         Assert.Equal(DOWNLOADING, db.GetJob("job-early")?.State);
         Assert.Equal(RECEIVED, db.GetJob("job-fresh")?.State);
@@ -373,7 +542,7 @@ public class JobPipelineTests : IAsyncLifetime
         db.UpdateJobState("job-done", PRINTING);
         db.UpdateJobState("job-done", COMPLETED);
 
-        await ResolveJobsStrandedAtThePrinterAsync(ctx, CancellationToken.None);
+        await ResolveJobsStrandedAtThePrinterAsync(ctx, SweepEverything, CancellationToken.None);
 
         Assert.Equal(COMPLETED, db.GetJob("job-done")?.State);
     }

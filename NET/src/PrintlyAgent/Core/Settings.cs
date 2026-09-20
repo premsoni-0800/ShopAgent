@@ -27,23 +27,20 @@ public sealed record Settings(
     string DbPath,
     string LogDir,
     string TempDir,
+
     /// <summary>
-    /// Where documents fetched ahead of a student's arrival are kept.
+    /// Where a waiting student's files are kept, one folder per order, from the
+    /// moment the order arrives until it prints.
     ///
     /// <para>
-    /// A sibling of <see cref="TempDir"/> rather than a folder inside it,
-    /// because the two have opposite lifetimes and one sweep runs over the
-    /// other. TempDir is scratch: download, print, delete, and
-    /// <c>Documents.SweepOrphanedDocuments</c> enforces that across a crash by
-    /// deleting any file whose owning process is gone. A held document is the
-    /// one case where an absent process means a restart rather than a leak -
-    /// the shop accepted in the morning, the student walks in after lunch, and
-    /// the agent may well have been restarted in between - so keeping these
-    /// anywhere that sweep looks would delete exactly the files the feature
-    /// exists to keep.
+    /// Distinct from <see cref="TempDir"/>, which is scratch space cleared as
+    /// soon as a job finishes with it. These files exist precisely so that there
+    /// is nothing left to fetch when the student finally walks in and scans, so
+    /// they have to outlive the job that fetched them - and a restart.
     /// </para>
     /// </summary>
-    string HeldDir,
+    string FilesDir = "",
+
     long HeartbeatIntervalSeconds = 10,
 
     /// <summary>
@@ -101,53 +98,27 @@ public static class SettingsLoader
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 "." + AppConstants.AppName.ToLowerInvariant());
 
-        // PRINTLY_DATA_DIR moves everything this agent keeps on disk - the
-        // database, the logs, the scratch space and the held documents - to a
-        // folder the shop chooses. Set it to something like
-        // C:\Users\you\Desktop\order files and the documents land where they
-        // can be watched arriving.
-        //
-        // The default is deliberately NOT such a folder. These are other
-        // people's coursework: the scratch copies are deleted the moment they
-        // have printed, and %LOCALAPPDATA% keeps them out of a directory that
-        // gets opened, backed up, screen-shared or synced to a cloud drive
-        // while they are there. Pointing this at the Desktop is a reasonable
-        // thing for a shop to want and an entirely different exposure, so it is
-        // a deliberate choice rather than the default.
-        //
-        // A path that cannot be created falls back rather than refusing to
-        // start: a typo in an environment variable must not leave a counter with
-        // no agent mid-shift. The fallback is logged loudly, because an agent
-        // silently writing somewhere other than where it was told is worse than
-        // either outcome.
-        var configured = Environment.GetEnvironmentVariable("PRINTLY_DATA_DIR");
         var appDataDir = Path.Combine(baseDir, AppConstants.AppName);
-        if (!string.IsNullOrWhiteSpace(configured))
-        {
-            try
-            {
-                var resolved = Path.GetFullPath(configured.Trim());
-                Directory.CreateDirectory(resolved);
-                appDataDir = resolved;
-            }
-            catch (Exception exc) when (exc is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
-            {
-                Console.Error.WriteLine(
-                    $"PRINTLY_DATA_DIR '{configured}' could not be used ({exc.Message}); falling back to {appDataDir}");
-            }
-        }
         var logDir = Path.Combine(appDataDir, "logs");
         // Restricted, cleared-on-use scratch space for downloaded documents -
         // never a permanent copy, and never inside a user-browsable folder.
         var tempDir = Path.Combine(appDataDir, "tmp");
-        // Deliberately not under tempDir - see Settings.HeldDir for why the
-        // orphan sweep must never be able to reach these.
-        var heldDir = Path.Combine(appDataDir, "held");
+        // Where a waiting student's files are kept until they walk in.
+        //
+        // Separate from tmp deliberately: tmp is cleared on use, and these have
+        // to survive from the upload until the scan - minutes or hours later,
+        // across a restart. They are fetched the moment the order arrives so
+        // that pressing Print at the counter starts a printer rather than a
+        // download, which is the whole point of holding them here.
+        //
+        // Deleted once the order prints, and swept if it never does. See
+        // Documents.SweepAbandonedOrders.
+        var filesDir = Path.Combine(appDataDir, "files");
 
         Directory.CreateDirectory(appDataDir);
         Directory.CreateDirectory(logDir);
         Directory.CreateDirectory(tempDir);
-        Directory.CreateDirectory(heldDir);
+        Directory.CreateDirectory(filesDir);
 
         return new Settings(
             BackendBaseUrl: (Environment.GetEnvironmentVariable("PRINTLY_BACKEND_URL")
@@ -158,7 +129,7 @@ public static class SettingsLoader
             DbPath: Path.Combine(appDataDir, "agent.db"),
             LogDir: logDir,
             TempDir: tempDir,
-            HeldDir: heldDir,
+            FilesDir: filesDir,
             // A shop that genuinely has more than one printer can say so without
             // a rebuild. Nonsense values fall back rather than starting an agent
             // that prints nothing (0) or thrashes the temp dir (300).

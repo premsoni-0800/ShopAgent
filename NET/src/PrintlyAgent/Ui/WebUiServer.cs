@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Sockets;
-using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
 namespace PrintlyAgent.Ui;
@@ -137,14 +136,33 @@ public sealed class WebUiServer : IDisposable
             {
                 context = await _listener.GetContextAsync().ConfigureAwait(false);
             }
-            catch (Exception)
+            catch (Exception exc)
             {
-                return; // listener stopped
+                // Only a stop is a reason to leave. This used to return on any
+                // exception at all, which meant a single aborted connection or
+                // http.sys hiccup silently ended the accept loop for the life
+                // of the process: the window kept its dead page, every call
+                // hung, nothing was logged, and the only cure was restarting
+                // the app - on the machine specifically meant to sit unattended
+                // all day.
+                if (_shutdown.IsCancellationRequested || !_listener.IsListening) return;
+
+                _log.LogWarning(exc, "webui_accept_failed");
+                // A listener failing instantly and repeatedly must not become a
+                // spin; a single aborted connection costs nothing here.
+                try { await Task.Delay(250, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                continue;
             }
 
             // Deliberately not awaited: one request must never hold up the next,
             // and an SSE stream holds its own for as long as the page is open.
-            _ = Task.Run(() => HandleAsync(context, ct), ct);
+            //
+            // The token is not passed as Task.Run's creation token on purpose:
+            // that cancels the work before it starts once shutdown begins, and
+            // the context is then never closed, leaving that client hanging on
+            // a request nobody will ever answer.
+            _ = Task.Run(() => HandleAsync(context, ct));
         }
     }
 
@@ -160,9 +178,9 @@ public sealed class WebUiServer : IDisposable
                 return;
             }
 
-            if (path.StartsWith("/doc/", StringComparison.Ordinal))
+            if (path.StartsWith(LocalFilesPrefix, StringComparison.Ordinal))
             {
-                await ProxyDocumentAsync(context, path, ct).ConfigureAwait(false);
+                ServeHeldFile(context, path);
             }
             else if (path.StartsWith("/api", StringComparison.Ordinal)
                 || path.StartsWith("/actuator", StringComparison.Ordinal))
@@ -198,6 +216,80 @@ public sealed class WebUiServer : IDisposable
             || host.Equals($"localhost:{Port}", StringComparison.OrdinalIgnoreCase);
     }
 
+    // --- held files ----------------------------------------------------------
+
+    /// <summary>
+    /// Where the Files screen asks for a preview of a document this machine is
+    /// already holding: <c>/local/files/{orderUuid}/{itemId}</c>.
+    /// </summary>
+    internal const string LocalFilesPrefix = "/local/files/";
+
+    /// <summary>
+    /// Resolves a held file for the page. Set by the host once the agent exists;
+    /// null in tests and before pairing, which serves a 404 - the honest answer
+    /// when this machine is holding nothing for anyone.
+    /// </summary>
+    public Func<string, string, string?>? HeldFileResolver { get; set; }
+
+    /// <summary>
+    /// Serves one held document off this disk.
+    ///
+    /// <para>
+    /// The path is <em>not</em> turned into a filename. The two segments are
+    /// handed to the agent, which looks them up in its own table and returns the
+    /// path it recorded when it fetched the file - so what is served is always
+    /// something this shop is genuinely holding, and never something the page
+    /// steered a path towards. A page inside this webview is not a trusted
+    /// caller: it is the one place a bad document could get script running.
+    /// </para>
+    ///
+    /// <para>
+    /// Inline rather than an attachment, because the whole point is that the
+    /// owner can see what they are about to print without downloading it first.
+    /// </para>
+    /// </summary>
+    private void ServeHeldFile(HttpListenerContext context, string path)
+    {
+        var segments = path[LocalFilesPrefix.Length..]
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        string? resolved = null;
+        if (segments.Length == 2 && HeldFileResolver is { } resolve)
+        {
+            resolved = resolve(Uri.UnescapeDataString(segments[0]), Uri.UnescapeDataString(segments[1]));
+        }
+
+        if (resolved is null || !File.Exists(resolved))
+        {
+            context.Response.StatusCode = 404;
+            context.Response.Close();
+            return;
+        }
+
+        try
+        {
+            using var file = File.OpenRead(resolved);
+            context.Response.ContentType = "application/pdf";
+            // Never cached. These are somebody's documents, they are deleted the
+            // moment the order prints, and a stale one shown against the next
+            // student's name is the worst outcome this screen has.
+            context.Response.Headers["Cache-Control"] = "no-store";
+            context.Response.Headers["Content-Disposition"] = "inline";
+            context.Response.ContentLength64 = file.Length;
+            file.CopyTo(context.Response.OutputStream);
+        }
+        catch (IOException exc)
+        {
+            // Being deleted underneath us by a print that just finished.
+            _log.LogDebug(exc, "held_file_read_failed path={Path}", path);
+            try { context.Response.StatusCode = 404; } catch (Exception) { }
+        }
+        finally
+        {
+            try { context.Response.Close(); } catch (Exception) { }
+        }
+    }
+
     // --- static files --------------------------------------------------------
 
     /// <summary>
@@ -221,15 +313,7 @@ public sealed class WebUiServer : IDisposable
     internal static string ContentTypeFor(string path) => path switch
     {
         _ when path.EndsWith(".html", StringComparison.OrdinalIgnoreCase) => "text/html; charset=utf-8",
-        // .mjs alongside .js, and not as a nicety: the dashboard's PDF viewer
-        // starts its renderer with `new Worker(url, { type: "module" })`, and a
-        // module worker is refused outright unless the response is a JavaScript
-        // MIME type. Served as application/octet-stream it failed silently -
-        // the page simply reported that it could not preview the document, with
-        // nothing to connect that to a content type.
-        _ when path.EndsWith(".js", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith(".mjs", StringComparison.OrdinalIgnoreCase)
-            => "application/javascript; charset=utf-8",
+        _ when path.EndsWith(".js", StringComparison.OrdinalIgnoreCase) => "application/javascript; charset=utf-8",
         _ when path.EndsWith(".css", StringComparison.OrdinalIgnoreCase) => "text/css; charset=utf-8",
         _ when path.EndsWith(".json", StringComparison.OrdinalIgnoreCase) => "application/json; charset=utf-8",
         _ when path.EndsWith(".svg", StringComparison.OrdinalIgnoreCase) => "image/svg+xml",
@@ -241,10 +325,13 @@ public sealed class WebUiServer : IDisposable
 
     private void ServeStatic(HttpListenerContext context, string path)
     {
-        var resolved = path is "/" or "" ? "/dashboard/index.html" : null;
+        var resolved = path is "/" or "" ? "/dashboard/index.html"
+            : path is "/agent" or "/agent/" ? "/webui/index.html"
+            : null;
 
         var bytes = ReadContent(resolved)
             ?? ReadContent("/dashboard" + path)
+            ?? ReadContent("/webui" + path)
             // SPA fallback - but never for a file request, where a 404 is the
             // honest answer and handing back HTML would surface as a baffling
             // "unexpected token <" in the console instead.
@@ -279,106 +366,6 @@ public sealed class WebUiServer : IDisposable
     private static bool IsSafeToRetry(string method) =>
         method.Equals("GET", StringComparison.OrdinalIgnoreCase)
         || method.Equals("HEAD", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Serves one of an order's documents from this origin: GET
-    /// /doc/{shopId}/{orderId}/{itemId}.
-    ///
-    /// The page could already ask the backend for a link and open it - that is
-    /// what the preview does - but a link is a signed URL on the storage host,
-    /// and anything that has to *read* the bytes from script rather than hand
-    /// them to an &lt;iframe&gt; needs that host to allow this origin by CORS. It
-    /// does not, and a shop counter is the wrong place to discover it: page
-    /// thumbnails came up as "preview unavailable" with nothing to say why.
-    ///
-    /// So the bytes come back through here instead, which is same-origin and
-    /// needs no permission from anyone. The two hops are the ones the page would
-    /// have made itself - ask for the link, then fetch it - just made from this
-    /// side of the window.
-    ///
-    /// Note what is NOT proxied: a URL supplied by the page. The only address
-    /// fetched is the one this agent's own backend just returned, so a document
-    /// route cannot be talked into fetching something else. The ids are checked
-    /// as GUIDs before they are put into a path for the same reason.
-    /// </summary>
-    private async Task ProxyDocumentAsync(HttpListenerContext context, string path, CancellationToken ct)
-    {
-        var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length != 4
-            || !Guid.TryParse(parts[1], out var shopId)
-            || !Guid.TryParse(parts[2], out var orderId)
-            || !Guid.TryParse(parts[3], out var itemId))
-        {
-            context.Response.StatusCode = 404;
-            context.Response.Close();
-            return;
-        }
-
-        try
-        {
-            var linkUrl =
-                $"{_backendBaseUrl}/api/v1/shop/{shopId}/orders/{orderId}/items/{itemId}/download-url";
-
-            using var linkRequest = new HttpRequestMessage(HttpMethod.Get, linkUrl);
-            // The page's own credentials, not the agent's. This route reaches
-            // exactly the documents the signed-in shop could already reach.
-            var authorization = context.Request.Headers["Authorization"];
-            if (!string.IsNullOrEmpty(authorization))
-            {
-                linkRequest.Headers.TryAddWithoutValidation("Authorization", authorization);
-            }
-
-            using var linkResponse = await _upstream.SendAsync(linkRequest, ct).ConfigureAwait(false);
-            if (!linkResponse.IsSuccessStatusCode)
-            {
-                _log.LogWarning(
-                    "doc_proxy_link_refused status={Status} order={Order}",
-                    (int)linkResponse.StatusCode, orderId);
-                context.Response.StatusCode = (int)linkResponse.StatusCode;
-                context.Response.Close();
-                return;
-            }
-
-            var payload = await linkResponse.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            string? signed;
-            using (var document = JsonDocument.Parse(payload))
-            {
-                signed = document.RootElement.TryGetProperty("url", out var url) ? url.GetString() : null;
-            }
-
-            // Absolute http(s) only. The backend is ours, but a malformed answer
-            // should fail here rather than be handed to HttpClient.
-            if (!Uri.TryCreate(signed, UriKind.Absolute, out var target)
-                || target.Scheme is not ("http" or "https"))
-            {
-                _log.LogWarning("doc_proxy_bad_link order={Order}", orderId);
-                context.Response.StatusCode = 502;
-                context.Response.Close();
-                return;
-            }
-
-            using var fileRequest = new HttpRequestMessage(HttpMethod.Get, target);
-            using var fileResponse = await _upstream
-                .SendAsync(fileRequest, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-
-            context.Response.StatusCode = (int)fileResponse.StatusCode;
-            context.Response.ContentType =
-                fileResponse.Content.Headers.ContentType?.ToString() ?? "application/octet-stream";
-            // A customer's document, on a shared counter machine: held only for
-            // as long as the page is looking at it.
-            context.Response.Headers["Cache-Control"] = "no-store";
-            context.Response.SendChunked = true;
-
-            await using var source = await fileResponse.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            await source.CopyToAsync(context.Response.OutputStream, ct).ConfigureAwait(false);
-            context.Response.Close();
-        }
-        catch (Exception exc)
-        {
-            _log.LogWarning(exc, "doc_proxy_failed order={Order}", orderId);
-            try { context.Response.StatusCode = 502; context.Response.Close(); } catch (Exception) { }
-        }
-    }
 
     private async Task ProxyToBackendAsync(HttpListenerContext context, CancellationToken ct, bool retried = false)
     {
@@ -497,6 +484,27 @@ public sealed class WebUiServer : IDisposable
             {
                 _log.LogInformation("api_proxy_retry_after_dns_failure path={Path}", request.Url?.AbsolutePath);
                 await ProxyToBackendAsync(context, ct, retried: true).ConfigureAwait(false);
+                return;
+            }
+
+            // The page went away mid-response, which is not a failure of
+            // anything.
+            //
+            // Error 1229 is HttpListener saying the client's connection no
+            // longer exists - the WebView navigated, the dashboard reloaded, or
+            // a fetch was aborted while the answer was still being written. It
+            // arrived as a warning with a full stack trace naming an order, so
+            // the log read as though proxying orders was broken, while the only
+            // thing that had happened was somebody clicking away from a screen.
+            // Nothing can be sent to a connection that is gone, so there is also
+            // no point falling through to the 502 below.
+            const int ClientConnectionGone = 1229;
+            var clientGone = exc is HttpListenerException { ErrorCode: ClientConnectionGone }
+                || exc is IOException { InnerException: HttpListenerException { ErrorCode: ClientConnectionGone } }
+                || exc is ObjectDisposedException;
+            if (clientGone)
+            {
+                _log.LogDebug("api_proxy_client_disconnected path={Path}", request.Url?.AbsolutePath);
                 return;
             }
 

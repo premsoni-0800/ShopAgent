@@ -47,23 +47,6 @@
     <UseWindowsForms>true</UseWindowsForms>
 
     <!--
-      Not the WinForms default, which is SystemAware.
-
-      SystemAware means the window is laid out once for the scaling in force
-      when the session began, and from then on Windows stretches the bitmap
-      whenever the real scaling differs - on a second monitor at a different
-      percentage, or after the shopkeeper changes the scaling without signing
-      out. A stretched WebView2 is both blurry and the wrong size: the page is
-      never told its viewport changed, so it never reflows to fit.
-
-      PerMonitorV2 hands the window the new DPI instead, WinForms resizes it,
-      and WebView2 re-renders the dashboard at the scale of the screen it is
-      actually on. It suits this app particularly well because there is exactly
-      one control in the window - the webview - and it does its own scaling.
-    -->
-    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-
-    <!--
       WinExe, not Exe: a shop counter should not get a console window behind the
       app. The logs still go to the console when one is attached, which is how
       it is run during development.
@@ -117,16 +100,36 @@
 
   <ItemGroup>
     <!--
-      The vendored dashboard, copied beside the executable and served from
+      The two vendored bundles, copied beside the executable and served from
       there over the local origin.
 
       Linked from the Kotlin project's own resources rather than duplicated:
-      it is built by the dashboard's own toolchain (printlypartner-web), and a
-      second copy in this tree would be one more thing to forget to rebuild.
-      The same bundle the Kotlin app serves is the bundle this one serves.
+      they are built by the dashboard's own toolchain, and a second copy in this
+      tree would be one more thing to forget to rebuild. The same bundle the
+      Kotlin app serves is the bundle this one serves.
     -->
-    <Content Include="..\..\..\src\main\resources\dashboard\**\*">
-      <Link>webcontent\dashboard\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    <!--
+      The two web bundles the app serves, vendored into this repository.
+
+      They are checked in, and that is the point. The whole interface is these
+      bundles rendered in the WebView2 control, and they used to be linked from
+      outside the tree - the dashboard from PrintlyPartnerWeb's Vite output, the
+      agent-setup page from a Kotlin project's resources. Both of those are
+      correct only on a machine that happens to have those repositories sitting
+      beside this one, and a glob that matches nothing does not fail: MSBuild
+      resolves an empty Content list and the build succeeds having copied no UI
+      at all. Clone this repository on its own and you got an application whose
+      window had nothing to load, with a green build and no error to explain it.
+
+      So the bundles live here now, and a clone is enough to build and run.
+
+      To take a new dashboard build, copy PrintlyPartnerWeb/dist over
+      webcontent/dashboard and commit the result - the same act as any other
+      vendored dependency, and visible in the diff rather than dependent on what
+      is next to the checkout. Drop the superseded assets/index-*.js and .css
+      while doing it; only what index.html names is served.
+    -->
+    <Content Include="webcontent\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>

@@ -20,6 +20,23 @@ public sealed record JobRow(
     bool Priority = false);
 
 /// <summary>
+/// One file this machine is holding on disk for an order whose student has not
+/// arrived yet.
+///
+/// Carries only what is needed to find the file again. Who it belongs to, how
+/// many pages it is and what it costs all come from the shop's own order list,
+/// which is fetched fresh and is the only place any of that is true.
+/// </summary>
+public sealed record HeldFileRow(
+    string OrderId,
+    string ItemId,
+    string? ShopId,
+    string? FileName,
+    string LocalPath,
+    long Bytes,
+    string ReceivedAt);
+
+/// <summary>
 /// Local SQLite state - the agent's source of truth for "have I already handled
 /// this job". Port of db/Database.kt.
 ///
@@ -98,6 +115,35 @@ public sealed class Database : IDisposable
             )
             """);
 
+        // The files of an order that is waiting for its student to walk in, and
+        // where each one is on this disk.
+        //
+        // Files only. The customer's name, mobile, page count and what they owe
+        // are deliberately NOT copied here - the shop order list already carries
+        // all of it, is refetched constantly, and is the one place it is true. A
+        // copy on a counter PC is a copy that goes stale and then gets read out
+        // to somebody.
+        //
+        // Keyed on (order_id, item_id) so re-fetching an order it already holds
+        // replaces rather than duplicates, which is what makes the prefetch safe
+        // to run again after a restart.
+        Execute("""
+            CREATE TABLE IF NOT EXISTS held_files (
+                order_id    TEXT NOT NULL,
+                item_id     TEXT NOT NULL,
+                shop_id     TEXT,
+                file_name   TEXT,
+                local_path  TEXT NOT NULL,
+                bytes       INTEGER NOT NULL DEFAULT 0,
+                received_at TEXT NOT NULL,
+                PRIMARY KEY (order_id, item_id)
+            )
+            """);
+
+        // The Files screen lists one shop's waiting orders, newest first, on
+        // every open and every agent push.
+        Execute("CREATE INDEX IF NOT EXISTS ix_held_files_shop ON held_files(shop_id, received_at)");
+
         // One machine can serve different shops over its life: a shop signs in
         // with its own credentials and the agent re-pairs to them. The jobs
         // already here belong to whoever had the machine before, and are
@@ -116,6 +162,15 @@ public sealed class Database : IDisposable
         // after the first.
         try { Execute("ALTER TABLE print_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"); }
         catch (SqliteException) { /* column already there */ }
+
+        // The two shapes every hot query uses. Without them each one is a full
+        // scan of a table that only ever grows: the priority rotation and the
+        // counter-scan sweep between them run thousands of times a day, for the
+        // life of the install, on a counter PC's disk.
+        Execute(
+            "CREATE INDEX IF NOT EXISTS ix_jobs_candidates " +
+            "ON print_jobs(shop_id, priority, state, received_at)");
+        Execute("CREATE INDEX IF NOT EXISTS ix_jobs_shop_state ON print_jobs(shop_id, state)");
     }
 
     private void Execute(string sql)
@@ -162,6 +217,135 @@ public sealed class Database : IDisposable
             command.Parameters.AddWithValue("$value", value);
             command.ExecuteNonQuery();
         }
+    }
+
+    // --- held_files ----------------------------------------------------------
+
+    /// <summary>
+    /// Records a file this machine now holds for a waiting order.
+    ///
+    /// Upsert rather than insert: the prefetch runs again after a restart, and
+    /// re-fetching an order already on disk must replace the row rather than
+    /// fail or duplicate it.
+    /// </summary>
+    public void UpsertHeldFile(
+        string orderId,
+        string itemId,
+        string? shopId,
+        string? fileName,
+        string localPath,
+        long bytes)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText =
+                "INSERT INTO held_files (order_id, item_id, shop_id, file_name, local_path, bytes, received_at) " +
+                "VALUES ($orderId, $itemId, $shopId, $fileName, $localPath, $bytes, $now) " +
+                "ON CONFLICT(order_id, item_id) DO UPDATE SET " +
+                "shop_id = excluded.shop_id, file_name = excluded.file_name, " +
+                "local_path = excluded.local_path, bytes = excluded.bytes";
+            command.Parameters.AddWithValue("$orderId", orderId);
+            command.Parameters.AddWithValue("$itemId", itemId);
+            command.Parameters.AddWithValue("$shopId", (object?)shopId ?? DBNull.Value);
+            command.Parameters.AddWithValue("$fileName", (object?)fileName ?? DBNull.Value);
+            command.Parameters.AddWithValue("$localPath", localPath);
+            command.Parameters.AddWithValue("$bytes", bytes);
+            command.Parameters.AddWithValue("$now", NowIso());
+            command.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Every file this machine is holding for one shop, oldest first.</summary>
+    public List<HeldFileRow> HeldFiles(string shopId) =>
+        QueryHeldFiles(
+            "SELECT * FROM held_files WHERE shop_id = $shopId ORDER BY received_at, order_id, item_id",
+            command => command.Parameters.AddWithValue("$shopId", shopId));
+
+    /// <summary>The files held for one order, in the order they were fetched.</summary>
+    public List<HeldFileRow> HeldFilesForOrder(string orderId) =>
+        QueryHeldFiles(
+            "SELECT * FROM held_files WHERE order_id = $orderId ORDER BY received_at, item_id",
+            command => command.Parameters.AddWithValue("$orderId", orderId));
+
+    /// <summary>Whether anything is already held for this order.</summary>
+    public bool HasHeldFiles(string orderId)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "SELECT 1 FROM held_files WHERE order_id = $orderId LIMIT 1";
+            command.Parameters.AddWithValue("$orderId", orderId);
+            return command.ExecuteScalar() is not null;
+        }
+    }
+
+    /// <summary>
+    /// Forgets the files of one order. The rows only; deleting what is on disk
+    /// is the caller's, because it is the caller that knows whether the paper
+    /// actually came out.
+    /// </summary>
+    public void DeleteHeldFiles(string orderId)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "DELETE FROM held_files WHERE order_id = $orderId";
+            command.Parameters.AddWithValue("$orderId", orderId);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Orders held since before <paramref name="beforeIso"/> - the ones whose
+    /// student never came.
+    ///
+    /// Distinct order ids rather than rows: the sweep deletes a whole order's
+    /// folder at a time, and half of one is worse than none of it.
+    /// </summary>
+    public List<string> HeldOrdersOlderThan(string beforeIso)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText =
+                "SELECT order_id FROM held_files GROUP BY order_id HAVING MAX(received_at) < $before";
+            command.Parameters.AddWithValue("$before", beforeIso);
+            using var reader = command.ExecuteReader();
+            var ids = new List<string>();
+            while (reader.Read()) ids.Add(reader.GetString(0));
+            return ids;
+        }
+    }
+
+    private List<HeldFileRow> QueryHeldFiles(string sql, Action<SqliteCommand> bind)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = sql;
+            bind(command);
+            using var reader = command.ExecuteReader();
+            var rows = new List<HeldFileRow>();
+            while (reader.Read())
+            {
+                rows.Add(new HeldFileRow(
+                    OrderId: reader.GetString(reader.GetOrdinal("order_id")),
+                    ItemId: reader.GetString(reader.GetOrdinal("item_id")),
+                    ShopId: ReadNullableString(reader, "shop_id"),
+                    FileName: ReadNullableString(reader, "file_name"),
+                    LocalPath: reader.GetString(reader.GetOrdinal("local_path")),
+                    Bytes: reader.GetInt64(reader.GetOrdinal("bytes")),
+                    ReceivedAt: reader.GetString(reader.GetOrdinal("received_at"))));
+            }
+            return rows;
+        }
+    }
+
+    private static string? ReadNullableString(SqliteDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
     }
 
     // --- print_jobs ----------------------------------------------------------
@@ -303,19 +487,20 @@ public sealed class Database : IDisposable
     /// <see cref="DueScheduledJobs"/>' job, and running it now would print it
     /// early.
     ///
-    /// HELD is excluded, and of everything this query leaves out it is the one
-    /// that would do the most damage. A held job has claimed and downloaded and
-    /// not printed, which is precisely the shape this sweep is looking for -
-    /// DOWNLOADED, interrupted, safe to replay - and it is not safe to replay,
-    /// because nothing interrupted it. It is waiting on a student who has not
-    /// arrived. Replaying one prints somebody's coursework into an empty shop
-    /// hours early, and the shop has no way to un-print it. The list of states
-    /// here is an allow-list precisely so that a new state has to be added
-    /// deliberately to become resumable; HELD is named in this comment rather
-    /// than added to the SQL because the safe thing is already what happens,
-    /// and the next person to widen this list needs to know why.
-    /// <see cref="HeldJobs"/> is the query that does look at them, and it
-    /// releases them by asking the backend rather than by assuming.
+    /// Excludes anything waiting for a counter scan, for the same reason and
+    /// more sharply. Such a row is RECEIVED with no scheduled time and no
+    /// priority, which is exactly what an interrupted job looked like before
+    /// scan-at-counter existed - so without the priority test below, every
+    /// restart swept up every order whose student was still walking to the shop
+    /// and printed the lot. That is the whole feature undone by a sweep meant
+    /// for something else, and it is worse than the behaviour it replaced,
+    /// because the orders come out in a batch nobody is standing there for.
+    ///
+    /// Past RECEIVED the question does not arise: a job only leaves RECEIVED by
+    /// being taken off the print queue, and under scan-at-counter nothing
+    /// reaches the queue without a scan. Those states stay resumable whatever
+    /// their priority flag says, so a job left mid-download by an agent built
+    /// before this rule is still picked up.
     ///
     /// Scoped to one shop because a machine can serve several over its life -
     /// each shop signs in with its own credentials and the agent re-pairs. A job
@@ -325,7 +510,8 @@ public sealed class Database : IDisposable
     public List<JobRow> ResumableJobs(string shopId) =>
         Query(
             "SELECT * FROM print_jobs WHERE state IN ('RECEIVED', 'VALIDATING', 'DOWNLOADING', 'DOWNLOADED') " +
-            "AND scheduled_print_at IS NULL AND shop_id = $shopId",
+            "AND scheduled_print_at IS NULL AND shop_id = $shopId " +
+            "AND NOT (state = 'RECEIVED' AND priority = 0)",
             command => command.Parameters.AddWithValue("$shopId", shopId));
 
     /// <summary>
@@ -344,32 +530,17 @@ public sealed class Database : IDisposable
     /// agent that had long since restarted and was never going to mention it
     /// again.
     /// </summary>
-    public List<JobRow> JobsStrandedAtThePrinter(string shopId) =>
+    public List<JobRow> JobsStrandedAtThePrinter(string shopId, string beforeIso) =>
         Query(
-            "SELECT * FROM print_jobs WHERE state IN ('SUBMITTING', 'SUBMITTED', 'PRINTING') AND shop_id = $shopId",
-            command => command.Parameters.AddWithValue("$shopId", shopId));
-
-    /// <summary>
-    /// Jobs whose documents are on disk waiting for their student to walk in.
-    ///
-    /// <para>
-    /// Oldest first so a shop that accepted a morning's worth of orders
-    /// releases them in the order it took them, and so the rotation is stable
-    /// across passes - the same reason <see cref="PriorityCandidates"/> orders
-    /// the same way.
-    /// </para>
-    ///
-    /// <para>
-    /// Scoped to one shop for the same reason as <see cref="ResumableJobs"/>: a
-    /// machine serves different shops over its life, and a previous shop's held
-    /// order is not this one's to print. The credential this agent now holds
-    /// could not even ask the backend about it.
-    /// </para>
-    /// </summary>
-    public List<JobRow> HeldJobs(string shopId) =>
-        Query(
-            "SELECT * FROM print_jobs WHERE state = 'HELD' AND shop_id = $shopId ORDER BY received_at, job_id",
-            command => command.Parameters.AddWithValue("$shopId", shopId));
+            "SELECT * FROM print_jobs WHERE state IN ('SUBMITTING', 'SUBMITTED', 'PRINTING') " +
+            "AND shop_id = $shopId AND updated_at < $before",
+            command =>
+            {
+                command.Parameters.AddWithValue("$shopId", shopId);
+                // Ordinal string comparison on round-trip ISO instants, which
+                // sort correctly as text - the same rule DueScheduledJobs uses.
+                command.Parameters.AddWithValue("$before", beforeIso);
+            });
 
     /// <summary>RECEIVED jobs held back for a future print time whose time has now arrived.</summary>
     public List<JobRow> DueScheduledJobs(string nowIso, string shopId) =>
@@ -381,6 +552,27 @@ public sealed class Database : IDisposable
                 command.Parameters.AddWithValue("$now", nowIso);
                 command.Parameters.AddWithValue("$shopId", shopId);
             });
+
+    /// <summary>
+    /// Every order this shop is holding for a counter scan. Not paged.
+    ///
+    /// Deliberately different from <see cref="PriorityCandidates"/>, which is
+    /// paged because each row it returns costs a request to the backend. This
+    /// one costs nothing per row: the caller has already learned which orders
+    /// were scanned from a single list call, and is only matching that answer
+    /// against local rows.
+    ///
+    /// Paging it would be actively wrong, and was. The sweep used
+    /// PriorityCandidates with a 200-row window, and that query is ordered
+    /// oldest-first - so once a shop had accumulated 200 orders nobody ever
+    /// collected, those permanently filled the window and a student scanning
+    /// today fell outside it. The fast path would have gone quietly blind on
+    /// exactly the shops that had been running longest.
+    /// </summary>
+    public List<JobRow> HeldForCounterScan(string shopId) =>
+        Query(
+            "SELECT * FROM print_jobs WHERE state = 'RECEIVED' AND priority = 0 AND shop_id = $shopId",
+            command => command.Parameters.AddWithValue("$shopId", shopId));
 
     /// <summary>
     /// Open jobs that have not been granted in-shop priority - the only ones a

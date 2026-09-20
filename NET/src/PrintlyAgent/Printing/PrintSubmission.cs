@@ -61,6 +61,16 @@ public sealed class PrintSubmissionStalled : Exception
 public static class PrintSubmission
 {
     /// <summary>
+    /// The most copies of one document this will ever send to a printer.
+    ///
+    /// A ceiling rather than a validation rule: the number arrives from the
+    /// server and is cast to a short on its way into DEVMODE, so something has
+    /// to bound it before the cast does it silently and wrongly. 999 is far
+    /// past any real counter order.
+    /// </summary>
+    private const int MaxCopies = 999;
+
+    /// <summary>
     /// How long a job may make no progress at all before it is treated as stuck.
     ///
     /// Not a total time limit: a 3,000-page document legitimately takes a long
@@ -112,7 +122,13 @@ public static class PrintSubmission
             using var document = new PrintDocument();
             document.DocumentName = jobNameToken;
             document.PrinterSettings.PrinterName = printerName;
-            document.PrinterSettings.Copies = (short)Math.Max(1, options.Copies);
+            // Clamped, not just floored. Copies arrives from the server DTO and
+            // is never bounded anywhere on the way here, and the cast is to a
+            // *short*: 65536 truncates to 0 and 32768 to -32768, either of
+            // which goes into DEVMODE's dmCopies and makes the paper disagree
+            // with what the customer paid for - in one direction or, on a
+            // driver that reads it unsigned, spectacularly in the other.
+            document.PrinterSettings.Copies = (short)Math.Clamp(options.Copies, 1, MaxCopies);
             document.PrinterSettings.Collate = true;
 
             // Asked of the driver explicitly rather than assumed. A driver that

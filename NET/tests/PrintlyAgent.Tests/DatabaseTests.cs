@@ -75,6 +75,52 @@ public class DatabaseTests : IDisposable
         Assert.DoesNotContain("job-submitting", resumable);
     }
 
+    /// <summary>
+    /// The restart that would have undone scan-at-counter entirely.
+    ///
+    /// An order waiting for its student to walk in is RECEIVED, unscheduled and
+    /// unscanned - byte for byte what an interrupted job looked like before the
+    /// scan existed. So the resume sweep claimed them, and every agent restart
+    /// printed the lot in a batch with nobody at the counter: the exact waste
+    /// the feature is there to stop, made worse by arriving all at once.
+    /// </summary>
+    [Fact(DisplayName = "orders waiting for a counter scan are not resumed on restart")]
+    public void OrdersWaitingForACounterScanAreNotResumed()
+    {
+        using var db = NewDatabase();
+
+        // Two students who have paid and are still walking over.
+        db.InsertJobReference("job-awaiting-1", "order-1", "HH-000001", shopId: ShopA);
+        db.InsertJobReference("job-awaiting-2", "order-2", "HH-000002", shopId: ShopA);
+
+        // One who scanned, and whose job the restart caught before it started.
+        db.InsertJobReference("job-scanned", "order-3", "HH-000003", shopId: ShopA);
+        db.MarkPriority("job-scanned");
+
+        var resumable = db.ResumableJobs(ShopA).Select(r => r.JobId).ToList();
+
+        Assert.Equal(new[] { "job-scanned" }, resumable);
+    }
+
+    /// <summary>
+    /// The other half, so the exclusion cannot be widened into stranding real
+    /// work. Past RECEIVED a job has already been taken off the print queue,
+    /// which under scan-at-counter means it was scanned - but a row left
+    /// mid-download by an agent built before any of this carries no priority
+    /// flag, and must still be picked up rather than stuck for ever.
+    /// </summary>
+    [Fact(DisplayName = "a job interrupted mid-download is resumed whatever its priority flag says")]
+    public void AJobInterruptedMidDownloadIsResumedRegardlessOfPriority()
+    {
+        using var db = NewDatabase();
+        db.InsertJobReference("job-downloading", "order-1", "HH-000001", shopId: ShopA);
+        db.UpdateJobState("job-downloading", "VALIDATING");
+        db.UpdateJobState("job-downloading", "DOWNLOADING");
+
+        Assert.False(db.GetJob("job-downloading")!.Priority);
+        Assert.Contains("job-downloading", db.ResumableJobs(ShopA).Select(r => r.JobId));
+    }
+
     [Fact(DisplayName = "unresolvedJobs excludes terminal states")]
     public void UnresolvedJobsExcludesTerminalStates()
     {
@@ -138,6 +184,12 @@ public class DatabaseTests : IDisposable
         using var db = NewDatabase();
         db.InsertJobReference("job-a", "order-a", "AAA-1", shopId: ShopA);
         db.InsertJobReference("job-b", "order-b", "BBB-1", shopId: ShopB);
+        // Scanned, so both are genuinely resumable and the assertion below is
+        // about whose job it is rather than about whether it may run at all -
+        // an unscanned job is excluded from the sweep for its own reasons, and
+        // testing shop scoping through one would pass no matter what.
+        db.MarkPriority("job-a");
+        db.MarkPriority("job-b");
 
         Assert.Equal(new[] { "job-a" }, db.ResumableJobs(ShopA).Select(r => r.JobId));
         Assert.Equal(new[] { "job-b" }, db.ResumableJobs(ShopB).Select(r => r.JobId));

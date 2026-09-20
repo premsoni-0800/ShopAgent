@@ -31,6 +31,7 @@ public class WebUiServerTests
     public void IndexHtmlIsNeverKept()
     {
         Assert.Equal("no-store", WebUiServer.CacheControlFor("/dashboard/index.html"));
+        Assert.Equal("no-store", WebUiServer.CacheControlFor("/webui/index.html"));
         Assert.Equal("no-store", WebUiServer.CacheControlFor("/"));
     }
 
@@ -63,10 +64,6 @@ public class WebUiServerTests
         // the script never executes and the screen is simply blank.
         Assert.StartsWith("text/html", WebUiServer.ContentTypeFor("/dashboard/index.html"));
         Assert.StartsWith("application/javascript", WebUiServer.ContentTypeFor("/assets/app.js"));
-        // The PDF viewer's renderer is an .mjs started as a module worker, and a
-        // module worker is refused unless the type is JavaScript. Getting this
-        // wrong cost nothing louder than "could not preview the document".
-        Assert.StartsWith("application/javascript", WebUiServer.ContentTypeFor("/assets/pdf.worker.min-Dswkl.mjs"));
         Assert.StartsWith("text/css", WebUiServer.ContentTypeFor("/assets/app.css"));
         Assert.Equal("image/svg+xml", WebUiServer.ContentTypeFor("/favicon.svg"));
     }

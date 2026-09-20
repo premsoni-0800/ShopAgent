@@ -1,15 +1,17 @@
-using System.Globalization;
-
 namespace PrintlyAgent.Core;
 
 /// <summary>What the backend could tell the agent about an order's slot.</summary>
 public abstract record ScheduleLookup
 {
     /// <summary>
-    /// The server answered. <see cref="Known.ReleaseAt"/> is when this shop is
-    /// meant to receive the order - null on a Print Now order - and
-    /// <see cref="Known.Priority"/> is true when the student has scanned the
-    /// shop's QR at the counter and the backend has agreed to serve them next.
+    /// The server answered. <see cref="Known.Priority"/> is the one that decides
+    /// anything: true when the student has scanned the shop's QR at the counter
+    /// and the backend has agreed to serve them next. Nothing prints without it.
+    ///
+    /// <see cref="Known.ReleaseAt"/> is when this shop was due to receive the
+    /// order, from the days of scheduled printing. Still read off the response,
+    /// still worth having in a log, no longer consulted by
+    /// <see cref="Scheduling.PlanFor"/>.
     ///
     /// <see cref="Known.OrderCode"/> is the shop-facing order number -
     /// PPP01-000079, the thing on the customer's receipt - read off the same
@@ -56,6 +58,26 @@ public abstract record SchedulePlan
     {
         public static readonly Hold Instance = new();
     }
+
+    /// <summary>
+    /// Record the job, and print nothing until the student scans at the counter.
+    ///
+    /// Distinct from <see cref="Hold"/> in the one way that matters: this one
+    /// <em>is</em> written down. Holding without recording is for a question the
+    /// agent could not get an answer to, and it works because the reconciliation
+    /// poll re-asks within ten seconds. Waiting for a scan is not a question at
+    /// all - the answer is known and it is "not yet" - and it can last an hour
+    /// while the student walks over. Re-asking the backend about it every ten
+    /// seconds for that whole time, per order, is exactly the flood
+    /// PriorityCandidates exists to avoid.
+    ///
+    /// So the row goes in as RECEIVED with priority 0, which is the state the
+    /// rotating recheck already looks for, and the scan is noticed there.
+    /// </summary>
+    public sealed record AwaitCounterScan : SchedulePlan
+    {
+        public static readonly AwaitCounterScan Instance = new();
+    }
 }
 
 public static class Scheduling
@@ -63,54 +85,49 @@ public static class Scheduling
     /// <summary>
     /// Turns what the lookup found into what the agent should do.
     ///
-    /// Printing early and never printing at all are both real harms, so they are
-    /// weighed rather than one being picked outright. A failure that might clear
-    /// holds the job: the reconciliation poll re-lists it within ten seconds,
-    /// and a scheduled order is by definition one with time to spare. A failure
-    /// that will not clear prints it now, because the alternative there is an
-    /// order that never comes out at all.
+    /// One rule now: nothing prints until the student scans the shop's QR at the
+    /// counter. Printly is a scan-at-counter service - the student uploads, pays,
+    /// walks in, and scans - so a paid order arriving here is not a job to do, it
+    /// is a job to be ready for. The scan is the whole trigger.
     ///
-    /// There is deliberately no lead time here. The backend already subtracted
-    /// its own from the student's chosen time and sent the answer as
-    /// `shopReleaseAt`, so the agent takes that whole rather than keeping a
-    /// number of its own. A copy would be a fourth: the backend has
-    /// printly.scheduled-print.release-lead, the student app has
-    /// SHOP_RELEASE_LEAD, and the dashboard has PRINT_LEAD_MINUTES. That shape
-    /// has already failed once - the student app sat at twenty minutes while the
-    /// server released at five, so a student asking for 7:00 was told 6:40 and
-    /// the shop got it at 6:55. An agent that derives nothing cannot drift.
+    /// This reverses what used to be here, and the reversal is the point. An
+    /// order with no release time used to mean "print it the moment it is
+    /// claimed", so a student who ordered from their room had a printout sitting
+    /// on the counter minutes later - going cold, paid for by the shop in paper
+    /// and toner, and possibly never collected at all. That is the exact waste
+    /// the shop owner is being shown a fix for.
     ///
-    /// A release time already upon us is not a schedule, it is a job to print
-    /// now - which is also what an unscheduled order, or one with an unreadable
-    /// time, deserves.
+    /// <para>
+    /// The release time is no longer consulted. It answered a question nobody
+    /// asks any more ("when is this shop due to receive it?"), and a scanned
+    /// student is at the counter <em>now</em> whatever a slot once said. The
+    /// backend still sends it and <see cref="ScheduleLookup.Known.ReleaseAt"/>
+    /// still carries it, because rows written by an older agent before an
+    /// upgrade are drained by the scheduled path on the way through - but no new
+    /// decision is made from it.
+    /// </para>
     /// </summary>
-    public static SchedulePlan PlanFor(ScheduleLookup lookup, DateTimeOffset now) => lookup switch
+    public static SchedulePlan PlanFor(ScheduleLookup lookup) => lookup switch
     {
+        // Might clear. Record nothing and let the reconciliation poll ask again -
+        // an agent that cannot reach its backend has not learned that a student
+        // has not scanned, it has learned nothing.
         ScheduleLookup.Unavailable => SchedulePlan.Hold.Instance,
-        ScheduleLookup.Refused => new SchedulePlan.PrintAt(null),
-        ScheduleLookup.Known known => PlanForKnown(known, now),
-        _ => new SchedulePlan.PrintAt(null),
+
+        // Will not clear - the order is gone, or the owner is signed out. This
+        // used to print, on the reasoning that never printing at all is a real
+        // harm too. Under scan-at-counter it is not: printing here puts paper in
+        // a tray for a student the agent cannot confirm ever asked for it, and
+        // the job is visible in the shop's own queue either way. Waiting wastes
+        // nothing and can be resolved by the student simply scanning.
+        ScheduleLookup.Refused => SchedulePlan.AwaitCounterScan.Instance,
+
+        // The student is standing at the counter. This is the only thing that
+        // starts a printer.
+        ScheduleLookup.Known { Priority: true } => new SchedulePlan.PrintAt(null),
+
+        ScheduleLookup.Known => SchedulePlan.AwaitCounterScan.Instance,
+
+        _ => SchedulePlan.AwaitCounterScan.Instance,
     };
-
-    private static SchedulePlan PlanForKnown(ScheduleLookup.Known known, DateTimeOffset now)
-    {
-        if (known.ReleaseAt is null) return new SchedulePlan.PrintAt(null);
-
-        // Round-trip parsing only. An unreadable instant is treated exactly as
-        // "not scheduled" rather than as a failure, because the alternative -
-        // holding the job - would strand an order on a typo the shop cannot see
-        // or fix.
-        if (!DateTimeOffset.TryParse(
-                known.ReleaseAt,
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.RoundtripKind | DateTimeStyles.AdjustToUniversal,
-                out var releaseAt))
-        {
-            return new SchedulePlan.PrintAt(null);
-        }
-
-        return releaseAt > now
-            ? new SchedulePlan.PrintAt(releaseAt.UtcDateTime.ToString("O", CultureInfo.InvariantCulture))
-            : new SchedulePlan.PrintAt(null);
-    }
 }

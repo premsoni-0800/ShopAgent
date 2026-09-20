@@ -133,6 +133,7 @@ public static class SpoolerOutcomePoller
     private const int JOB_STATUS_OFFLINE = 0x00000020;
     private const int JOB_STATUS_PAPEROUT = 0x00000040;
     private const int JOB_STATUS_PRINTED = 0x00000080;
+    private const int JOB_STATUS_DELETING = 0x00000004;
     private const int JOB_STATUS_DELETED = 0x00000100;
     private const int JOB_STATUS_BLOCKED_DEVQ = 0x00000200;
     private const int JOB_STATUS_USER_INTERVENTION = 0x00000400;
@@ -142,8 +143,16 @@ public static class SpoolerOutcomePoller
     /// The only bits that end a job badly and for good: the driver reporting an
     /// outright error, and somebody cancelling it out of the queue. Everything
     /// else that looks like trouble is <see cref="Recoverable"/>.
+    ///
+    /// DELETING counts as well as DELETED, and leaving it out was a real hole
+    /// rather than a fine distinction. A job cancelled by hand from the Windows
+    /// queue shows DELETING and is then removed, often without a two-second
+    /// poll ever catching DELETED - so the last status seen carried no failure
+    /// bit, the job was simply gone next tick, and the branch below read that
+    /// absence as "printed and removed". Shop staff clearing a jammed job were
+    /// telling the student it had printed.
     /// </summary>
-    private const int FailureBits = JOB_STATUS_ERROR | JOB_STATUS_DELETED;
+    private const int FailureBits = JOB_STATUS_ERROR | JOB_STATUS_DELETED | JOB_STATUS_DELETING;
 
     private const int SuccessBits = JOB_STATUS_PRINTED | JOB_STATUS_COMPLETE;
 
@@ -383,6 +392,38 @@ public static class SpoolerOutcomePoller
     /// <c>SpoolerOutcomePoller.jobProgress(printerName, jobNameToken)</c>.
     /// </para>
     /// </summary>
+    private const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+    /// <summary>
+    /// Bytes needed for the job buffer, or null when the spooler could not be
+    /// read at all.
+    ///
+    /// The distinction is the whole point, and both callers used to lose it.
+    /// They discarded the probe's return value and treated pcbNeeded == 0 as
+    /// "no jobs in the queue" - but EnumJobs leaves pcbNeeded at 0 on *any*
+    /// failure that is not ERROR_INSUFFICIENT_BUFFER. An access-denied, an
+    /// invalid handle, or an RPC fault against a network print server all read
+    /// as an empty queue, and an empty queue is how this file decides a job
+    /// finished printing. A remote spooler restarting mid-job was therefore
+    /// reported as PRINT_COMPLETED, and the student was sent to collect pages
+    /// that had never come out.
+    ///
+    /// Null means "no answer", which every caller already knows how to carry.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static int? JobBufferSize(IntPtr printerHandle)
+    {
+        var ok = EnumJobsW(printerHandle, 0, 999, 1, IntPtr.Zero, 0, out var needed, out _);
+        // Read immediately: any interop in between would overwrite it.
+        var error = Marshal.GetLastWin32Error();
+
+        // Succeeded outright - a genuine answer, and 0 genuinely means empty.
+        if (ok) return needed;
+        // The expected "your buffer is too small, here is the size" reply.
+        if (error == ERROR_INSUFFICIENT_BUFFER) return needed;
+        return null;
+    }
+
     [SupportedOSPlatform("windows")]
     public static JobProgress? GetJobProgress(string printerName, string jobNameToken, ILogger? log = null)
     {
@@ -391,9 +432,13 @@ public static class SpoolerOutcomePoller
         {
             // Probe for the buffer size first; this call is expected to fail with
             // ERROR_INSUFFICIENT_BUFFER, and only pcbNeeded is meaningful.
-            _ = EnumJobsW(printerHandle, 0, 999, 1, IntPtr.Zero, 0, out var needed, out _);
-            if (needed <= 0) return new JobProgress(false, 0);
+            var size = JobBufferSize(printerHandle);
+            // Unreadable, not empty. Null is what StallDetector reads as "no
+            // evidence either way", which is the honest answer here.
+            if (size is null) return null;
+            if (size == 0) return new JobProgress(false, 0);
 
+            var needed = size.Value;
             var buffer = Marshal.AllocHGlobal(needed);
             try
             {
@@ -437,9 +482,12 @@ public static class SpoolerOutcomePoller
         }
         try
         {
-            _ = EnumJobsW(printerHandle, 0, 999, 1, IntPtr.Zero, 0, out var needed, out _);
-            if (needed <= 0) return new JobStatus(0, false); // no jobs at all in the queue
+            var size = JobBufferSize(printerHandle);
+            // Unreadable. Emphatically not "the job is gone, so it printed".
+            if (size is null) return new JobStatus(null, false);
+            if (size == 0) return new JobStatus(0, false); // no jobs at all in the queue
 
+            var needed = size.Value;
             var buffer = Marshal.AllocHGlobal(needed);
             try
             {

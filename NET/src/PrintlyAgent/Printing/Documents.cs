@@ -78,230 +78,50 @@ public static class Documents
         string url,
         string tempDir,
         long timeoutSeconds,
-        CancellationToken ct = default,
-        string? key = null)
+        CancellationToken ct = default)
     {
+        Directory.CreateDirectory(tempDir);
         // Prefixed with this process's id so SweepOrphanedDocuments can tell a
         // file another running agent is still printing from one abandoned by an
         // agent that died.
-        //
-        // The directory is not created here: DownloadDocumentToAsync ensures the
-        // parent of whatever path it is given, and doing it twice per document
-        // is a second synchronous filesystem call on a path that runs once per
-        // item of every order, concurrently.
-        //
-        // <paramref name="key"/> is what makes a retry resume instead of
-        // starting again. A name invented per call meant the second attempt at
-        // a 40MB document shared nothing with the first: a new name, a new part
-        // file, and the same bytes pulled over the same bad connection from
-        // zero. Given the item id, all three attempts are the same file and each
-        // carries on from where the last stopped.
         var pid = Environment.ProcessId;
-        var name = key is null ? Guid.NewGuid().ToString("N") : SanitiseId(key);
-        var destination = Path.Combine(tempDir, $"{pid}-{name}.pdf");
-        return await DownloadDocumentToAsync(http, url, destination, timeoutSeconds, ct).ConfigureAwait(false);
-    }
+        var destination = Path.Combine(tempDir, $"{pid}-{Guid.NewGuid():N}.pdf");
 
-    /// <summary>
-    /// The same download, to a caller-chosen path.
-    ///
-    /// <para>
-    /// Split out for the held-document store, whose filenames have to be worked
-    /// out rather than invented: the process that eventually prints a held order
-    /// is very often not the one that fetched it, so there is nobody left to
-    /// remember a random name. Kept as the one implementation both paths call
-    /// rather than a second copy, because "downloads a customer's document" is
-    /// not a thing worth having two of.
-    /// </para>
-    /// </summary>
-    public static async Task<string> DownloadDocumentToAsync(
-        HttpClient http,
-        string url,
-        string destination,
-        long timeoutSeconds,
-        CancellationToken ct = default)
-    {
-        var parent = Path.GetDirectoryName(destination);
-        if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
-
-        // Bytes land here first and are moved into place only once the transfer
-        // finishes. Two things fall out of that, and both matter on a shop
-        // counter: a half-written file is never mistaken for a document (the
-        // held store is read by name, by a process that did not write it,
-        // possibly days later), and what survives a dropped connection is a
-        // named, resumable remainder rather than rubbish to be deleted.
-        var part = destination + ".part";
-
-        var have = File.Exists(part) ? new FileInfo(part).Length : 0L;
-        if (have > 0)
-        {
-            var resumed = await TransferAsync(http, url, part, have, resume: true, timeoutSeconds, ct)
-                .ConfigureAwait(false);
-            if (resumed)
-            {
-                File.Move(part, destination, overwrite: true);
-                return destination;
-            }
-
-            // The server would not, or could not, continue where we left off.
-            // Starting again is slower and always correct; carrying on from a
-            // partial the server did not agree to would splice two different
-            // responses into one file.
-            File.Delete(part);
-        }
-
-        await TransferAsync(http, url, part, 0L, resume: false, timeoutSeconds, ct).ConfigureAwait(false);
-        File.Move(part, destination, overwrite: true);
-        return destination;
-    }
-
-    /// <summary>
-    /// One transfer into <paramref name="part"/>, appending when
-    /// <paramref name="resume"/> and the server agreed to it.
-    /// </summary>
-    /// <returns>
-    /// false when a resume was asked for and refused, which is the caller's
-    /// signal to start the file again. Any other failure throws: a download that
-    /// cannot happen at all is the retry loop's business, not this method's.
-    /// </returns>
-    private static async Task<bool> TransferAsync(
-        HttpClient http,
-        string url,
-        string part,
-        long from,
-        bool resume,
-        long timeoutSeconds,
-        CancellationToken ct)
-    {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        // TryAddWithoutValidation rather than Headers.Range, which would need
-        // System.Net.Http.Headers - not one of .NET 8's implicit usings. This is
-        // the same way WebUiServer forwards headers, and the wire format is the
-        // whole of what matters here.
-        if (resume && from > 0) request.Headers.TryAddWithoutValidation("Range", $"bytes={from}-");
-
         using var response = await http
             .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token)
             .ConfigureAwait(false);
 
-        var status = (int)response.StatusCode;
-
-        // 416 means the range is past the end of the object - the partial is as
-        // long as, or longer than, the file the server is offering. That is a
-        // stale or mismatched leftover, never something to append to.
-        if (resume && status == 416) return false;
-
-        // 200 to a Range request means the store ignored it and is sending the
-        // whole object from byte zero. Appending that would double the file.
-        if (resume && status != 206) return false;
-
         if (!response.IsSuccessStatusCode)
         {
             throw new DocumentFetchError(
-                status,
-                $"the document could not be fetched: HTTP {status}");
+                (int)response.StatusCode,
+                $"the document could not be fetched: HTTP {(int)response.StatusCode}");
         }
 
-        var append = resume && status == 206;
-        if (append && !File.Exists(part))
-        {
-            throw new DocumentFetchError(status, "partial download vanished mid-resume");
-        }
-
-        await using (var output = append
-            ? new FileStream(part, FileMode.Append, FileAccess.Write)
-            : new FileStream(part, FileMode.Create, FileAccess.Write))
-        {
-            await response.Content.CopyToAsync(output, deadline.Token).ConfigureAwait(false);
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Where a held order's document lives: one directory per job, one file per
-    /// item, both named after ids the backend already gave us.
-    ///
-    /// <para>
-    /// Deterministic on purpose, and it is the whole reason this is a method
-    /// rather than a name chosen at download time. A held order is fetched in
-    /// the morning and printed after lunch, very often by a different process -
-    /// the shop closes the app, Windows updates, the counter PC is restarted.
-    /// Anything remembered only in memory is gone by then; anything random needs
-    /// an index to find it again, which is one more thing that can disagree with
-    /// the disk. The job id and the item id are both already in the local row
-    /// and in the job detail, so the path can simply be recomputed whenever it
-    /// is wanted.
-    /// </para>
-    /// </summary>
-    public static string HeldDocumentPath(string heldDir, string jobId, string itemId) =>
-        Path.Combine(heldDir, SanitiseId(jobId), SanitiseId(itemId) + ".pdf");
-
-    /// <summary>
-    /// Moves a freshly downloaded document into the held store.
-    ///
-    /// <para>
-    /// A move rather than a copy, so there is never a window in which the same
-    /// customer document exists twice on a shop's disk, and so the temp copy
-    /// cannot be left behind for the orphan sweep to find. Overwrite is on
-    /// because that is what makes re-fetching a missing held file idempotent.
-    /// </para>
-    /// </summary>
-    public static string StoreHeldDocument(string source, string heldDir, string jobId, string itemId)
-    {
-        var destination = HeldDocumentPath(heldDir, jobId, itemId);
-        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-        File.Move(source, destination, overwrite: true);
-        return destination;
-    }
-
-    /// <summary>
-    /// Deletes a job's held directory once its pages have gone to a printer.
-    ///
-    /// <para>
-    /// Best-effort and silent: the documents have printed by the time this runs,
-    /// so a file that cannot be removed is a housekeeping problem, not something
-    /// to fail an order over. A job that was never held has no directory here,
-    /// which is why the normal print path can call this unconditionally.
-    /// </para>
-    /// </summary>
-    public static void DiscardHeldDocuments(string heldDir, string jobId)
-    {
         try
         {
-            var dir = Path.Combine(heldDir, SanitiseId(jobId));
-            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+            await using var output = File.Create(destination);
+            await response.Content.CopyToAsync(output, deadline.Token).ConfigureAwait(false);
         }
         catch
         {
-            // Nothing here is worth interrupting a finished print for.
+            // A half-written customer document, deleted here because nothing
+            // else can. The path is only returned on success, so the caller
+            // never learns this file exists and its own cleanup cannot reach
+            // it - and the orphan sweep deliberately skips files belonging to a
+            // live process, which this one is. Left alone it survives until the
+            // agent restarts, which on a counter PC is weeks.
+            try { File.Delete(destination); } catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            throw;
         }
-    }
 
-    /// <summary>
-    /// Keeps an id to the characters that are safe in a path segment.
-    ///
-    /// <para>
-    /// These ids are server-generated and have never been anything but hex and
-    /// dashes, so in practice this changes nothing - it is here because they are
-    /// used to build a filesystem path, and a path built from a value this
-    /// process did not choose is worth being uninteresting about. A stray
-    /// separator would otherwise write a customer's document somewhere other
-    /// than the held store.
-    /// </para>
-    /// </summary>
-    private static string SanitiseId(string id) =>
-        string.Create(id.Length, id, (span, source) =>
-        {
-            for (var i = 0; i < source.Length; i++)
-            {
-                var c = source[i];
-                span[i] = char.IsLetterOrDigit(c) || c == '-' || c == '_' ? c : '_';
-            }
-        });
+        return destination;
+    }
 
     /// <summary>
     /// Deletes customer documents left behind by an agent that did not shut down.
@@ -322,15 +142,6 @@ public static class Documents
     /// pid has since been recycled onto a live process, is left for the next run
     /// rather than risked.
     /// </para>
-    ///
-    /// <para>
-    /// Reaches only <paramref name="tempDir"/> itself, and not one level down.
-    /// That is what keeps held documents safe without this method needing to
-    /// know they exist: they live under <c>Settings.HeldDir</c>, a sibling
-    /// directory, and for them a dead owning process means the agent was
-    /// restarted between the shop accepting an order and its student arriving -
-    /// which is the ordinary case, not a leak.
-    /// </para>
     /// </summary>
     public static int SweepOrphanedDocuments(string tempDir)
     {
@@ -338,14 +149,7 @@ public static class Documents
         var removed = 0;
         try
         {
-            // Both the finished documents and the half-transferred ones. A
-            // .part is abandoned by exactly the same events - a crash, a kill,
-            // the counter PC losing power - and left out of this it is a
-            // customer's coursework accumulating in a temp directory for ever,
-            // just under a different extension.
-            foreach (var entry in Directory.EnumerateFiles(tempDir, "*.pdf*")
-                         .Where(f => f.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)
-                                  || f.EndsWith(".pdf.part", StringComparison.OrdinalIgnoreCase)))
+            foreach (var entry in Directory.EnumerateFiles(tempDir, "*.pdf"))
             {
                 var fileName = Path.GetFileName(entry);
                 // Kotlin's substringBefore('-') keeps the whole name when there
