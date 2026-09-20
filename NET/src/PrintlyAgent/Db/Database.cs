@@ -658,6 +658,72 @@ public sealed class Database : IDisposable
         }
     }
 
+    /// <summary>
+    /// The printer names currently recorded, in a stable order.
+    ///
+    /// Internal because nothing in the agent reads this table - the shop's view
+    /// comes from the backend and the print path from
+    /// <see cref="Printers.PrinterDiscovery"/>. It exists so the upsert and the
+    /// prune can be held to saying what they claim, which they could not be
+    /// otherwise.
+    /// </summary>
+    internal IReadOnlyList<string> PrinterNames()
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "SELECT windows_printer_name FROM printers ORDER BY windows_printer_name";
+            using var reader = command.ExecuteReader();
+
+            var names = new List<string>();
+            while (reader.Read()) names.Add(reader.GetString(0));
+            return names;
+        }
+    }
+
+    /// <summary>
+    /// Drops the printers this machine no longer has, leaving the table saying
+    /// what is actually plugged in.
+    ///
+    /// <para>
+    /// Nothing removed rows, only added them, so the table was a record of
+    /// every printer the agent had ever seen: a counter that replaced a laser,
+    /// or was used to test against a few, accumulated them all and kept
+    /// reporting the last status each one had before it went away. A row saying
+    /// READY for a printer that was unplugged last March is worse than no row.
+    /// </para>
+    ///
+    /// <para>
+    /// Called with the same list that was just upserted, so the two together
+    /// make the table a snapshot rather than a history. An empty list clears
+    /// it, which is correct: no printers is a real answer.
+    /// </para>
+    /// </summary>
+    public void PruneMissingPrinters(IReadOnlyCollection<string> windowsPrinterNames)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+
+            // Parameterised one name at a time rather than interpolated into
+            // the SQL: a Windows printer name is whatever the driver installed,
+            // apostrophes included, and this table is keyed on it.
+            var placeholders = new List<string>(windowsPrinterNames.Count);
+            var i = 0;
+            foreach (var name in windowsPrinterNames)
+            {
+                var parameter = "$p" + i++;
+                placeholders.Add(parameter);
+                command.Parameters.AddWithValue(parameter, name);
+            }
+
+            command.CommandText = placeholders.Count == 0
+                ? "DELETE FROM printers"
+                : $"DELETE FROM printers WHERE windows_printer_name NOT IN ({string.Join(", ", placeholders)})";
+            command.ExecuteNonQuery();
+        }
+    }
+
     private static JobRow ToJobRow(SqliteDataReader reader) => new(
         JobId: reader.GetString(reader.GetOrdinal("job_id")),
         OrderId: reader.GetString(reader.GetOrdinal("order_id")),

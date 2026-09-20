@@ -157,6 +157,12 @@ public sealed class JsBridge
             ["ok"] = true,
             ["colour"] = routing.Colour,
             ["bw"] = routing.BlackAndWhite,
+            // Whether the agent chose these or the shop did, so the screen can
+            // say "chosen automatically" rather than presenting the agent's own
+            // answer back as though somebody had set it. Additive: a dashboard
+            // bundle that does not read them behaves exactly as before.
+            ["colourAuto"] = routing.ColourAuto,
+            ["bwAuto"] = routing.BlackAndWhiteAuto,
         };
     }
 

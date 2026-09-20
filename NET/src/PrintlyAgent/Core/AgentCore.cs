@@ -681,7 +681,11 @@ public sealed class AgentCore : IAsyncDisposable
     /// <summary>The printers on this PC, as the routing dropdowns need them.</summary>
     public async Task<List<Dictionary<string, object?>>> ListLocalPrintersAsync()
     {
-        var printers = await Task.Run(() => PrinterDiscovery.DiscoverPrinters(_log)).ConfigureAwait(false);
+        // What the routing screen offers. Same filter as the backend sync, so
+        // the shop is never asked to choose between printers the agent has
+        // already decided not to report.
+        var printers = PrinterDiscovery.Reportable(
+            await Task.Run(() => PrinterDiscovery.DiscoverPrinters(_log)).ConfigureAwait(false));
         return printers.Select(p => new Dictionary<string, object?>
         {
             ["windowsPrinterName"] = p.WindowsPrinterName,
@@ -918,7 +922,13 @@ public sealed class AgentCore : IAsyncDisposable
                     // that must not be told what was true two minutes ago. It
                     // also leaves the cache warm for the print path, which is
                     // where the cost would actually be felt.
-                    var printers = PrinterDiscovery.DiscoverPrinters(_log, askDrivers: true);
+                    // Reportable, not the raw list: the backend's copy is what
+                    // the shop picks from, and a counter with a laser has no
+                    // use for the PDF and fax drivers Windows ships with. The
+                    // selector still sees all of them - see
+                    // PrinterDiscovery.Reportable for why the two differ.
+                    var printers = PrinterDiscovery.Reportable(
+                        PrinterDiscovery.DiscoverPrinters(_log, askDrivers: true));
                     var request = new PrinterSyncRequest(printers.Select(p => new AgentPrinter(
                         p.WindowsPrinterName,
                         p.DisplayName,
@@ -939,6 +949,33 @@ public sealed class AgentCore : IAsyncDisposable
                             string.Join(",", p.Sizes.Select(s => s.ToString()).OrderBy(s => s, StringComparer.Ordinal)),
                             p.Status.ToString(),
                             p.IsSystemDefault);
+                    }
+
+                    // And forget the ones that have gone, so the table is what
+                    // this machine has rather than everything it has ever had.
+                    Db.PruneMissingPrinters(printers.Select(p => p.WindowsPrinterName).ToList());
+
+                    // Decide the routing the shop has not decided for itself.
+                    //
+                    // Here rather than at print time because the point of it is
+                    // to be visible: the routing screen should show which
+                    // machine takes colour and which takes black and white
+                    // without anybody having chosen, and should follow the
+                    // hardware when it changes. Running on the sweep means the
+                    // printer-change watch drives this too - plug a colour
+                    // printer in and it is routed to within a couple of
+                    // seconds.
+                    //
+                    // Written only when it actually moved. This runs every 120
+                    // seconds and the answer is nearly always the same one.
+                    var routing = PrinterRoutingStore.Read(Db);
+                    var decided = AutoRouting.Decide(routing, printers);
+                    if (decided != routing)
+                    {
+                        PrinterRoutingStore.Write(Db, decided);
+                        _log.LogInformation(
+                            "printer_routing_auto colour={Colour} bw={Bw}",
+                            decided.Colour ?? "none", decided.BlackAndWhite ?? "none");
                     }
 
                     // Name what is wrong with each device while nothing is
@@ -1015,6 +1052,15 @@ public sealed class AgentCore : IAsyncDisposable
         {
             // A sweep is already pending. That sweep will re-read the whole
             // machine, so this change is already accounted for.
+        }
+        catch (ObjectDisposedException)
+        {
+            // Shutting down. DisposeAsync waits five seconds for the loops
+            // together and then leaves whatever is left to process teardown,
+            // so the watch can still be alive - and still be handed a printer
+            // change - after this has been disposed. There is no sweep left to
+            // wake, and nothing worth logging about an agent that is going away
+            // anyway.
         }
     }
 

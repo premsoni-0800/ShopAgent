@@ -176,4 +176,81 @@ public class PrinterSelectorTests
         Assert.Null(result.Printer);
         Assert.Equal("PRINTER_INCOMPATIBLE", result.Reason);
     }
+
+    /// <summary>
+    /// The split a two-machine shop actually works to, and the reason it bought
+    /// the second machine.
+    /// </summary>
+    [Fact(DisplayName = "black and white work goes to the mono laser, not the colour printer")]
+    public void BlackAndWhiteWorkGoesToTheMonoLaser()
+    {
+        var printers = new[]
+        {
+            // The colour machine, and the Windows default - which is the usual
+            // arrangement, and used to be enough to win it every job.
+            Printer("Canon iR C3025", isDefault: true, colorCapable: true, duplexCapable: true,
+                paperSizes: PaperSize.A4),
+            Printer("HP LaserJet M1005", colorCapable: false, duplexCapable: true, paperSizes: PaperSize.A4),
+        };
+
+        var result = PrinterSelector.SelectPrinter(Item(colorMode: ColorMode.BLACK_AND_WHITE), printers);
+
+        Assert.Equal("HP LaserJet M1005", result.Printer?.WindowsPrinterName);
+    }
+
+    [Fact(DisplayName = "colour work goes to the colour printer even when the mono laser is the default")]
+    public void ColourWorkGoesToTheColourPrinter()
+    {
+        var printers = new[]
+        {
+            Printer("HP LaserJet M1005", isDefault: true, colorCapable: false, duplexCapable: true,
+                paperSizes: PaperSize.A4),
+            Printer("Canon iR C3025", colorCapable: true, duplexCapable: true, paperSizes: PaperSize.A4),
+        };
+
+        var result = PrinterSelector.SelectPrinter(Item(colorMode: ColorMode.COLOR), printers);
+
+        Assert.Equal("Canon iR C3025", result.Printer?.WindowsPrinterName);
+    }
+
+    /// <summary>
+    /// Null is "the driver would not say", and it must not be read as mono just
+    /// because that would save toner - see PrinterDiscovery on why the third
+    /// answer is carried at all.
+    /// </summary>
+    [Fact(DisplayName = "a printer that would not say is not treated as the mono one")]
+    public void APrinterThatWouldNotSayIsNotTreatedAsMono()
+    {
+        var printers = new[]
+        {
+            Printer("Unknown Caps", paperSizes: PaperSize.A4),
+            Printer("HP LaserJet M1005", colorCapable: false, paperSizes: PaperSize.A4),
+        };
+
+        var result = PrinterSelector.SelectPrinter(Item(colorMode: ColorMode.BLACK_AND_WHITE), printers);
+
+        Assert.Equal("HP LaserJet M1005", result.Printer?.WindowsPrinterName);
+    }
+
+    /// <summary>
+    /// The shop's own choice is still a choice. Routing is consulted before the
+    /// scoring, so naming the colour machine for black and white work - to keep
+    /// the laser for a long job, say - is obeyed rather than overruled.
+    /// </summary>
+    [Fact(DisplayName = "an explicit routing choice still beats the automatic colour match")]
+    public void ExplicitRoutingStillBeatsTheAutomaticColourMatch()
+    {
+        var printers = new[]
+        {
+            Printer("Canon iR C3025", colorCapable: true, duplexCapable: true, paperSizes: PaperSize.A4),
+            Printer("HP LaserJet M1005", colorCapable: false, duplexCapable: true, paperSizes: PaperSize.A4),
+        };
+
+        var result = PrinterSelector.SelectPrinter(
+            Item(colorMode: ColorMode.BLACK_AND_WHITE),
+            printers,
+            new PrinterRouting(BlackAndWhite: "Canon iR C3025"));
+
+        Assert.Equal("Canon iR C3025", result.Printer?.WindowsPrinterName);
+    }
 }

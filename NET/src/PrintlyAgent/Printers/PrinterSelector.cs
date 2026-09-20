@@ -44,7 +44,31 @@ public sealed record SelectionResult(LocalPrinter? Printer, string? Reason = nul
 /// renamed, or cannot do the job is passed over rather than obeyed.
 /// </para>
 /// </summary>
-public sealed record PrinterRouting(string? Colour = null, string? BlackAndWhite = null)
+public sealed record PrinterRouting(
+    string? Colour = null,
+    string? BlackAndWhite = null,
+
+    /// <summary>
+    /// Whether this side was decided by the agent rather than chosen by the
+    /// shop.
+    ///
+    /// <para>
+    /// The distinction is the whole reason automatic routing can exist at all.
+    /// An entry the agent filled in is its own to revise when the machine
+    /// changes; an entry a person chose is not, and must survive a printer
+    /// being unplugged, a sweep, and a restart. Without the flag the two are
+    /// indistinguishable the moment they are written, and the agent would
+    /// either overwrite the shop's choice or never be able to correct its own.
+    /// </para>
+    ///
+    /// <para>
+    /// Defaults to false, which is what a routing stored before this existed
+    /// deserialises to - so every setting a shop has already made is read as
+    /// theirs and left alone. The safe direction.
+    /// </para>
+    /// </summary>
+    bool ColourAuto = false,
+    bool BlackAndWhiteAuto = false)
 {
     public static readonly PrinterRouting None = new();
 
@@ -68,11 +92,11 @@ public static class PrinterSelector
         IReadOnlyList<LocalPrinter> printers,
         PrinterRouting? routing = null)
     {
-        // Whether this machine has any real printer at all, judged across every
-        // printer rather than only the usable ones - a shop whose only laser is
-        // offline still has a laser, and the right answer then is "this cannot
-        // be printed now", not "written to a file instead".
-        var hasPhysicalPrinter = printers.Any(p => !PrintToFile.IsPrintToFileDriver(p.WindowsPrinterName));
+        // Whether this machine has any real printer at all. Shared with
+        // PrinterDiscovery.Reportable, which decides on the same question
+        // whether these printers are worth showing the shop - the two must
+        // agree, or the agent would print with a printer it had hidden.
+        var hasPhysicalPrinter = PrinterDiscovery.AnyPhysical(printers);
 
         var candidates = printers
             .Where(p => p.Status != PrinterReportedStatus.OFFLINE && p.Status != PrinterReportedStatus.ERROR)
@@ -132,8 +156,29 @@ public static class PrinterSelector
     private static int Score(PrintJobItem item, LocalPrinter printer)
     {
         var score = 0;
+
+        // Colour mode outranks every other signal, the system default included.
+        //
+        // A shop with two machines has two for this reason: the colour one and
+        // the cheap mono laser. Sending black-and-white work to the colour
+        // printer is not a wrong print, it is an expensive one - colour toner
+        // spent on a job the mono laser was bought to take - and it happened on
+        // every single order, because the colour printer is usually the Windows
+        // default and IsSystemDefault outscored the capability match. The other
+        // direction was never in doubt: a colour job on a mono laser is proven
+        // incompatible and excluded outright, above.
+        //
+        // A printer that would not say is not matched either way. Null means the
+        // driver did not answer, and guessing mono to save toner would send
+        // colour-capable work to a machine nobody has confirmed can do it.
+        if (item.ColorMode == ColorMode.COLOR && printer.ColorCapable == true) score += 20;
+        if (item.ColorMode == ColorMode.BLACK_AND_WHITE && printer.ColorCapable == false) score += 20;
+
         if (printer.IsSystemDefault) score += 10;
-        if (item.ColorMode == ColorMode.COLOR && printer.ColorCapable == true) score += 3;
+
+        // Known-and-wrong still beats unknown for black and white: a colour
+        // printer that says it is one will certainly print the job, where a
+        // printer that would not answer may not really be there at all.
         if (item.ColorMode == ColorMode.BLACK_AND_WHITE && printer.ColorCapable != null) score += 1;
         if (item.DuplexMode == DuplexMode.DOUBLE_SIDED && printer.DuplexCapable == true) score += 3;
         if (printer.Sizes.Count > 0 && printer.Sizes.Contains(item.PaperSize)) score += 3;

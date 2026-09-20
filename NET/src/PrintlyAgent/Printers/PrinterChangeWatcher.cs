@@ -140,13 +140,41 @@ public sealed class PrinterChangeWatcher
         // until a printer changed or the slice expired, and DisposeAsync gives
         // its loops five seconds before giving up on them.
         using var signalled = new ManualResetEvent(false);
-        signalled.SafeWaitHandle = new SafeWaitHandle(change, ownsHandle: false);
+
+        // The event allocates a kernel handle of its own in that constructor,
+        // and assigning SafeWaitHandle replaces it without closing it - the
+        // property setter simply overwrites the field. Closed here, or the
+        // agent leaks one event handle for the life of the process every time
+        // the watch is started.
+        //
+        // ownsHandle: false on the replacement, because the spooler's
+        // notification object is closed by FindClosePrinterChangeNotification
+        // and must not also be closed by disposing this wrapper.
+        using (var ownHandle = signalled.SafeWaitHandle)
+        {
+            signalled.SafeWaitHandle = new SafeWaitHandle(change, ownsHandle: false);
+        }
 
         var waits = new[] { signalled, ct.WaitHandle };
 
         while (!ct.IsCancellationRequested)
         {
-            var woke = WaitHandle.WaitAny(waits, WaitSlice);
+            int woke;
+            try
+            {
+                woke = WaitHandle.WaitAny(waits, WaitSlice);
+            }
+            catch (ObjectDisposedException)
+            {
+                // The agent disposed its CancellationTokenSource, and with it
+                // the token's wait handle, while this thread was still in the
+                // wait. That only happens on the way out - AgentCore disposes
+                // the source last of all - so it means shutdown, and the right
+                // answer is to stop rather than to report a fault nobody will
+                // read.
+                return;
+            }
+
             if (woke != 0) continue; // cancelled, or the slice expired
 
             // Re-arms the subscription as well as reporting what happened, and

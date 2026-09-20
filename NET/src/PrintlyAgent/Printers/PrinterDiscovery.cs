@@ -142,6 +142,44 @@ public static class PrinterDiscovery
         }
     }
 
+    /// <summary>
+    /// Whether this machine has a printer that puts ink on paper, as opposed to
+    /// one that writes a file.
+    ///
+    /// Asked across every printer rather than only the usable ones: a shop whose
+    /// only laser is switched off still has a laser, and the right answer then
+    /// is that the order cannot be printed now - not that it should quietly go
+    /// to a PDF instead.
+    /// </summary>
+    public static bool AnyPhysical(IReadOnlyList<LocalPrinter> printers) =>
+        printers.Any(p => !PrintToFile.IsPrintToFileDriver(p.WindowsPrinterName));
+
+    /// <summary>
+    /// The printers worth telling the shop and the backend about.
+    ///
+    /// <para>
+    /// "Microsoft Print to PDF", "OneNote (Desktop)", the XPS writer and the fax
+    /// driver are on every Windows machine whether or not anyone wants them, and
+    /// a counter that has a laser has no use for any of them. Reporting them put
+    /// four entries in the shop's printer list where one belonged, and made the
+    /// routing screen a question about which PDF writer should take colour work.
+    /// </para>
+    ///
+    /// <para>
+    /// Only when there is something real to show instead, which is the same rule
+    /// <see cref="PrinterSelector.SelectPrinter"/> applies to choosing one - and
+    /// deliberately so: a dev box and this project's own test setup have nothing
+    /// but these, and a printer list that were empty there would say the agent
+    /// had found nothing, while jobs went on printing to file. Both halves
+    /// therefore ask <see cref="AnyPhysical"/>, so neither can start hiding a
+    /// printer the other is still willing to print with.
+    /// </para>
+    /// </summary>
+    public static IReadOnlyList<LocalPrinter> Reportable(IReadOnlyList<LocalPrinter> printers) =>
+        AnyPhysical(printers)
+            ? printers.Where(p => !PrintToFile.IsPrintToFileDriver(p.WindowsPrinterName)).ToList()
+            : printers;
+
     private static IReadOnlyList<LocalPrinter> QueryPrinters(ILogger? log = null)
     {
         string? defaultName;

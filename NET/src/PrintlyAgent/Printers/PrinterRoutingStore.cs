@@ -66,7 +66,14 @@ public static class PrinterRoutingStore
     {
         var cleaned = new PrinterRouting(
             Colour: Blank(routing.Colour),
-            BlackAndWhite: Blank(routing.BlackAndWhite));
+            BlackAndWhite: Blank(routing.BlackAndWhite),
+            // Carried, not dropped. These say whether the agent may revise its
+            // own choice later; losing them on the way to disk would turn every
+            // automatic assignment into one the shop appeared to have made, and
+            // the agent would then refuse to correct it when the printer went
+            // away.
+            ColourAuto: routing.ColourAuto,
+            BlackAndWhiteAuto: routing.BlackAndWhiteAuto);
         db.SetState(Key, JsonSerializer.Serialize(cleaned, Json));
     }
 
