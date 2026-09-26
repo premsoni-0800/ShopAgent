@@ -145,19 +145,38 @@ public static class SettingsLoader
     }
 
     /// <summary>
-    /// C:\Users\&lt;name&gt;\PrintlyFiles - on this PC's own disk, always.
+    /// Desktop\PrintlyFiles - where the owner sees it without looking for it -
+    /// or C:\Users\&lt;name&gt;\PrintlyFiles when the Desktop is not a plain
+    /// folder on this PC's own disk.
     ///
-    /// Not Documents: Documents can be redirected - to OneDrive, to a network
-    /// share, or (in a Parallels VM) to the Mac's own folders - and a counter
-    /// that prints off a network share is waiting on the network after all,
-    /// which is the one thing holding the files here exists to avoid. It was
-    /// in Documents first, and on the VM it landed on \\Mac\Home\Desktop.
+    /// A Desktop synced to OneDrive would upload every customer's document to
+    /// the cloud, and one redirected to a network share would have the counter
+    /// printing off the network - the one thing holding the files here exists
+    /// to avoid. Either way the profile folder is used instead.
     /// </summary>
     private static string? PrintlyFilesDir()
     {
+        var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        if (IsPlainLocalFolder(desktop)) return Path.Combine(desktop, "PrintlyFiles");
+
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         if (string.IsNullOrEmpty(profile) || profile.StartsWith(@"\\", StringComparison.Ordinal)) return null;
         return Path.Combine(profile, "PrintlyFiles");
+    }
+
+    private static bool IsPlainLocalFolder(string? path)
+    {
+        if (string.IsNullOrEmpty(path) || !Path.IsPathRooted(path)) return false;
+        if (path.StartsWith(@"\\", StringComparison.Ordinal)) return false;
+        if (path.Contains("OneDrive", StringComparison.OrdinalIgnoreCase)) return false;
+        try
+        {
+            return new DriveInfo(Path.GetPathRoot(path)!).DriveType == DriveType.Fixed;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private static int ReadBoundedInt(string name, int min, int max, int fallback)

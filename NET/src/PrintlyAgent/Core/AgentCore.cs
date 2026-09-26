@@ -192,6 +192,7 @@ public sealed class AgentCore : IAsyncDisposable
 
         var moved = MoveHeldFilesIntoPrintlyFiles(settings, Db, _log);
         if (moved > 0) _log.LogInformation("held_files_moved_into_printlyfiles count={Count}", moved);
+        RemoveEmptyOldPrintlyFiles(settings, _log);
 
         // Previews of every held file, drawn now rather than on the first click.
         PreviewCache.Root = Path.Combine(settings.AppDataDir, "preview-cache");
@@ -208,6 +209,30 @@ public sealed class AgentCore : IAsyncDisposable
     /// app data (or in a redirected Documents folder) and were listed on the
     /// Files page while the folder the owner opened was empty.
     /// </summary>
+    /// <summary>
+    /// The PrintlyFiles an earlier version used (the profile folder), once its
+    /// files have moved to the Desktop and it is empty - so the owner is not
+    /// left with two folders of the same name, one of them always empty.
+    /// </summary>
+    private static void RemoveEmptyOldPrintlyFiles(Settings settings, ILogger log)
+    {
+        try
+        {
+            var old = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "PrintlyFiles");
+            if (string.Equals(Path.GetFullPath(old), Path.GetFullPath(settings.FilesDir), StringComparison.OrdinalIgnoreCase)) return;
+            if (!Directory.Exists(old)) return;
+            foreach (var dir in Directory.GetDirectories(old))
+            {
+                if (!Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir);
+            }
+            if (!Directory.EnumerateFileSystemEntries(old).Any()) Directory.Delete(old);
+        }
+        catch (Exception exc)
+        {
+            log.LogDebug(exc, "old_printlyfiles_cleanup_failed");
+        }
+    }
+
     internal static int MoveHeldFilesIntoPrintlyFiles(Settings settings, Database db, ILogger log)
     {
         if (string.IsNullOrEmpty(settings.FilesDir)) return 0;
