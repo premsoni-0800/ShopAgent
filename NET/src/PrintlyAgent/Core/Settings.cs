@@ -144,11 +144,20 @@ public static class SettingsLoader
         );
     }
 
-    /// <summary>Documents\PrintlyFiles, or null where there is no Documents folder.</summary>
+    /// <summary>
+    /// C:\Users\&lt;name&gt;\PrintlyFiles - on this PC's own disk, always.
+    ///
+    /// Not Documents: Documents can be redirected - to OneDrive, to a network
+    /// share, or (in a Parallels VM) to the Mac's own folders - and a counter
+    /// that prints off a network share is waiting on the network after all,
+    /// which is the one thing holding the files here exists to avoid. It was
+    /// in Documents first, and on the VM it landed on \\Mac\Home\Desktop.
+    /// </summary>
     private static string? PrintlyFilesDir()
     {
-        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        return string.IsNullOrEmpty(documents) ? null : Path.Combine(documents, "PrintlyFiles");
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrEmpty(profile) || profile.StartsWith(@"\\", StringComparison.Ordinal)) return null;
+        return Path.Combine(profile, "PrintlyFiles");
     }
 
     private static int ReadBoundedInt(string name, int min, int max, int fallback)

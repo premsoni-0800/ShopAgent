@@ -365,6 +365,9 @@ public sealed class Database : IDisposable
             command => command.Parameters.AddWithValue("$shopId", shopId));
 
     /// <summary>The files held for one order, in the order they were fetched.</summary>
+    public List<HeldFileRow> AllHeldFiles() =>
+        QueryHeldFiles("SELECT * FROM held_files ORDER BY order_id, received_at, item_id", _ => { });
+
     public List<HeldFileRow> HeldFilesForOrder(string orderId) =>
         QueryHeldFiles(
             "SELECT * FROM held_files WHERE order_id = $orderId ORDER BY received_at, item_id",

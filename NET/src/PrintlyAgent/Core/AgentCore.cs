@@ -189,6 +189,57 @@ public sealed class AgentCore : IAsyncDisposable
         // happen whether or not this agent ever manages to sign in.
         var abandoned = SweepAbandonedHeldFiles(settings, Db, _log);
         if (abandoned > 0) _log.LogInformation("abandoned_held_orders_removed count={Count}", abandoned);
+
+        var moved = MoveHeldFilesIntoPrintlyFiles(settings, Db, _log);
+        if (moved > 0) _log.LogInformation("held_files_moved_into_printlyfiles count={Count}", moved);
+    }
+
+    /// <summary>
+    /// Moves every held file that lives anywhere else into PrintlyFiles, so the
+    /// folder is the one place this PC keeps customers' files - the Files page
+    /// and Explorer show the same thing. Files held by an older version sat in
+    /// app data (or in a redirected Documents folder) and were listed on the
+    /// Files page while the folder the owner opened was empty.
+    /// </summary>
+    internal static int MoveHeldFilesIntoPrintlyFiles(Settings settings, Database db, ILogger log)
+    {
+        if (string.IsNullOrEmpty(settings.FilesDir)) return 0;
+        var root = Path.GetFullPath(settings.FilesDir).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+        var moved = 0;
+        foreach (var group in db.AllHeldFiles().GroupBy(row => row.OrderId, StringComparer.Ordinal))
+        {
+            var number = 0;
+            foreach (var row in group)
+            {
+                number++;
+                if (row.LocalPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
+                try
+                {
+                    if (!File.Exists(row.LocalPath)) continue;
+                    var code = db.OrderReference(row.OrderId).OrderCode;
+                    var folder = Path.Combine(settings.FilesDir, string.IsNullOrWhiteSpace(code)
+                        ? JobPipeline.SafeFileStem(row.OrderId)
+                        : $"{JobPipeline.SafeFileStem(code)} ({JobPipeline.SafeFileStem(row.OrderId)[..Math.Min(8, JobPipeline.SafeFileStem(row.OrderId).Length)]})");
+                    Directory.CreateDirectory(folder);
+                    var destination = Path.Combine(folder, $"{number} - {JobPipeline.ReadableFileStem(row.FileName, row.ItemId)}.pdf");
+                    File.Move(row.LocalPath, destination, overwrite: true);
+                    db.UpsertHeldFile(row.OrderId, row.ItemId, row.ShopId, row.FileName, destination, row.Bytes);
+                    moved++;
+
+                    // The old per-order folder, once it has nothing left in it.
+                    var old = Path.GetDirectoryName(row.LocalPath);
+                    if (old is not null && Directory.Exists(old) && !Directory.EnumerateFileSystemEntries(old).Any())
+                    {
+                        Directory.Delete(old);
+                    }
+                }
+                catch (Exception exc)
+                {
+                    log.LogWarning(exc, "held_file_move_failed order={OrderId} item={ItemId}", row.OrderId, row.ItemId);
+                }
+            }
+        }
+        return moved;
     }
 
     /// <summary>

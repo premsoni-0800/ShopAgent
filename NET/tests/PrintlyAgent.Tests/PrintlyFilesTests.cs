@@ -113,6 +113,32 @@ public class PrintlyFilesTests : IDisposable
         Assert.True(Directory.Exists(filesDir), "PrintlyFiles itself is never removed");
     }
 
+    [Fact(DisplayName = "files an older version held elsewhere are moved into PrintlyFiles on start")]
+    public void OldHeldFilesAreMovedIntoPrintlyFiles()
+    {
+        var filesDir = Path.Combine(_root, "PrintlyFiles");
+        var legacy = Path.Combine(_root, "appdata", "files", "order-uuid-9");
+        Directory.CreateDirectory(legacy);
+        var oldPath = Path.Combine(legacy, "item-a.pdf");
+        File.WriteAllText(oldPath, "%PDF-1.4 old");
+
+        using var db = new Database(Path.Combine(_root, "agent-move.db"));
+        db.InsertJobReference("job-9", "order-uuid-9", "PPP01-000191", shopId: ShopId);
+        db.UpsertHeldFile("order-uuid-9", "item-a", ShopId, "Screenshot_20260914.png", oldPath, 12);
+        var settings = new PrintlyAgent.Core.Settings(
+            BackendBaseUrl: "http://127.0.0.1:1", Msg91WidgetId: "", AppDataDir: _root,
+            DbPath: Path.Combine(_root, "x.db"), LogDir: _root, TempDir: Path.Combine(_root, "tmp"), FilesDir: filesDir);
+
+        var moved = PrintlyAgent.Core.AgentCore.MoveHeldFilesIntoPrintlyFiles(settings, db, NullLogger.Instance);
+
+        var expected = Path.Combine(filesDir, "PPP01-000191 (order-uu)", "1 - Screenshot_20260914.pdf");
+        Assert.Equal(1, moved);
+        Assert.True(File.Exists(expected));
+        Assert.False(File.Exists(oldPath));
+        Assert.Equal(expected, db.HeldFilesForOrder("order-uuid-9").Single().LocalPath);
+        Assert.Equal(0, PrintlyAgent.Core.AgentCore.MoveHeldFilesIntoPrintlyFiles(settings, db, NullLogger.Instance));
+    }
+
     [Fact(DisplayName = "a file name that is nothing but punctuation still gets a name")]
     public void AnUnusableNameFallsBack()
     {
