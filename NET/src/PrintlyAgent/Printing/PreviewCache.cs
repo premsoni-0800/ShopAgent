@@ -32,6 +32,13 @@ public static class PreviewCache
     /// <summary>A4 at about 170 dpi.</summary>
     public const int PreviewWidth = 1400;
 
+    /// <summary>
+    /// Bumped whenever the way a sheet is drawn changes, so previews drawn the
+    /// old way are not served again - 2: the backend's frame round a photo is
+    /// cut away (ConvertedImagePlacement).
+    /// </summary>
+    private const int DrawingVersion = 2;
+
     /// <summary>Pages drawn ahead of time per file. Later pages are drawn when asked for.</summary>
     private const int WarmPages = 12;
 
@@ -155,7 +162,7 @@ public static class PreviewCache
         if (string.IsNullOrEmpty(Root)) return null;
         var info = new FileInfo(pdfPath);
         var key = $"{info.FullName}|{info.Length}|{info.LastWriteTimeUtc.Ticks}|{page}|" +
-                  $"{orientation ?? "PORTRAIT"}|{colorMode ?? "COLOR"}|{paperSize ?? "A4"}|{PreviewWidth}";
+                  $"{orientation ?? "PORTRAIT"}|{colorMode ?? "COLOR"}|{paperSize ?? "A4"}|{PreviewWidth}|v{DrawingVersion}";
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..32];
         return Path.Combine(Root, hash + ".jpg");
     }

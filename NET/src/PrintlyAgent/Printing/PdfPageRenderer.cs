@@ -50,8 +50,17 @@ public sealed class PdfPageRenderer : IDisposable
         // Docnet wants the page dimensions up front; passing the DPI as both
         // axes asks it to scale from the page's own size, which is what
         // renderImageWithDPI does.
-        _reader = _lib.GetDocReader(File.ReadAllBytes(pdfPath), new PageDimensions(dpi / 72.0));
+        var bytes = File.ReadAllBytes(pdfPath);
+        _reader = _lib.GetDocReader(bytes, new PageDimensions(dpi / 72.0));
+        if (_reader.GetPageCount() == 1) _soleImage = ConvertedImagePlacement.Find(bytes);
     }
+
+    /// <summary>
+    /// Where the backend placed an uploaded photo on the A4 page it made of it,
+    /// in points from the page's bottom-left - or null for any other PDF. See
+    /// <see cref="ConvertedImagePlacement"/>.
+    /// </summary>
+    private readonly (double X, double Y, double W, double H)? _soleImage;
 
     public int PageCount => _reader.GetPageCount();
 
@@ -101,6 +110,29 @@ public sealed class PdfPageRenderer : IDisposable
             graphics.DrawImageUnscaled(argb, 0, 0);
         }
         bitmap.SetResolution(_dpi, _dpi);
+
+        // The photo exactly as the student sent it, without the white frame the
+        // backend put round it: every page is then fitted to the sheet by the
+        // one rule the student's own preview uses, so nothing is added.
+        if (_soleImage is { } image)
+        {
+            var scale = _dpi / 72.0;
+            var pageHeightPt = height / scale;
+            var crop = Rectangle.Intersect(
+                new Rectangle(0, 0, width, height),
+                Rectangle.Round(new RectangleF(
+                    (float)(image.X * scale),
+                    (float)((pageHeightPt - image.Y - image.H) * scale),
+                    (float)(image.W * scale),
+                    (float)(image.H * scale))));
+            if (crop.Width > 0 && crop.Height > 0 && (crop.Width < width || crop.Height < height))
+            {
+                var cropped = bitmap.Clone(crop, PixelFormat.Format24bppRgb);
+                cropped.SetResolution(_dpi, _dpi);
+                bitmap.Dispose();
+                bitmap = cropped;
+            }
+        }
 
         _cached?.Dispose();
         _cached = bitmap;

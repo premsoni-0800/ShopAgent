@@ -26,4 +26,8 @@
     <ProjectReference Include="..\..\src\PrintlyAgent\PrintlyAgent.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- PDFs made by the backend's real image converter, for ConvertedImagePlacementTests. -->
+    <None Include="Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>
