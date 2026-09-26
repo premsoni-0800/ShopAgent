@@ -1330,7 +1330,10 @@ public static class JobPipeline
     /// </summary>
     internal static void DeleteHeldOrder(Database db, string filesDir, string orderId)
     {
-        var folders = db.HeldFilesForOrder(orderId)
+        var rows = db.HeldFilesForOrder(orderId);
+        // Previews first: they are found by the file, which is about to go.
+        foreach (var row in rows) PreviewCache.Forget(row.LocalPath, row.Orientation, row.ColorMode, row.PaperSize);
+        var folders = rows
             .Select(row => Path.GetDirectoryName(row.LocalPath))
             .Where(dir => !string.IsNullOrEmpty(dir))
             .Append(Path.Combine(filesDir, SafeFileStem(orderId)))

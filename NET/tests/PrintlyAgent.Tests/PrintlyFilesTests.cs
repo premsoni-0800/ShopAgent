@@ -139,6 +139,41 @@ public class PrintlyFilesTests : IDisposable
         Assert.Equal(0, PrintlyAgent.Core.AgentCore.MoveHeldFilesIntoPrintlyFiles(settings, db, NullLogger.Instance));
     }
 
+    [Fact(DisplayName = "once an order has printed, its files and its previews are gone and its record stays")]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    public void APrintedOrderLeavesNoFilesBehind()
+    {
+        var filesDir = Path.Combine(_root, "PrintlyFiles");
+        var folder = Path.Combine(filesDir, "PPP01-000300 (order-pr)");
+        Directory.CreateDirectory(folder);
+        var held = Path.Combine(folder, "1 - notes.pdf");
+        File.Copy(Path.Combine(AppContext.BaseDirectory, "Fixtures", "converter", "doc.pdf"), held);
+
+        using var db = new Database(Path.Combine(_root, "agent-printed.db"));
+        db.InsertJobReference("job-p", "order-printed", "PPP01-000300", shopId: ShopId);
+        db.UpsertHeldFile("order-printed", "item-p", ShopId, "notes.pdf", held, new FileInfo(held).Length, "PORTRAIT", "COLOR", "A4");
+
+        var previews = Path.Combine(_root, "preview-cache");
+        var previous = PrintlyAgent.Printing.PreviewCache.Root;
+        PrintlyAgent.Printing.PreviewCache.Root = previews;
+        try
+        {
+            PrintlyAgent.Printing.PreviewCache.SheetJpeg(held, 1, "PORTRAIT", "COLOR", "A4");
+            Assert.Single(Directory.GetFiles(previews, "*.jpg"));
+
+            JobPipeline.DeleteHeldOrder(db, filesDir, "order-printed");
+        }
+        finally
+        {
+            PrintlyAgent.Printing.PreviewCache.Root = previous;
+        }
+
+        Assert.False(Directory.Exists(folder), "the order's folder in PrintlyFiles is deleted");
+        Assert.Empty(Directory.GetFiles(previews, "*.jpg"));
+        Assert.Empty(db.HeldFilesForOrder("order-printed"));
+        Assert.NotNull(db.GetJob("job-p")); // the order's record stays
+    }
+
     [Fact(DisplayName = "a file name that is nothing but punctuation still gets a name")]
     public void AnUnusableNameFallsBack()
     {

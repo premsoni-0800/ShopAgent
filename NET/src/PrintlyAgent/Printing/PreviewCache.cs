@@ -126,6 +126,29 @@ public static class PreviewCache
         });
     }
 
+    /// <summary>
+    /// Deletes a file's previews - called with its held copy once the order has
+    /// printed, so nothing of the customer's document stays on this PC.
+    /// </summary>
+    public static void Forget(string pdfPath, string? orientation, string? colorMode, string? paperSize)
+    {
+        if (string.IsNullOrEmpty(Root) || !File.Exists(pdfPath)) return;
+        try
+        {
+            var pages = PageCount(pdfPath);
+            for (var page = 1; page <= pages; page++)
+            {
+                var file = CachePath(pdfPath, page, orientation, colorMode, paperSize);
+                if (file is not null && File.Exists(file)) File.Delete(file);
+            }
+        }
+        catch (Exception exc)
+        {
+            // The week-old sweep removes whatever this misses.
+            if (Log is not null) Log.LogDebug(exc, "preview_forget_failed path={Path}", pdfPath);
+        }
+    }
+
     /// <summary>Removes previews nobody has needed for a week - their files have long gone.</summary>
     public static void Sweep()
     {
