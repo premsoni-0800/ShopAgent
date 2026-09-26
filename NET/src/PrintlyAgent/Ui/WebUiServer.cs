@@ -254,12 +254,32 @@ public sealed class WebUiServer : IDisposable
             .Split('/', StringSplitOptions.RemoveEmptyEntries);
 
         string? resolved = null;
-        if (segments.Length == 2 && HeldFileResolver is { } resolve)
+        if (segments.Length >= 2 && HeldFileResolver is { } resolve)
         {
             resolved = resolve(Uri.UnescapeDataString(segments[0]), Uri.UnescapeDataString(segments[1]));
         }
 
         if (resolved is null || !File.Exists(resolved))
+        {
+            context.Response.StatusCode = 404;
+            context.Response.Close();
+            return;
+        }
+
+        // .../pages and .../page/{n}: the file as sheet images, so the
+        // dashboard shows each page as the paper it will print on - no PDF
+        // viewer, no toolbar, nothing to zoom.
+        if (segments.Length == 3 && segments[2] == "pages")
+        {
+            ServePageList(context, resolved);
+            return;
+        }
+        if (segments.Length == 4 && segments[2] == "page" && int.TryParse(segments[3], out var pageNumber))
+        {
+            ServePageImage(context, resolved, pageNumber, context.Request.QueryString["w"]);
+            return;
+        }
+        if (segments.Length != 2)
         {
             context.Response.StatusCode = 404;
             context.Response.Close();
@@ -288,6 +308,82 @@ public sealed class WebUiServer : IDisposable
         {
             try { context.Response.Close(); } catch (Exception) { }
         }
+    }
+
+    /// <summary>{"pages":[{"width":pt,"height":pt}]} - each page's size, for its sheet's shape.</summary>
+    private void ServePageList(HttpListenerContext context, string pdfPath)
+    {
+        try
+        {
+            // 72 dpi renders a page at its size in points, which is all this needs.
+            using var renderer = new Printing.PdfPageRenderer(pdfPath, 72);
+            var pages = new List<object>();
+            for (var i = 0; i < renderer.PageCount; i++)
+            {
+                var page = renderer.RenderPage(i);
+                pages.Add(new { width = page.Width, height = page.Height });
+            }
+            WriteJson(context, new { pages });
+        }
+        catch (Exception exc)
+        {
+            _log.LogDebug(exc, "held_file_pages_failed");
+            try { context.Response.StatusCode = 422; context.Response.Close(); } catch (Exception) { }
+        }
+    }
+
+    /// <summary>
+    /// One page as a PNG, rendered for a sheet <paramref name="widthParam"/>
+    /// pixels wide (the dashboard asks for its on-screen size), 150 dpi if not
+    /// given, never above 200 dpi.
+    /// </summary>
+    private void ServePageImage(HttpListenerContext context, string pdfPath, int pageNumber, string? widthParam)
+    {
+        try
+        {
+            using var probe = new Printing.PdfPageRenderer(pdfPath, 72);
+            if (pageNumber < 1 || pageNumber > probe.PageCount)
+            {
+                context.Response.StatusCode = 404;
+                context.Response.Close();
+                return;
+            }
+            var widthPt = probe.RenderPage(pageNumber - 1).Width;
+            var dpi = 150;
+            if (int.TryParse(widthParam, out var wanted) && wanted > 0 && widthPt > 0)
+            {
+                dpi = Math.Clamp((int)Math.Ceiling(wanted * 72.0 / widthPt), 36, 200);
+            }
+
+            using var renderer = new Printing.PdfPageRenderer(pdfPath, dpi);
+            var bitmap = renderer.RenderPage(pageNumber - 1);
+            using var buffer = new MemoryStream();
+            bitmap.Save(buffer, System.Drawing.Imaging.ImageFormat.Png);
+            context.Response.ContentType = "image/png";
+            context.Response.Headers["Cache-Control"] = "no-store";
+            context.Response.ContentLength64 = buffer.Length;
+            buffer.Position = 0;
+            buffer.CopyTo(context.Response.OutputStream);
+        }
+        catch (Exception exc)
+        {
+            _log.LogDebug(exc, "held_file_page_render_failed");
+            try { context.Response.StatusCode = 422; } catch (Exception) { }
+        }
+        finally
+        {
+            try { context.Response.Close(); } catch (Exception) { }
+        }
+    }
+
+    private static void WriteJson(HttpListenerContext context, object value)
+    {
+        var bytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value);
+        context.Response.ContentType = "application/json; charset=utf-8";
+        context.Response.Headers["Cache-Control"] = "no-store";
+        context.Response.ContentLength64 = bytes.Length;
+        context.Response.OutputStream.Write(bytes);
+        context.Response.Close();
     }
 
     // --- static files --------------------------------------------------------
