@@ -229,6 +229,49 @@ public class JobPipelineTests : IAsyncLifetime
         await DrainAsync(queue);
     }
 
+    /// <summary>
+    /// After a restart only what the owner started is replayed. A job nobody
+    /// pressed Print on goes back to waiting - printing it on its own is the
+    /// fault this rule exists to close.
+    /// </summary>
+    [Fact(DisplayName = "after a restart, only a job the owner just started is replayed")]
+    public async Task OnlyAnOwnerStartedJobIsReplayed()
+    {
+        var (ctx, db) = NewContext();
+        db.InsertJobReference("job-auto", "order-auto", "AA-000020", shopId: ShopId);
+        db.MarkPriority("job-auto"); // an old version's counter scan - not a Print
+        db.UpdateJobState("job-auto", DOWNLOADING);
+        db.InsertJobReference("job-owner", "order-owner", "AA-000021", shopId: ShopId);
+        db.MarkOwnerReleased("job-owner");
+        db.UpdateJobState("job-owner", DOWNLOADING);
+
+        var queue = NewQueue(workers: 1);
+        ResumeInterruptedJobs(ctx, queue, ownerStartedOnly: true);
+
+        await UntilAsync(() => db.GetJob("job-owner")?.State is not (DOWNLOADING or RECEIVED));
+        await Task.Delay(300);
+
+        Assert.Equal(RECEIVED, db.GetJob("job-auto")?.State);
+        Assert.Null(db.GetJob("job-auto")?.OwnerReleasedAt);
+        Assert.False(db.GetJob("job-auto")?.Priority);
+
+        await DrainAsync(queue);
+    }
+
+    [Fact(DisplayName = "a job the owner never pressed Print on does not print, however it was queued")]
+    public async Task AnUnreleasedJobNeverPrints()
+    {
+        var (baseCtx, db) = NewContext();
+        var ctx = baseCtx with { RequireOwnerRelease = true };
+        db.InsertJobReference("job-x", "order-x", "AA-000030", shopId: ShopId);
+
+        await ProcessJobAsync(ctx, "job-x");
+
+        // Back to waiting and untouched - it never even reached the network.
+        Assert.Equal(RECEIVED, db.GetJob("job-x")?.State);
+        Assert.Equal(0, db.GetJob("job-x")?.AttemptCount);
+    }
+
     // --- scan at counter -----------------------------------------------------
 
     /// <summary>

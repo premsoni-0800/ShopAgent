@@ -549,6 +549,11 @@ public sealed class AgentCore : IAsyncDisposable
 
         return held
             .GroupBy(row => row.OrderId, StringComparer.Ordinal)
+            // Scanned at the counter: the order has moved to Home, where the
+            // owner prints it, so it leaves the waiting list. The files stay in
+            // PrintlyFiles until it prints - Print reads them from there.
+            .Where(group => !(byUuid.TryGetValue(group.Key, out var o)
+                              && o.TryGetValue("inShopPriority", out var scanned) && scanned is true))
             .Select(group =>
             {
                 byUuid.TryGetValue(group.Key, out var order);
@@ -638,7 +643,10 @@ public sealed class AgentCore : IAsyncDisposable
     }
 
     /// <summary>How long an owner's Print keeps an order's jobs free of the counter-scan gate.</summary>
-    private static readonly TimeSpan OwnerReleaseLifetime = TimeSpan.FromMinutes(30);
+    // Long enough for the job Print asked the server for to arrive; short
+    // enough that a later job for the same order - a re-issue, a second
+    // attempt from another screen - still waits for its own Print.
+    private static readonly TimeSpan OwnerReleaseLifetime = TimeSpan.FromMinutes(2);
 
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _releasedByOwner =
         new(StringComparer.Ordinal);
@@ -657,12 +665,9 @@ public sealed class AgentCore : IAsyncDisposable
         var ctx = JobContextFor(credential);
 
         var started = 0;
-        foreach (var row in Db.HeldForCounterScan(credential.ShopId))
+        foreach (var row in Db.WaitingJobsForOrder(credential.ShopId, orderUuid))
         {
-            if (!string.Equals(row.OrderId, orderUuid, StringComparison.Ordinal)) continue;
-            if (row.State != JobPipeline.RECEIVED) continue;
-
-            Db.MarkPriority(row.JobId);
+            Db.MarkOwnerReleased(row.JobId);
             if (_printQueue.Enqueue(
                     row.JobId, row.OrderCode, priority: true,
                     () => JobPipeline.ProcessJobAsync(ctx, row.JobId, _shutdown.Token, awaitOutcome: false)))
@@ -1386,7 +1391,19 @@ public sealed class AgentCore : IAsyncDisposable
             // so the real code is already in hand and costs nothing.
             orderCode ??= (lookup as ScheduleLookup.Known)?.OrderCode;
 
-            switch (released ? new SchedulePlan.PrintAt(null) : Scheduling.PlanFor(lookup))
+            // Nothing prints unless the shop owner pressed Print on the order.
+            //
+            // A job used to go straight to the printer whenever the backend had
+            // not marked it held - which is every job on an auto-print shop -
+            // and a counter scan, or a scheduled time arriving, released a held
+            // one on its own. The counter PC then printed orders nobody at the
+            // counter had asked for. The owner's Print (ReleaseOrder, or a file
+            // on the Print errors page) is now the only way into the queue;
+            // everything else is recorded and its files downloaded, and waits.
+            var plan = released ? new SchedulePlan.PrintAt(null) : Scheduling.PlanFor(lookup);
+            if (!released && plan is not SchedulePlan.Hold) plan = new SchedulePlan.AwaitCounterScan();
+
+            switch (plan)
             {
                 case SchedulePlan.PrintAt printAt:
                     JobPipeline.HandleJobReference(
@@ -1453,7 +1470,8 @@ public sealed class AgentCore : IAsyncDisposable
         // The pipeline's own work is cancelled with the agent, so a job still
         // downloading when the app closes stops rather than finishing into a
         // database that is already shut.
-        _shutdown.Token);
+        _shutdown.Token,
+        RequireOwnerRelease: true);
 
     private async Task ScheduledJobsLoopAsync(CancellationToken ct)
     {
@@ -1464,7 +1482,7 @@ public sealed class AgentCore : IAsyncDisposable
             {
                 try
                 {
-                    JobPipeline.ProcessDueScheduledJobs(JobContextFor(credential), _printQueue);
+                    JobPipeline.ProcessDueScheduledJobs(JobContextFor(credential), _printQueue, ReleasedByOwner);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
                 catch (Exception exc) { _log.LogError(exc, "scheduled_jobs_check_failed"); }
@@ -1498,7 +1516,7 @@ public sealed class AgentCore : IAsyncDisposable
 
         try
         {
-            JobPipeline.ResumeInterruptedJobs(context, _printQueue);
+            JobPipeline.ResumeInterruptedJobs(context, _printQueue, ownerStartedOnly: true);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception exc) { _log.LogError(exc, "resume_interrupted_jobs_failed"); }

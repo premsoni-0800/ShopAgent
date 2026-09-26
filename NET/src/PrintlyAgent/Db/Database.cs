@@ -17,7 +17,9 @@ public sealed record JobRow(
     string UpdatedAt,
     string? ScheduledPrintAt,
     /// <summary>The order jumped the queue at the counter - see the `priority` column.</summary>
-    bool Priority = false);
+    bool Priority = false,
+    /// <summary>When the shop owner pressed Print on this job - the only thing that lets it print.</summary>
+    string? OwnerReleasedAt = null);
 
 /// <summary>
 /// One file this machine is holding on disk for an order whose student has not
@@ -196,6 +198,19 @@ public sealed class Database : IDisposable
         // shape, same reason: already-present is the normal case on every run
         // after the first.
         try { Execute("ALTER TABLE print_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"); }
+        catch (SqliteException) { /* column already there */ }
+
+        // When the shop owner pressed Print. Nothing prints without it - see
+        // JobPipeline.ProcessJobAsync. Added with a one-time reset of the old
+        // `priority` flag on unfinished jobs: an older version set it on a
+        // counter scan and replayed those jobs after a restart, which printed
+        // orders nobody at the counter had asked for.
+        try
+        {
+            Execute("ALTER TABLE print_jobs ADD COLUMN owner_released_at TEXT");
+            Execute("UPDATE print_jobs SET priority = 0 " +
+                    "WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'UNKNOWN')");
+        }
         catch (SqliteException) { /* column already there */ }
 
         // The two shapes every hot query uses. Without them each one is a full
@@ -495,6 +510,45 @@ public sealed class Database : IDisposable
     /// twice - so without this the grant would only ever live in the running
     /// queue and be lost on the next restart.
     /// </summary>
+    /// <summary>The shop owner pressed Print on this job: it may now print, and goes first.</summary>
+    public void MarkOwnerReleased(string jobId)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "UPDATE print_jobs SET owner_released_at = $now, priority = 1 WHERE job_id = $jobId";
+            command.Parameters.AddWithValue("$now", NowIso());
+            command.Parameters.AddWithValue("$jobId", jobId);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Takes back an owner's Print that never reached a printer - see ResumeInterruptedJobs.</summary>
+    public void ClearOwnerRelease(string jobId)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "UPDATE print_jobs SET owner_released_at = NULL, priority = 0 WHERE job_id = $jobId";
+            command.Parameters.AddWithValue("$jobId", jobId);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// An order's jobs still waiting to print, whatever their priority flag - what
+    /// the owner's Print releases. HeldForCounterScan skipped priority rows, so a
+    /// press on an order an old version had marked printed nothing at all.
+    /// </summary>
+    public List<JobRow> WaitingJobsForOrder(string shopId, string orderId) =>
+        Query(
+            "SELECT * FROM print_jobs WHERE state = 'RECEIVED' AND shop_id = $shopId AND order_id = $orderId",
+            command =>
+            {
+                command.Parameters.AddWithValue("$shopId", shopId);
+                command.Parameters.AddWithValue("$orderId", orderId);
+            });
+
     public void MarkPriority(string jobId)
     {
         lock (_lock)
@@ -771,7 +825,8 @@ public sealed class Database : IDisposable
         ReceivedAt: reader.GetString(reader.GetOrdinal("received_at")),
         UpdatedAt: reader.GetString(reader.GetOrdinal("updated_at")),
         ScheduledPrintAt: GetNullableString(reader, "scheduled_print_at"),
-        Priority: GetBool(reader, "priority"));
+        Priority: GetBool(reader, "priority"),
+        OwnerReleasedAt: GetNullableString(reader, "owner_released_at"));
 
     private static bool GetBool(SqliteDataReader reader, string column)
     {

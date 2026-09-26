@@ -57,7 +57,8 @@ public sealed record JobContext(
     /// <summary>Best-effort UI push - fired on every local state change. No-op in tests/contexts that don't care about the UI.</summary>
     Action? OnEvent = null,
     ILogger? Log = null,
-    CancellationToken Cancellation = default)
+    CancellationToken Cancellation = default,
+    bool RequireOwnerRelease = false)
 {
     internal ILogger Logger => Log ?? NullLogger.Instance;
 
@@ -234,6 +235,10 @@ public static class JobPipeline
     {
         if (RegisterJobReference(ctx, jobId, orderId, orderCode, scheduledPrintAt, priority))
         {
+            // In the app a priority reference is an owner's Print (see
+            // AgentCore.OnJobReference), so it is written down as one before
+            // the queue can pick it up.
+            if (priority) ctx.Db.MarkOwnerReleased(jobId);
             queue.Enqueue(jobId, orderCode, priority, () => ProcessJobAsync(ctx, jobId, ctx.Cancellation, awaitOutcome: false));
             return;
         }
@@ -252,9 +257,9 @@ public static class JobPipeline
         // one a restart has yet to resume, keeps a grant it is too early to act
         // on. Only then moved in the queue, if it is in one.
         var row = ctx.Db.GetJob(jobId);
-        if (row is null || row.Priority || TERMINAL.Contains(row.State)) return;
+        if (row is null || row.OwnerReleasedAt is not null || TERMINAL.Contains(row.State)) return;
 
-        ctx.Db.MarkPriority(jobId);
+        ctx.Db.MarkOwnerReleased(jobId);
         ctx.RaiseEvent();
         if (queue.Promote(jobId))
         {
@@ -348,10 +353,16 @@ public static class JobPipeline
     /// one late by however long all the others took.
     /// </para>
     /// </summary>
-    public static void ProcessDueScheduledJobs(JobContext ctx, PrintQueue queue)
+    /// <param name="mayPrint">
+    /// Whether the owner has pressed Print on this order (by order id). A due
+    /// time is not permission to print - see AgentCore.OnJobReference. Null
+    /// prints every due job, which is what the scheduling tests exercise.
+    /// </param>
+    public static void ProcessDueScheduledJobs(JobContext ctx, PrintQueue queue, Func<string, bool>? mayPrint = null)
     {
         foreach (var row in ctx.Db.DueScheduledJobs(NowIso(), ctx.Credential.ShopId))
         {
+            if (mayPrint is not null && !mayPrint(row.OrderId)) continue;
             // row.Priority, not false. MarkPriority persists a counter scan
             // precisely so it survives a restart, and hard-coding false here
             // threw that away at the one moment it mattered.
@@ -374,10 +385,26 @@ public static class JobPipeline
     /// qualify.
     /// </para>
     /// </summary>
-    public static void ResumeInterruptedJobs(JobContext ctx, PrintQueue queue)
+    /// <param name="ownerStartedOnly">
+    /// Replay only jobs the owner started (marked priority by Print). Any other
+    /// interrupted job is put back to waiting rather than printed on its own
+    /// after a restart - see AgentCore.OnJobReference.
+    /// </param>
+    public static void ResumeInterruptedJobs(JobContext ctx, PrintQueue queue, bool ownerStartedOnly = false)
     {
         foreach (var row in ctx.Db.ResumableJobs(ctx.Credential.ShopId))
         {
+            // Replayed only when the owner pressed Print on it moments before the
+            // agent stopped - a crash mid-download. Anything older goes back to
+            // waiting with its Print taken back: printing a click from yesterday
+            // when the PC is switched on this morning is not what anybody asked.
+            if (ownerStartedOnly && !ReleasedRecently(row.OwnerReleasedAt))
+            {
+                ctx.Db.UpdateJobState(row.JobId, RECEIVED);
+                ctx.Db.ClearOwnerRelease(row.JobId);
+                ctx.Logger.LogInformation("interrupted_job_back_to_waiting job={JobId} state={State}", row.JobId, row.State);
+                continue;
+            }
             // Rewind to the start rather than continuing from where it stopped.
             // [ProcessJobAsync] always begins by moving to VALIDATING, and the
             // state machine has no edge back to it from DOWNLOADING or DOWNLOADED
@@ -476,6 +503,18 @@ public static class JobPipeline
     {
         var row = ctx.Db.GetJob(jobId);
         if (row is null || TERMINAL.Contains(row.State)) return;
+
+        // The last gate before a printer, and the one every caller passes
+        // through: a job the shop owner has not pressed Print on does not print,
+        // however it got into the queue. Put back to waiting, not failed - the
+        // owner's Print picks it up from there.
+        if (ctx.RequireOwnerRelease && row.OwnerReleasedAt is null)
+        {
+            ctx.Db.UpdateJobState(jobId, RECEIVED);
+            ctx.RaiseEvent();
+            ctx.Logger.LogWarning("print_blocked_not_released_by_owner job={JobId} order={OrderId}", jobId, row.OrderId);
+            return;
+        }
 
         // Whether anything has been handed to a printer driver yet. Past that
         // point no error may be reported as FAILED, however it arrives: the shop
@@ -1195,6 +1234,12 @@ public static class JobPipeline
             ctx.Logger.LogWarning(exc, "order_files_prefetch_failed order={OrderId}", orderId);
         }
     }
+
+    /// <summary>An owner's Print recent enough to carry across a restart.</summary>
+    private static bool ReleasedRecently(string? ownerReleasedAt) =>
+        DateTime.TryParse(ownerReleasedAt, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var at)
+        && DateTime.UtcNow - at.ToUniversalTime() < TimeSpan.FromMinutes(10);
 
     /// <summary>
     /// This order's folder inside PrintlyFiles: the order's number, with the
