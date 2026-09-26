@@ -52,6 +52,10 @@ public sealed record PrinterRouting(string? Colour = null, string? BlackAndWhite
     public string? For(PrintJobItem item) =>
         item.ColorMode == ColorMode.COLOR ? Blank(Colour) : Blank(BlackAndWhite);
 
+    /// <summary>The printer this shop has named for the <em>other</em> colour mode, if it named one.</summary>
+    public string? Other(PrintJobItem item) =>
+        item.ColorMode == ColorMode.COLOR ? Blank(BlackAndWhite) : Blank(Colour);
+
     private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 }
 
@@ -91,6 +95,14 @@ public static class PrinterSelector
             // Still selectable when there is nothing else on the machine, which
             // is every dev box and this project's own test setup.
             .Where(p => !(hasPhysicalPrinter && PrintToFile.IsPrintToFileDriver(p.WindowsPrinterName)))
+            // Never onto the machine the shop set aside for the other half of
+            // the work. With the colour printer unplugged, the colour file of a
+            // mixed order went to the mono laser - whose driver, like many,
+            // would not say it was mono - and came out grey, reported printed.
+            // The shop split its printers by colour on purpose; a file whose
+            // printer is missing waits on the Errors page, where the owner can
+            // still send it anywhere by hand.
+            .Where(p => !IsNamedForTheOtherMode(item, p, routing))
             .ToList();
 
         if (candidates.Count == 0) return new SelectionResult(null, "PRINTER_INCOMPATIBLE");
@@ -119,6 +131,15 @@ public static class PrinterSelector
             .First();
 
         return new SelectionResult(best);
+    }
+
+    private static bool IsNamedForTheOtherMode(PrintJobItem item, LocalPrinter printer, PrinterRouting? routing)
+    {
+        var other = routing?.Other(item);
+        if (other is null) return false;
+        // Both modes named to one printer is one printer doing everything, not a split.
+        if (string.Equals(other, routing!.For(item), StringComparison.OrdinalIgnoreCase)) return false;
+        return string.Equals(printer.WindowsPrinterName, other, StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool ProvenIncompatible(PrintJobItem item, LocalPrinter printer)

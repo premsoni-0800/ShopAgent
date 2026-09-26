@@ -234,7 +234,7 @@ public static class JobPipeline
     {
         if (RegisterJobReference(ctx, jobId, orderId, orderCode, scheduledPrintAt, priority))
         {
-            queue.Enqueue(jobId, orderCode, priority, () => ProcessJobAsync(ctx, jobId, ctx.Cancellation));
+            queue.Enqueue(jobId, orderCode, priority, () => ProcessJobAsync(ctx, jobId, ctx.Cancellation, awaitOutcome: false));
             return;
         }
 
@@ -277,7 +277,7 @@ public static class JobPipeline
         // reading of this that prints twice.
         if (!string.Equals(row.State, RECEIVED, StringComparison.Ordinal)) return;
 
-        if (queue.Enqueue(jobId, orderCode ?? row.OrderCode, true, () => ProcessJobAsync(ctx, jobId, ctx.Cancellation)))
+        if (queue.Enqueue(jobId, orderCode ?? row.OrderCode, true, () => ProcessJobAsync(ctx, jobId, ctx.Cancellation, awaitOutcome: false)))
         {
             ctx.Logger.LogInformation(
                 "counter_scan_released_job job={JobId} order={OrderId}", jobId, orderId);
@@ -317,6 +317,9 @@ public static class JobPipeline
         if (!isNew)
         {
             ctx.Logger.LogDebug("awaiting_counter_scan_still job={JobId}", jobId);
+            // Held by an earlier run, or by a version that never reported it:
+            // the files are here, so the timeline should say so.
+            if (ctx.Db.HasHeldFiles(orderId)) _ = Task.Run(() => ReportCachedAsync(ctx, jobId, orderId, ctx.Cancellation));
             return;
         }
 
@@ -352,7 +355,7 @@ public static class JobPipeline
             // row.Priority, not false. MarkPriority persists a counter scan
             // precisely so it survives a restart, and hard-coding false here
             // threw that away at the one moment it mattered.
-            if (queue.Enqueue(row.JobId, row.OrderCode, row.Priority, () => ProcessJobAsync(ctx, row.JobId, ctx.Cancellation)))
+            if (queue.Enqueue(row.JobId, row.OrderCode, row.Priority, () => ProcessJobAsync(ctx, row.JobId, ctx.Cancellation, awaitOutcome: false)))
             {
                 ctx.Logger.LogInformation(
                     "scheduled_print_job_due job={JobId} order={OrderId}", row.JobId, row.OrderId);
@@ -401,7 +404,7 @@ public static class JobPipeline
             var accepted = queue.Enqueue(row.JobId, row.OrderCode, row.Priority, () =>
             {
                 ctx.Db.UpdateJobState(row.JobId, RECEIVED);
-                return ProcessJobAsync(ctx, row.JobId, ctx.Cancellation);
+                return ProcessJobAsync(ctx, row.JobId, ctx.Cancellation, awaitOutcome: false);
             });
             if (accepted)
             {
@@ -463,7 +466,13 @@ public static class JobPipeline
     /// </summary>
     private static string NowIso() => DateTime.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
 
-    public static async Task ProcessJobAsync(JobContext ctx, string jobId, CancellationToken cancellation = default)
+    /// <param name="awaitOutcome">
+    /// Wait for the spooler's final answer before returning. The print queue
+    /// passes false, so its slot frees the moment every file is with Windows;
+    /// tests pass the default, to read the outcome when this returns.
+    /// </param>
+    public static async Task ProcessJobAsync(
+        JobContext ctx, string jobId, CancellationToken cancellation = default, bool awaitOutcome = true)
     {
         var row = ctx.Db.GetJob(jobId);
         if (row is null || TERMINAL.Contains(row.State)) return;
@@ -481,19 +490,22 @@ public static class JobPipeline
             // doing it again. That is the whole point - the gap between one
             // print ending and the next starting is this phase, and on a run of
             // small orders it was most of each order's life.
+            var preparing = System.Diagnostics.Stopwatch.StartNew();
             var prepared = await PrepareAsync(ctx, jobId, cancellation).ConfigureAwait(false);
             if (prepared is null) return;
+            var preparedMs = preparing.ElapsedMilliseconds;
 
             var (detail, downloaded) = prepared.Value;
 
-            List<(string PrinterName, string JobNameToken)> submissions;
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            PrintAttempt attempt;
             try
             {
                 Transition(ctx, jobId, DOWNLOADED);
                 ReportProgress(ctx, jobId, PrintJobProgressStage.PRINTING, cancellation);
                 var printers = await Task.Run(() => PrinterDiscovery.DiscoverPrinters(ctx.Logger), cancellation)
                     .ConfigureAwait(false);
-                submissions = await Task.Run(
+                attempt = await Task.Run(
                     () => SelectAndPrint(ctx, detail, downloaded, printers, printerName =>
                     {
                         // Fired once, immediately before the first page is handed
@@ -504,53 +516,49 @@ public static class JobPipeline
                     }),
                     cancellation).ConfigureAwait(false);
             }
-            // There is deliberately no DocumentValidationError case here any
-            // more. It existed to catch the document inspection that ran in this
-            // block; with that removed, nothing in here can raise one, and a
-            // DOCUMENT_INVALID failure path that can never fire would only
-            // suggest to the next reader that documents are still being checked.
-            // A file that cannot be opened now surfaces as a PrintSubmissionError
-            // below, from the renderer.
-            catch (NoCompatiblePrinterException exc)
-            {
-                await FailAsync(ctx, jobId, Reason(exc, "no compatible printer"), PrintJobFailureReason.PRINTER_INCOMPATIBLE, cancellation)
-                    .ConfigureAwait(false);
-                return;
-            }
-            catch (PrintSubmissionError exc)
-            {
-                await FailAsync(ctx, jobId, Reason(exc, "print submission failed"), PrintJobFailureReason.PRINTER_ERROR, cancellation)
-                    .ConfigureAwait(false);
-                return;
-            }
-            catch (PrintSubmissionStalled exc)
-            {
-                // Deliberately not a failure. The driver took the job and stopped
-                // responding partway through, so pages may well be in the tray
-                // already - reporting it failed is what would have the shop print
-                // the whole thing again on top of what came out. Same rule as the
-                // spooler's own UNKNOWN: only somebody who can look at the printer
-                // can say what happened.
-                await MarkUnknownAsync(ctx, jobId, Reason(exc, "the printer stopped responding"), cancellation)
-                    .ConfigureAwait(false);
-                return;
-            }
             finally
             {
                 DeleteDownloads(ctx, downloaded);
                 ForgetPreparation(jobId);
             }
 
+            ctx.Logger.LogInformation(
+                "print_job_timing job={JobId} prepared_ms={Prepared} spooled_ms={Spooled} files={Files} sent={Sent}",
+                jobId, preparedMs, timer.ElapsedMilliseconds, detail.Items.Count, attempt.Submitted.Count);
+
+            foreach (var failure in attempt.Failed)
+            {
+                RecordItem(ctx, detail, failure.Item, failure.MayHavePrinted ? ITEM_UNKNOWN : ITEM_FAILED,
+                    failure.PrinterName, failure.Reason);
+            }
+
+            // Nothing reached a printer: the order failed as a whole, which the
+            // shop reads as "print it again" - correct, since no paper exists.
+            if (attempt.Submitted.Count == 0 && attempt.Failed.All(f => !f.MayHavePrinted))
+            {
+                var allUnroutable = attempt.Failed.All(f => f.PrinterName is null);
+                await FailAsync(
+                    ctx, jobId, Summary(detail, attempt.Failed.Select(f => (f.Item, f.Reason)).ToList(), printed: 0),
+                    allUnroutable ? PrintJobFailureReason.PRINTER_INCOMPATIBLE : PrintJobFailureReason.PRINTER_ERROR,
+                    cancellation).ConfigureAwait(false);
+                return;
+            }
+
+            if (attempt.Submitted.Count == 0)
+            {
+                // Only stalled sends: pages may be out, so never FAILED.
+                await MarkUnknownAsync(
+                    ctx, jobId, Summary(detail, attempt.Failed.Select(f => (f.Item, f.Reason)).ToList(), printed: 0),
+                    cancellation).ConfigureAwait(false);
+                return;
+            }
+
             // The printer is recorded locally and reported at the same moment, so
-            // the shop's own job list can say which machine took the order - and,
-            // when something goes wrong later, which one to go and look at.
-            var printerUsed = submissions[^1].PrinterName;
+            // the shop's own job list can say which machine took the order.
+            var printerUsed = attempt.Submitted[^1].PrinterName;
             Transition(ctx, jobId, SUBMITTED, printerWindowsName: printerUsed);
-            // Best-effort, deliberately. The driver has the document either way and
-            // the outcome report that follows carries the real answer. Letting a
-            // failure here escape would hand a printed order to the catch-all
-            // below - and the backend is a cold-starting host, so a timeout on
-            // this call is an ordinary event, not evidence anything went wrong.
+            // Best-effort, deliberately: the outcome report that follows carries
+            // the real answer, and the backend is a cold-starting host.
             try
             {
                 await ctx.Api.ReportStatusAsync(
@@ -566,41 +574,80 @@ public static class JobPipeline
                 ctx.Logger.LogWarning(exc, "print_job_submitted_report_failed job={JobId}", jobId);
             }
 
-            // The blocking submit call only proves the driver accepted the job -
-            // PRINTING's own outcome (COMPLETED/FAILED/UNKNOWN) is decided by
-            // asking the spooler what actually happened, same rule as the class
-            // doc above.
+            // The blocking submit call only proves the driver accepted each file;
+            // what actually happened is asked of the spooler, file by file.
             Transition(ctx, jobId, PRINTING);
-            var result = await PollAllOutcomesAsync(
-                submissions,
-                ctx.JobStallSeconds,
-                condition =>
-                {
-                    // Recorded the moment it happens, so the shop's job list can
-                    // say "out of paper" while the job is still waiting rather
-                    // than only once it has timed out.
-                    if (condition is not null)
-                    {
-                        ctx.Logger.LogWarning(
-                            "print_job_blocked job={JobId} condition={Condition}", jobId, condition.Value);
-                        ctx.Db.UpdateJobState(jobId, PRINTING, lastError: $"waiting: {condition.Value.Description()}");
-                        ctx.Db.RecordEvent(jobId, "BLOCKED", condition.Value.Description());
-                        ctx.RaiseEvent();
-                    }
-                },
-                ctx.Logger,
-                cancellation).ConfigureAwait(false);
-
-            switch (result.Outcome)
+            async Task FinishAsync()
             {
-                case PrintOutcome.COMPLETED:
+                PrinterCondition? stuckOn = null;
+                var outcomes = await PollEachOutcomeAsync(
+                    attempt.Submitted,
+                    ctx.JobStallSeconds,
+                    condition =>
+                    {
+                        // Recorded the moment it happens, so the shop's job list can
+                        // say "out of paper" while the job is still waiting.
+                        if (condition is not null)
+                        {
+                            stuckOn = condition;
+                            ctx.Logger.LogWarning(
+                                "print_job_blocked job={JobId} condition={Condition}", jobId, condition.Value);
+                            ctx.Db.UpdateJobState(jobId, PRINTING, lastError: $"waiting: {condition.Value.Description()}");
+                            ctx.Db.RecordEvent(jobId, "BLOCKED", condition.Value.Description());
+                            ctx.RaiseEvent();
+                        }
+                    },
+                    ctx.Logger,
+                    cancellation).ConfigureAwait(false);
+
+                var notPrinted = new List<(PrintJobItem Item, string Reason)>();
+                var printedCount = 0;
+                var anyUnconfirmed = attempt.Failed.Any(f => f.MayHavePrinted);
+                for (var i = 0; i < attempt.Submitted.Count; i++)
+                {
+                    var sent = attempt.Submitted[i];
+                    var outcome = outcomes[i];
+                    switch (outcome.Outcome)
+                    {
+                        case PrintOutcome.COMPLETED:
+                            printedCount++;
+                            RecordItem(ctx, detail, sent.Item, ITEM_PRINTED, sent.PrinterName, null);
+                            break;
+                        case PrintOutcome.FAILED when outcome.Condition is { } gone:
+                            // Withdrawn from a printer that is not there - see
+                            // SpoolerOutcomePoller's unreachable rule. Nothing came out.
+                            notPrinted.Add((sent.Item, $"{sent.PrinterName}: {gone.Description()}"));
+                            RecordItem(ctx, detail, sent.Item, ITEM_FAILED, sent.PrinterName,
+                                $"Not printed - {gone.Description()} ({sent.PrinterName}). " +
+                                "Print this file once the printer is back.");
+                            break;
+                        case PrintOutcome.FAILED:
+                            notPrinted.Add((sent.Item, $"{sent.PrinterName} reported an error"));
+                            RecordItem(ctx, detail, sent.Item, ITEM_FAILED, sent.PrinterName,
+                                $"{sent.PrinterName} reported an error after accepting it.");
+                            break;
+                        default:
+                            anyUnconfirmed = true;
+                            var why = outcome.Condition is { } c
+                                ? $"still waiting on {sent.PrinterName}: {c.Description()}"
+                                : $"sent to {sent.PrinterName}, but it never confirmed it finished";
+                            notPrinted.Add((sent.Item, why));
+                            RecordItem(ctx, detail, sent.Item, ITEM_UNKNOWN, sent.PrinterName, why);
+                            break;
+                    }
+                }
+                notPrinted.AddRange(attempt.Failed.Select(f => (f.Item, f.Reason)));
+
+                ctx.Logger.LogInformation(
+                    "print_job_outcome job={JobId} printed={Printed} of={Total} total_ms={Total_ms}",
+                    jobId, printedCount, detail.Items.Count, preparedMs + timer.ElapsedMilliseconds);
+
+                if (notPrinted.Count == 0)
+                {
                     Transition(ctx, jobId, COMPLETED);
-                    // The paper exists, so the copies held for this order have
-                    // done their job. Released here rather than in the `finally`
-                    // above, because that runs for a failed print too - and a
-                    // print that failed is exactly the one about to be retried
-                    // with the student still at the counter, which is the worst
-                    // possible moment to have thrown the files away.
+                    // The paper exists, so the copies held for this order have done
+                    // their job. Not released for anything less than a full print:
+                    // the files not printed are what the shop prints next.
                     ReleaseHeldFiles(ctx, detail.OrderId);
                     try
                     {
@@ -614,41 +661,65 @@ public static class JobPipeline
                     }
                     catch (Exception exc)
                     {
-                        // The pages printed; the only thing that failed was saying
-                        // so. Leaving it COMPLETED strands the order on the backend
-                        // as forever-printing, with nothing left locally to move it
-                        // on - COMPLETED is terminal here, so no sweep looks at it
-                        // again. UNKNOWN is the state that means a person has to
-                        // look, which is exactly what is wanted, and it is
+                        // The pages printed; only saying so failed. UNKNOWN is the
+                        // state that means a person has to look, and it is
                         // emphatically not FAILED.
                         await MarkUnknownAsync(
                             ctx, jobId, $"the pages printed, but the server could not be told: {exc}", cancellation)
                             .ConfigureAwait(false);
                     }
-                    break;
-
-                case PrintOutcome.FAILED:
+                }
+                else if (printedCount == 0 && !anyUnconfirmed)
+                {
+                    // The spooler rejected everything that was sent: no paper.
                     await FailAsync(
-                        ctx, jobId, "the printer reported an error after accepting the job",
+                        ctx, jobId, Summary(detail, notPrinted, printed: 0),
                         PrintJobFailureReason.PRINTER_ERROR, cancellation).ConfigureAwait(false);
-                    break;
-
-                case PrintOutcome.UNKNOWN:
-                default:
-                    // A stuck job is still in the queue and may yet print, so this
-                    // is never reported as failed - that is what would let the
-                    // shop reprint a page that then comes out anyway. Naming the
-                    // condition turns "go and look at the printer" into something
-                    // actionable.
+                }
+                else
+                {
+                    // Some of it is on paper. Never FAILED - that has the shop reprint
+                    // the whole order on top of what came out. UNKNOWN is "a person
+                    // needs to look", and the per-file list says exactly at what.
                     await MarkUnknownAsync(
-                        ctx,
-                        jobId,
-                        result.Condition is { } stuckOn
-                            ? $"still waiting: {stuckOn.Description()}. The job is queued and prints once this is fixed."
-                            : "could not confirm the print finished before the spooler check timed out",
+                        ctx, jobId,
+                        stuckOn is { } blocked && printedCount == 0
+                            ? $"still waiting: {blocked.Description()}. The job is queued and prints once this is fixed."
+                            : Summary(detail, notPrinted, printedCount),
                         cancellation).ConfigureAwait(false);
-                    break;
+                }
             }
+
+            if (awaitOutcome)
+            {
+                await FinishAsync().ConfigureAwait(false);
+                return;
+            }
+
+            // Everything is with the spooler now, which queues it for the
+            // printer by itself. Waiting here for the paper to come out held the
+            // agent's one print slot for as long as the printer took - a
+            // 40-page order kept every other order's Print button waiting
+            // minutes. The outcome is still watched and reported, just not with
+            // the next order stuck behind it.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await FinishAsync().ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+                {
+                    // Shutting down; the stranded-at-the-printer sweep settles it next start.
+                }
+                catch (Exception exc)
+                {
+                    ctx.Logger.LogError(exc, "print_job_outcome_error job={JobId}", jobId);
+                    await MarkUnknownAsync(
+                        ctx, jobId, $"unexpected error after the document reached the printer: {exc}", cancellation)
+                        .ConfigureAwait(false);
+                }
+            }, CancellationToken.None);
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
@@ -695,6 +766,36 @@ public static class JobPipeline
     /// </summary>
     private static string Reason(Exception exc, string fallback) =>
         string.IsNullOrWhiteSpace(exc.Message) ? fallback : exc.Message;
+
+    // Per-file outcomes, as the shop's per-file list shows them.
+    internal const string ITEM_PRINTED = "PRINTED";
+    internal const string ITEM_FAILED = "FAILED";
+    internal const string ITEM_UNKNOWN = "UNKNOWN";
+
+    private static void RecordItem(
+        JobContext ctx, PrintJobDetail detail, PrintJobItem item, string status, string? printerName, string? reason)
+    {
+        try
+        {
+            ctx.Db.UpsertItemResult(
+                detail.JobId, item.ItemId, detail.OrderId, item.FileName, item.ColorMode.ToString(),
+                status, printerName, reason);
+        }
+        catch (Exception exc)
+        {
+            // Bookkeeping for the screen; never a reason to change the outcome.
+            ctx.Logger.LogWarning(exc, "item_result_record_failed job={JobId} item={ItemId}", detail.JobId, item.ItemId);
+        }
+    }
+
+    /// <summary>"Printed 2 of 3 files. Not printed: x.pdf - why." Short enough for the job list.</summary>
+    internal static string Summary(PrintJobDetail detail, IReadOnlyList<(PrintJobItem Item, string Reason)> notPrinted, int printed)
+    {
+        var names = string.Join("; ", notPrinted.Select(n => $"{n.Item.FileName} - {n.Reason}"));
+        return printed == 0
+            ? $"Nothing printed. {names}"
+            : $"Printed {printed} of {detail.Items.Count} files. Not printed: {names}";
+    }
 
     /// <summary>
     /// Kotlin's <c>downloaded.values.forEach { it.toFile().delete() }</c>.
@@ -1030,8 +1131,13 @@ public static class JobPipeline
             var byDocumentId = new Dictionary<string, DownloadUrl>(StringComparer.Ordinal);
             foreach (var entry in urls.Items) byDocumentId[entry.DocumentId] = entry;
 
-            var folder = OrderFolder(ctx, orderId);
+            // Named by the order's number, so the folder in PrintlyFiles reads
+            // the way the counter talks about the order.
+            var folder = OrderFolder(ctx, orderId, detail.OrderCode);
             Directory.CreateDirectory(folder);
+            var position = detail.Items
+                .Select((item, index) => (item.ItemId, index))
+                .ToDictionary(pair => pair.ItemId, pair => pair.index + 1, StringComparer.Ordinal);
 
             using var slots = new SemaphoreSlim(ParallelDownloads);
             var fetches = detail.Items
@@ -1048,7 +1154,11 @@ public static class JobPipeline
                             ctx.Api.Http, byDocumentId[item.DocumentId].Url,
                             ctx.TempDir, ctx.DownloadTimeoutSeconds, cancellation).ConfigureAwait(false);
 
-                        var destination = Path.Combine(folder, SafeFileStem(item.ItemId) + ".pdf");
+                        // "1 - thesis.pdf": the student's own file name, numbered
+                        // so two files with one name cannot overwrite each other.
+                        // Always .pdf - the backend converts every upload to PDF.
+                        var destination = Path.Combine(
+                            folder, $"{position[item.ItemId]} - {ReadableFileStem(item.FileName, item.ItemId)}.pdf");
                         File.Move(scratch, destination, overwrite: true);
 
                         ctx.Db.UpsertHeldFile(
@@ -1068,37 +1178,13 @@ public static class JobPipeline
             ctx.Logger.LogInformation(
                 "order_files_held order={OrderId} files={Count}", orderId, fetches.Count);
 
-            // Tell the backend the files are here. This is what lights "Order
-            // accepted" on the student's timeline.
-            //
-            // Sent only now, after every fetch has completed and each file has
-            // been moved into the held store - not when the download started.
-            // The whole meaning of the signal is that this shop's machine is
-            // holding the documents, so a student who walks in can scan and
-            // print with no network in the way; reporting it any earlier would
-            // promise something that is not true yet.
-            //
-            // Nothing to say when there was nothing to fetch: an order whose
-            // items all failed to match a download URL has cached no files, and
-            // claiming otherwise would be worse than staying quiet.
-            //
-            // Best-effort and idempotent, like the rest of the prefetch. The
-            // backend takes the first report and ignores later ones, so a retry
-            // after a restart is free, and a failure here costs the timeline
-            // row rather than the files.
-            if (fetches.Count > 0)
+            // Every file is on disk: tell the backend. This is the report that
+            // moves the student's timeline from "Order placed" to "Order
+            // accepted" for an order accepted ahead of them - and it was never
+            // sent, so the timeline never moved.
+            if (fetches.Count > 0 && fetches.Count == detail.Items.Count)
             {
-                try
-                {
-                    await ctx.Api.ReportCachedAsync(ctx.Credential, jobId, cancellation).ConfigureAwait(false);
-                    ctx.Logger.LogInformation("order_files_cached_reported order={OrderId} job={JobId}", orderId, jobId);
-                }
-                catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
-                catch (Exception exc)
-                {
-                    ctx.Logger.LogWarning(
-                        exc, "order_files_cached_report_failed order={OrderId} job={JobId}", orderId, jobId);
-                }
+                await ReportCachedAsync(ctx, jobId, orderId, cancellation).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) { /* shutting down */ }
@@ -1110,9 +1196,51 @@ public static class JobPipeline
         }
     }
 
-    /// <summary>This order's folder inside the held-files store.</summary>
-    internal static string OrderFolder(JobContext ctx, string orderId) =>
-        Path.Combine(ctx.FilesDir, SafeFileStem(orderId));
+    /// <summary>
+    /// This order's folder inside PrintlyFiles: the order's number, with the
+    /// start of its id alongside so two orders that share a number can never
+    /// share a folder.
+    /// </summary>
+    internal static string OrderFolder(JobContext ctx, string orderId, string? orderCode = null) =>
+        Path.Combine(ctx.FilesDir, string.IsNullOrWhiteSpace(orderCode)
+            ? SafeFileStem(orderId)
+            : $"{SafeFileStem(orderCode)} ({SafeFileStem(orderId)[..Math.Min(8, SafeFileStem(orderId).Length)]})");
+
+    /// <summary>A student's file name, without its extension, made safe for Windows.</summary>
+    internal static string ReadableFileStem(string? fileName, string fallback)
+    {
+        var stem = Path.GetFileNameWithoutExtension(fileName ?? "");
+        var invalid = Path.GetInvalidFileNameChars();
+        var cleaned = new string(stem.Select(c => invalid.Contains(c) ? '_' : c).ToArray()).Trim().TrimEnd('.');
+        if (cleaned.Length > 80) cleaned = cleaned[..80];
+        return cleaned.Length == 0 ? SafeFileStem(fallback) : cleaned;
+    }
+
+    /// <summary>Jobs whose files this process has already reported cached.</summary>
+    private static readonly ConcurrentDictionary<string, bool> CachedReported = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Tells the backend the order's files are on this disk, once per job per
+    /// run. Best effort: a failure is retried the next time the job is seen.
+    /// </summary>
+    internal static async Task ReportCachedAsync(JobContext ctx, string jobId, string orderId, CancellationToken cancellation)
+    {
+        if (!CachedReported.TryAdd(jobId, true)) return;
+        try
+        {
+            await ctx.Api.ReportCachedAsync(ctx.Credential, jobId, cancellation).ConfigureAwait(false);
+            ctx.Logger.LogInformation("order_files_cached_reported job={JobId} order={OrderId}", jobId, orderId);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            CachedReported.TryRemove(jobId, out _);
+        }
+        catch (Exception exc)
+        {
+            CachedReported.TryRemove(jobId, out _);
+            ctx.Logger.LogWarning(exc, "order_files_cached_report_failed job={JobId}", jobId);
+        }
+    }
 
     /// <summary>
     /// An id reduced to something safe to put in a path.
@@ -1138,13 +1266,38 @@ public static class JobPipeline
         if (string.IsNullOrEmpty(ctx.FilesDir)) return;
         try
         {
-            ctx.Db.DeleteHeldFiles(orderId);
-            var folder = OrderFolder(ctx, orderId);
-            if (Directory.Exists(folder)) Directory.Delete(folder, recursive: true);
+            DeleteHeldOrder(ctx.Db, ctx.FilesDir, orderId);
         }
         catch (Exception exc)
         {
             ctx.Logger.LogWarning(exc, "held_files_release_failed order={OrderId}", orderId);
+        }
+    }
+
+    /// <summary>
+    /// Removes an order's held files: every folder its rows point into (named
+    /// by order number now, by id before PrintlyFiles), then the rows.
+    /// </summary>
+    internal static void DeleteHeldOrder(Database db, string filesDir, string orderId)
+    {
+        var folders = db.HeldFilesForOrder(orderId)
+            .Select(row => Path.GetDirectoryName(row.LocalPath))
+            .Where(dir => !string.IsNullOrEmpty(dir))
+            .Append(Path.Combine(filesDir, SafeFileStem(orderId)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        db.DeleteHeldFiles(orderId);
+        foreach (var folder in folders)
+        {
+            // Only ever a folder inside a held-files store, never whatever a row
+            // happened to point at.
+            var parent = Path.GetDirectoryName(folder!);
+            if (Directory.Exists(folder)
+                && (string.Equals(parent, Path.GetFullPath(filesDir).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)
+                    || Path.GetFileName(parent) is "files"))
+            {
+                Directory.Delete(folder!, recursive: true);
+            }
         }
     }
 
@@ -1282,104 +1435,141 @@ public static class JobPipeline
     /// the enclosing <c>withContext(Dispatchers.IO)</c> was for.
     /// </para>
     /// </summary>
-    private static List<(string PrinterName, string JobNameToken)> SelectAndPrint(
+    private static PrintAttempt SelectAndPrint(
         JobContext ctx,
         PrintJobDetail detail,
         IReadOnlyDictionary<string, string> downloaded,
         IReadOnlyList<LocalPrinter> printers,
         Action<string> onAboutToPrint)
     {
-        var submissions = new List<(string PrinterName, string JobNameToken)>();
+        var attempt = new PrintAttempt();
         // Fully qualified: System.Drawing.Printing carries a PaperSize of its own
-        // that means something different from the order's, and importing the
-        // namespace here to reach one static property would put that name in
-        // scope alongside PrintlyAgent.Models.PaperSize. PrintSubmission.cs keeps
-        // the two apart with an explicit alias for the same reason.
+        // that means something different from the order's.
         var installed = new HashSet<string>(
             System.Drawing.Printing.PrinterSettings.InstalledPrinters.Cast<string>(),
             StringComparer.OrdinalIgnoreCase);
+        var routing = PrinterRoutingStore.Read(ctx.Db);
 
-        // Two passes, and the split is the point.
+        // Two passes, still: every file is matched to a printer before anything
+        // goes to a driver, so what cannot print is known up front.
         //
-        // Every printer is chosen and checked for *every* item before anything
-        // goes to a driver. Interleaved - choose for item, print item, choose
-        // for the next - a two-item order whose second item had no printer that
-        // could take it printed the first and then reported the job FAILED,
-        // which the shop reads as "print it again". Pages were already in the
-        // tray.
-        //
-        // The document itself is deliberately not examined in either pass: it
-        // is sent to the printer exactly as downloaded.
+        // What changed is what happens to a file that has no printer. It used to
+        // fail the whole order before anything printed - one colour file with
+        // the colour printer switched off meant the black-and-white pages stayed
+        // unprinted too, with the student at the counter. Now every file that
+        // can print does, and the ones that cannot are recorded with the reason,
+        // so the shop prints just those once the printer is back.
         var planned = new List<(PrintJobItem Item, string DocumentPath, LocalPrinter Printer)>();
         foreach (var item in detail.Items)
         {
-            // Taken as it arrived. The document is not opened, measured or
-            // checked for being a readable PDF before it goes to the driver -
-            // whatever was downloaded is what gets printed.
-            var documentPath = downloaded[item.ItemId];
-            var selection = PrinterSelector.SelectPrinter(item, printers, PrinterRoutingStore.Read(ctx.Db));
-            var printer = selection.Printer
-                ?? throw new NoCompatiblePrinterException(
-                    $"no compatible printer for item {item.ItemId}: {selection.Reason}");
+            if (!downloaded.TryGetValue(item.ItemId, out var documentPath))
+            {
+                attempt.Failed.Add(new ItemFailure(item, "The file could not be downloaded.", null, MayHavePrinted: false));
+                continue;
+            }
+            var selection = PrinterSelector.SelectPrinter(item, printers, routing);
+            if (selection.Printer is not { } printer)
+            {
+                attempt.Failed.Add(new ItemFailure(item, NoPrinterReason(item, routing.For(item)), null, MayHavePrinted: false));
+                continue;
+            }
             if (!installed.Contains(printer.WindowsPrinterName))
             {
-                throw new NoCompatiblePrinterException(
-                    $"printer {printer.WindowsPrinterName} not found in the Windows printer registry");
+                attempt.Failed.Add(new ItemFailure(
+                    item, $"{printer.WindowsPrinterName} is no longer installed on this computer.",
+                    printer.WindowsPrinterName, MayHavePrinted: false));
+                continue;
             }
             planned.Add((item, documentPath, printer));
         }
 
-        // Checked here rather than after the submit loop, where it used to be:
-        // an empty job is not something to discover once printing is over.
-        if (planned.Count == 0) throw new NoCompatiblePrinterException("job had no items");
-
-        // From here paper can move, and nothing below may be reported as FAILED.
         foreach (var (item, documentPath, printer) in planned)
         {
-            var options = new PrintOptions(
-                item.ColorMode, item.DuplexMode, item.PaperSize, item.Copies, item.PageRange);
-            if (submissions.Count == 0) onAboutToPrint(printer.WindowsPrinterName);
-            var jobNameToken = PrintSubmission.PrintPdf(
-                printer.WindowsPrinterName, documentPath, options, ctx.Logger);
-            submissions.Add((printer.WindowsPrinterName, jobNameToken));
+            if (attempt.Submitted.Count == 0) onAboutToPrint(printer.WindowsPrinterName);
+            try
+            {
+                var jobNameToken = PrintSubmission.PrintPdf(
+                    printer.WindowsPrinterName, documentPath, OptionsFor(item), ctx.Logger);
+                attempt.Submitted.Add(new ItemSubmission(item, printer.WindowsPrinterName, jobNameToken));
+            }
+            catch (PrintSubmissionError exc)
+            {
+                ctx.Logger.LogWarning(exc, "print_item_failed item={ItemId} printer={Printer}", item.ItemId, printer.WindowsPrinterName);
+                attempt.Failed.Add(new ItemFailure(
+                    item, Reason(exc, "the printer refused it"), printer.WindowsPrinterName, MayHavePrinted: false));
+            }
+            catch (PrintSubmissionStalled exc)
+            {
+                // The driver took it and stopped partway: pages may be out.
+                attempt.Failed.Add(new ItemFailure(
+                    item, Reason(exc, "the printer stopped responding"), printer.WindowsPrinterName, MayHavePrinted: true));
+            }
         }
 
-        return submissions;
+        return attempt;
+    }
+
+    /// <summary>The print settings a file was ordered with.</summary>
+    internal static PrintOptions OptionsFor(PrintJobItem item) =>
+        new(item.ColorMode, item.DuplexMode, item.PaperSize, item.Copies, item.PageRange, item.Orientation);
+
+    /// <summary>Why no printer could take this file, in words the counter can act on.</summary>
+    internal static string NoPrinterReason(PrintJobItem item, string? namedPrinter = null)
+    {
+        var what = item.ColorMode == ColorMode.COLOR ? "colour printer" : "printer";
+        var extra = item.DuplexMode == DuplexMode.DOUBLE_SIDED ? ", double-sided" : "";
+        // The shop chose a machine for this kind of file, so name it: "switch
+        // on the Canon" is something to do, "no printer" is not.
+        if (namedPrinter is not null)
+        {
+            var mode = item.ColorMode == ColorMode.COLOR ? "colour" : "black-and-white";
+            return $"The {mode} printer ({namedPrinter}) is not connected or not ready. " +
+                   "Switch it on, then print this file.";
+        }
+        return $"No {what} is connected and ready for {item.PaperSize}{extra}. " +
+               "Switch it on or set one on the Printers page, then print this file.";
+    }
+
+    internal sealed record ItemSubmission(PrintJobItem Item, string PrinterName, string JobNameToken);
+
+    internal sealed record ItemFailure(PrintJobItem Item, string Reason, string? PrinterName, bool MayHavePrinted);
+
+    internal sealed class PrintAttempt
+    {
+        public List<ItemSubmission> Submitted { get; } = new();
+        public List<ItemFailure> Failed { get; } = new();
     }
 
     /// <summary>
-    /// Any FAILED short-circuits immediately; COMPLETED only if every item
-    /// resolved COMPLETED; UNKNOWN if any item's outcome could not be confirmed.
+    /// The spooler's answer for each file that was sent, in the order sent.
     ///
-    /// <para>
+    /// Every file is asked about, even after one has failed: each answer is
+    /// what that file's row on the shop's screen says, and stopping at the first
+    /// failure left the rest of an order unaccounted for.
+    ///
     /// <paramref name="onCondition"/> fires while a job is stuck on something a
     /// person can fix, so the shop is told "out of paper" as it happens rather
     /// than after the timeout.
-    /// </para>
     /// </summary>
-    private static async Task<SpoolerOutcome> PollAllOutcomesAsync(
-        IReadOnlyList<(string PrinterName, string JobNameToken)> submissions,
+    private static async Task<List<SpoolerOutcome>> PollEachOutcomeAsync(
+        IReadOnlyList<ItemSubmission> submissions,
         double stallSeconds,
         Action<PrinterCondition?> onCondition,
         ILogger log,
         CancellationToken cancellation)
     {
-        var worst = new SpoolerOutcome(PrintOutcome.COMPLETED);
-        foreach (var (printerName, jobNameToken) in submissions)
+        var results = new List<SpoolerOutcome>(submissions.Count);
+        foreach (var submission in submissions)
         {
-            var result = await SpoolerOutcomePoller.PollJobOutcomeAsync(
-                printerName,
-                jobNameToken,
+            results.Add(await SpoolerOutcomePoller.PollJobOutcomeAsync(
+                submission.PrinterName,
+                submission.JobNameToken,
                 stallSeconds,
                 onCondition: onCondition,
                 log: log,
-                cancellation: cancellation).ConfigureAwait(false);
-            if (result.Outcome == PrintOutcome.FAILED) return result;
-            // Keep the condition with the UNKNOWN it belongs to - it is the only
-            // thing that tells a human what to go and fix.
-            if (result.Outcome == PrintOutcome.UNKNOWN) worst = result;
+                cancellation: cancellation).ConfigureAwait(false));
         }
-        return worst;
+        return results;
     }
 
     private static void Transition(JobContext ctx, string jobId, string next, string? printerWindowsName = null)

@@ -35,6 +35,9 @@ public static class PrintToFile
         "nitro pdf",
         "foxit reader pdf printer",
         "microsoft shared fax driver",
+        // Windows' own "Fax" queue, and the fax queue an MFP installs beside
+        // its print queue ("... (Fax)", "... series Fax"). Never paper.
+        "fax",
     };
 
     public static bool IsPrintToFileDriver(string printerName)

@@ -45,6 +45,52 @@ public class SpoolerOutcomePollerTests
             deviceConditionLookup: _ => null,
             onCondition: onCondition);
 
+    [Fact(DisplayName = "a job stuck on an unreachable printer is withdrawn and reported not printed")]
+    public async Task AJobStuckOnAnUnreachablePrinterIsWithdrawn()
+    {
+        var withdrawn = 0;
+        var result = await SpoolerOutcomePoller.PollJobOutcomeAsync(
+            "Printer", "job-1", stallSeconds: 60, pollIntervalSeconds: 0.0,
+            statusLookup: (_, _) => InQueue(PrintingBit),
+            deviceConditionLookup: _ => PrinterCondition.NOT_REACHABLE,
+            unreachableSeconds: 0.05,
+            cancelJob: (_, _) => { withdrawn++; return true; });
+
+        Assert.Equal(PrintOutcome.FAILED, result.Outcome);
+        Assert.Equal(PrinterCondition.NOT_REACHABLE, result.Condition);
+        Assert.Equal(1, withdrawn);
+    }
+
+    [Fact(DisplayName = "an unreachable job that cannot be withdrawn stays unknown")]
+    public async Task AnUnreachableJobThatCannotBeWithdrawnStaysUnknown()
+    {
+        // Still queued, so it may yet print - never FAILED on a guess.
+        var result = await SpoolerOutcomePoller.PollJobOutcomeAsync(
+            "Printer", "job-1", stallSeconds: 60, pollIntervalSeconds: 0.0,
+            statusLookup: (_, _) => InQueue(OfflineBit),
+            deviceConditionLookup: _ => null,
+            unreachableSeconds: 0.05,
+            cancelJob: (_, _) => false);
+
+        Assert.Equal(PrintOutcome.UNKNOWN, result.Outcome);
+        Assert.Equal(PrinterCondition.OFFLINE, result.Condition);
+    }
+
+    [Fact(DisplayName = "an unreachable printer that has already printed pages is not withdrawn")]
+    public async Task AnUnreachablePrinterMidJobIsNotWithdrawn()
+    {
+        var withdrawn = 0;
+        var result = await SpoolerOutcomePoller.PollJobOutcomeAsync(
+            "Printer", "job-1", stallSeconds: 0.3, pollIntervalSeconds: 0.0,
+            statusLookup: (_, _) => new SpoolerOutcomePoller.JobStatus(OfflineBit, true, PagesPrinted: 3),
+            deviceConditionLookup: _ => null,
+            unreachableSeconds: 0.05,
+            cancelJob: (_, _) => { withdrawn++; return true; });
+
+        Assert.Equal(PrintOutcome.UNKNOWN, result.Outcome);
+        Assert.Equal(0, withdrawn);
+    }
+
     [Fact(DisplayName = "printed bit is completed")]
     public async Task PrintedBitIsCompleted()
     {

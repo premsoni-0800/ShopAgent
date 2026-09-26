@@ -10,6 +10,7 @@ using PrintlyAgent.Models;
 // imports, so the bare name always means the order's size and the driver's is
 // spelled out in full wherever it appears.
 using PaperSize = PrintlyAgent.Models.PaperSize;
+using Orientation = PrintlyAgent.Models.Orientation;
 
 namespace PrintlyAgent.Printing;
 
@@ -19,7 +20,8 @@ public sealed record PrintOptions(
     PaperSize PaperSize,
     int Copies,
     /// <summary>1-based, e.g. "1-5,8"; null means every page.</summary>
-    string? PageRange);
+    string? PageRange,
+    Orientation Orientation = Orientation.PORTRAIT);
 
 public sealed class PrintSubmissionError : Exception
 {
@@ -135,8 +137,15 @@ public static class PrintSubmission
             // cannot do what was asked will say so; one that was never asked
             // quietly does something else.
             document.DefaultPageSettings.Color = options.ColorMode == ColorMode.COLOR;
+            // The orientation the student chose. It was carried all the way here
+            // on every job and never applied, so a landscape order came out
+            // portrait. Landscape pages bind on the short edge when printed
+            // double-sided, the same as any viewer's "flip on short edge".
+            var landscape = options.Orientation == Orientation.LANDSCAPE;
+            document.DefaultPageSettings.Landscape = landscape;
             document.PrinterSettings.Duplex =
-                options.DuplexMode == DuplexMode.DOUBLE_SIDED ? Duplex.Vertical : Duplex.Simplex;
+                options.DuplexMode != DuplexMode.DOUBLE_SIDED ? Duplex.Simplex
+                : landscape ? Duplex.Horizontal : Duplex.Vertical;
 
             if (PaperSizeToKind.TryGetValue(options.PaperSize, out var kind))
             {
@@ -182,14 +191,7 @@ public static class PrintSubmission
                 var pageNumber = pages[pageIndex]; // 1-based
                 using var image = (Image)renderer.RenderPage(pageNumber - 1).Clone();
 
-                var bounds = args.MarginBounds;
-                // Uniform scale - fit-to-page without distorting aspect ratio,
-                // matching a normal PDF-to-printer viewer's default rather than
-                // stretching the image.
-                var scale = Math.Min((double)bounds.Width / image.Width, (double)bounds.Height / image.Height);
-                var width = (int)(image.Width * scale);
-                var height = (int)(image.Height * scale);
-                args.Graphics!.DrawImage(image, bounds.Left, bounds.Top, width, height);
+                PageLayout.DrawOnSheet(args, image, PdfPageRenderer.RenderDpi);
 
                 pageIndex++;
                 args.HasMorePages = pageIndex < pages.Count;

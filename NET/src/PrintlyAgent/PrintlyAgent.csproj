@@ -52,10 +52,10 @@
       it is run during development.
     -->
     <OutputType>WinExe</OutputType>
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
-    <InformationalVersion>1.0.0</InformationalVersion>
+    <Version>1.0.9</Version>
+    <AssemblyVersion>1.0.9.0</AssemblyVersion>
+    <FileVersion>1.0.9.0</FileVersion>
+    <InformationalVersion>1.0.9</InformationalVersion>
     <Product>Printly Print Agent</Product>
     <Company>Printly</Company>
     <Copyright>Copyright © Printly</Copyright>
@@ -107,32 +107,30 @@
       they are built by the dashboard's own toolchain, and a second copy in this
       tree would be one more thing to forget to rebuild. The same bundle the
       Kotlin app serves is the bundle this one serves.
+
+      Where this folder stands alone (no Kotlin project around it), the copy in
+      ..\..\webcontent is used instead. Without either, the build succeeds and
+      the app 404s on its own start page, so the build refuses instead.
     -->
-    <!--
-      The two web bundles the app serves, vendored into this repository.
-
-      They are checked in, and that is the point. The whole interface is these
-      bundles rendered in the WebView2 control, and they used to be linked from
-      outside the tree - the dashboard from PrintlyPartnerWeb's Vite output, the
-      agent-setup page from a Kotlin project's resources. Both of those are
-      correct only on a machine that happens to have those repositories sitting
-      beside this one, and a glob that matches nothing does not fail: MSBuild
-      resolves an empty Content list and the build succeeds having copied no UI
-      at all. Clone this repository on its own and you got an application whose
-      window had nothing to load, with a green build and no error to explain it.
-
-      So the bundles live here now, and a clone is enough to build and run.
-
-      To take a new dashboard build, copy PrintlyPartnerWeb/dist over
-      webcontent/dashboard and commit the result - the same act as any other
-      vendored dependency, and visible in the diff rather than dependent on what
-      is next to the checkout. Drop the superseded assets/index-*.js and .css
-      while doing it; only what index.html names is served.
-    -->
-    <Content Include="webcontent\**\*">
+    <Content Include="$(WebContentRoot)dashboard\**\*">
+      <Link>webcontent\dashboard\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(WebContentRoot)webui\**\*">
+      <Link>webcontent\webui\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
+
+  <PropertyGroup>
+    <WebContentRoot Condition="Exists('..\..\..\src\main\resources\dashboard\index.html')">..\..\..\src\main\resources\</WebContentRoot>
+    <WebContentRoot Condition="'$(WebContentRoot)' == ''">..\..\webcontent\</WebContentRoot>
+  </PropertyGroup>
+
+  <Target Name="RequireWebContent" BeforeTargets="Build">
+    <Error Condition="!Exists('$(WebContentRoot)dashboard\index.html')"
+           Text="No dashboard bundle at $(WebContentRoot)dashboard - the app would open to a 404. Build PrintlyPartnerWeb and copy its dist into webcontent\dashboard." />
+  </Target>
 
 
   <ItemGroup>

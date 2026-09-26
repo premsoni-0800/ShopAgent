@@ -53,6 +53,11 @@ public sealed class AgentCore : IAsyncDisposable
     private static readonly TimeSpan ScheduledJobCheckInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan PrinterSyncInterval = TimeSpan.FromSeconds(120);
 
+    // The server's column limits for a reported printer (AgentPrinter in the
+    // backend's PrintAgentDtos.kt).
+    private const int MaxWindowsPrinterName = 260;
+    private const int MaxPrinterDisplayName = 120;
+
     private readonly ILogger _log;
     private readonly ILoggerFactory _loggerFactory;
 
@@ -209,9 +214,7 @@ public sealed class AgentCore : IAsyncDisposable
         {
             try
             {
-                db.DeleteHeldFiles(orderId);
-                var folder = Path.Combine(settings.FilesDir, JobPipeline.SafeFileStem(orderId));
-                if (Directory.Exists(folder)) Directory.Delete(folder, recursive: true);
+                JobPipeline.DeleteHeldOrder(db, settings.FilesDir, orderId);
                 removed++;
             }
             catch (Exception exc)
@@ -225,50 +228,6 @@ public sealed class AgentCore : IAsyncDisposable
     }
 
     // --- lifecycle -----------------------------------------------------------
-
-    /// <summary>
-    /// Pairs this machine when it is signed in but has no device credential.
-    ///
-    /// Pairing used to happen in exactly one place: the dashboard reaching into
-    /// the JS bridge with <c>adopt_session</c> after a sign-in. That is one
-    /// call, on a page, that has to land - and when it does not, or when the
-    /// pair itself throws, the result is a machine that is signed in, looks
-    /// connected, serves the dashboard perfectly well, and never claims a job.
-    /// Nothing about the screen says so. It is the failure this shop actually
-    /// hit: a stored owner session, no agent credential, and not one line in
-    /// the log about either.
-    ///
-    /// So the state is repaired here instead, from what is on disk, every time
-    /// the app starts. A credential is minted from the session we already have
-    /// rather than waiting to be asked. Signing in still pairs as before - this
-    /// only catches the case where that did not take.
-    ///
-    /// Best-effort by design: a failure leaves the app exactly as it was, still
-    /// signed in and still serving the dashboard, and is logged rather than
-    /// shown. The next launch tries again.
-    /// </summary>
-    public async Task EnsurePairedIfSignedInAsync()
-    {
-        if (_ownerSession is null || _agentCredential is not null) return;
-
-        try
-        {
-            _log.LogInformation("pairing_repair_starting shopId={ShopId}", _ownerSession.ShopId);
-            _agentCredential = await _auth.EnsurePairedAsync(Api, _ownerSession).ConfigureAwait(false);
-            Start();
-        }
-        catch (AnotherMachinePairedError exc)
-        {
-            // Another PC holds this shop's registration. Refusing is correct -
-            // two agents claiming the same jobs is worse than none - but it has
-            // to be visible, because the owner has to revoke the other one.
-            _log.LogWarning("pairing_repair_refused reason=ANOTHER_MACHINE_PAIRED {Message}", exc.Message);
-        }
-        catch (Exception exc)
-        {
-            _log.LogWarning(exc, "pairing_repair_failed");
-        }
-    }
 
     public void Start()
     {
@@ -370,20 +329,45 @@ public sealed class AgentCore : IAsyncDisposable
     /// that is a real conflict a person has to resolve, not something to paper
     /// over by quietly stealing the pairing from the PC that has the printers.
     /// </summary>
+    /// <param name="takeOver">
+    /// The owner chose to make this PC the shop's print agent, revoking the PC
+    /// that is online and holding it now.
+    /// </param>
     public async Task<OwnerSession> AdoptOwnerSessionAsync(
-        string accessToken, string refreshToken, string shopId, string? shopName)
+        string accessToken, string refreshToken, string shopId, string? shopName, bool takeOver = false)
     {
         var session = new OwnerSession(accessToken, refreshToken, shopId, shopName);
         CredentialStore.SaveOwnerSession(session);
-        return await AfterSignInAsync(session).ConfigureAwait(false);
+        return await AfterSignInAsync(session, takeOver).ConfigureAwait(false);
     }
 
-    private async Task<OwnerSession> AfterSignInAsync(OwnerSession session)
+    private async Task<OwnerSession> AfterSignInAsync(OwnerSession session, bool takeOver = false)
     {
         _ownerSession = session;
-        _agentCredential = await _auth.EnsurePairedAsync(Api, session).ConfigureAwait(false);
-        if (_loops.Count == 0) Start(); else RestartOrderEventsIfStopped();
+        _agentCredential = await _auth.EnsurePairedAsync(Api, session, takeOver: takeOver).ConfigureAwait(false);
+        if (_loops.Count == 0)
+        {
+            Start();
+        }
+        else
+        {
+            RestartOrderEventsIfStopped();
+            // A new pairing's printers are unknown to the server until the next
+            // sweep, which could be two minutes away - and until then the
+            // dashboard says "no printers" on a PC that has one plugged in.
+            SyncPrintersSoon();
+        }
         return session;
+    }
+
+    private readonly SemaphoreSlim _printerSyncNow = new(0, 1);
+    private string? _lastSyncedPrinters;
+
+    /// <summary>Wakes the printer sweep now rather than at its next interval.</summary>
+    private void SyncPrintersSoon()
+    {
+        try { _printerSyncNow.Release(); }
+        catch (SemaphoreFullException) { /* already due */ }
     }
 
     /// <summary>
@@ -531,69 +515,76 @@ public sealed class AgentCore : IAsyncDisposable
     /// </para>
     ///
     /// <para>
-    /// An order whose files are held but which the backend no longer lists is
-    /// left out entirely rather than shown with blanks: it has been cancelled,
-    /// or belongs to whoever had this machine before, and either way it is not
-    /// this shop's to hand over.
+    /// The files themselves decide what is listed - whatever is in PrintlyFiles
+    /// for this shop. They used to be filtered through the order list, which
+    /// now leaves out every order until its student scans: the Files page would
+    /// have been empty for exactly the orders it exists to show. Another shop's
+    /// files are still excluded (held_files carries the shop), and a cancelled
+    /// order's are swept with the rest after HeldFileRetentionDays.
     /// </para>
     /// </summary>
     public async Task<List<Dictionary<string, object?>>> HeldOrdersAsync()
     {
         var shopId = RequireSession().ShopId;
-        var held = Db.HeldFiles(shopId);
+        var held = Db.HeldFiles(shopId).Where(row => File.Exists(row.LocalPath)).ToList();
         if (held.Count == 0) return new List<Dictionary<string, object?>>();
 
-        var orders = await ListOrdersAsync().ConfigureAwait(false);
+        // What is in PrintlyFiles is the list - read from this machine, not
+        // filtered through the backend's order list. The counter's order list
+        // leaves out an order until its student scans, and these are exactly
+        // the orders that have not been scanned yet. The backend only adds the
+        // customer's name when it will say it.
         var byUuid = new Dictionary<string, Dictionary<string, object?>>(StringComparer.Ordinal);
-        foreach (var order in orders)
+        try
         {
-            if (order.TryGetValue("id", out var id) && id is not null) byUuid[id.ToString()!] = order;
+            foreach (var order in await ListOrdersAsync().ConfigureAwait(false))
+            {
+                if (order.TryGetValue("id", out var id) && id is not null) byUuid[id.ToString()!] = order;
+            }
+        }
+        catch (Exception exc)
+        {
+            _log.LogDebug(exc, "held_orders_enrich_failed");
         }
 
         return held
             .GroupBy(row => row.OrderId, StringComparer.Ordinal)
-            .Where(group => byUuid.ContainsKey(group.Key))
             .Select(group =>
             {
-                var order = byUuid[group.Key];
-                var customer = order.TryGetValue("customer", out var c)
+                byUuid.TryGetValue(group.Key, out var order);
+                var customer = order is not null && order.TryGetValue("customer", out var c)
                     ? c as IReadOnlyDictionary<string, object?>
                     : null;
+                var reference = Db.OrderReference(group.Key);
+                var first = group.First();
 
                 return new Dictionary<string, object?>
                 {
-                    // The order's real id, which every action is keyed on.
                     ["orderUuid"] = group.Key,
-                    // What the counter says out loud: the customer's mobile's
-                    // last four digits. Not unique - see the backend's
-                    // OrderIdFormat - which is why the name and full number
-                    // below are on the card beside it and not optional.
-                    ["orderId"] = order.GetValueOrDefault("orderId"),
+                    ["orderId"] = order?.GetValueOrDefault("orderId") ?? reference.OrderCode,
+                    ["jobId"] = reference.JobId,
                     ["customerName"] = customer?.GetValueOrDefault("name"),
                     ["customerPhone"] = customer?.GetValueOrDefault("phone"),
-                    ["customerUid"] = customer?.GetValueOrDefault("id"),
-                    ["totalPages"] = order.GetValueOrDefault("totalPages"),
-                    ["totalAmount"] = order.GetValueOrDefault("totalAmount"),
-                    ["status"] = order.GetValueOrDefault("status"),
-                    ["placedAt"] = order.GetValueOrDefault("placedAt"),
+                    ["totalPages"] = order?.GetValueOrDefault("totalPages"),
+                    ["status"] = order?.GetValueOrDefault("status"),
+                    ["folder"] = Path.GetDirectoryName(first.LocalPath),
                     ["heldAt"] = group.Min(row => row.ReceivedAt),
                     ["files"] = group
-                        .OrderBy(row => row.ReceivedAt, StringComparer.Ordinal)
+                        .OrderBy(row => row.LocalPath, StringComparer.OrdinalIgnoreCase)
                         .Select(row => new Dictionary<string, object?>
                         {
                             ["itemId"] = row.ItemId,
                             ["fileName"] = row.FileName,
+                            ["localName"] = Path.GetFileName(row.LocalPath),
                             ["bytes"] = row.Bytes,
                             // Served by this agent's own web server off the local
-                            // copy - see WebUiServer. A preview that went back to
-                            // the backend for a signed URL would be a network
-                            // round trip to show a file already on this disk.
+                            // copy - see WebUiServer.
                             ["previewUrl"] = $"/local/files/{Uri.EscapeDataString(row.OrderId)}/{Uri.EscapeDataString(row.ItemId)}",
                         })
                         .ToList(),
                 };
             })
-            .OrderBy(entry => entry["heldAt"] as string, StringComparer.Ordinal)
+            .OrderByDescending(entry => entry["heldAt"] as string, StringComparer.Ordinal)
             .ToList();
     }
 
@@ -614,6 +605,52 @@ public sealed class AgentCore : IAsyncDisposable
     /// it again is how one order prints twice.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// The owner pressed Print on this order: print it now, whether or not the
+    /// student has scanned at the counter.
+    ///
+    /// Scan-at-counter holds every job until the student is standing there, and
+    /// the owner's own Print button went through the same gate - it asked the
+    /// server for a job, the job arrived, and the agent parked it waiting for a
+    /// scan that the person at the printer had just made unnecessary. Nothing
+    /// printed and nothing said why. The owner pressing Print is the stronger
+    /// signal, so it opens the gate for this order.
+    ///
+    /// Covers both halves of the race with the job itself: a job already parked
+    /// here is started now, and one still on its way (Print has only just asked
+    /// the server for it) is let through when it arrives - see OnJobReference.
+    /// </summary>
+    public int ReleaseOrder(string orderUuid)
+    {
+        _releasedByOwner[orderUuid] = DateTime.UtcNow;
+        var started = PrintOrderNow(orderUuid);
+        _log.LogInformation("order_released_by_owner order={OrderId} started_now={Started}", orderUuid, started);
+
+        // A job recorded as held in the instant between the release and the
+        // look above would otherwise wait for the rotating recheck.
+        _ = Task.Run(async () =>
+        {
+            if (!await DelayAsync(TimeSpan.FromSeconds(4), _shutdown.Token).ConfigureAwait(false)) return;
+            try { PrintOrderNow(orderUuid); }
+            catch (Exception exc) { _log.LogWarning(exc, "order_release_retry_failed order={OrderId}", orderUuid); }
+        });
+        return started;
+    }
+
+    /// <summary>How long an owner's Print keeps an order's jobs free of the counter-scan gate.</summary>
+    private static readonly TimeSpan OwnerReleaseLifetime = TimeSpan.FromMinutes(30);
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _releasedByOwner =
+        new(StringComparer.Ordinal);
+
+    private bool ReleasedByOwner(string orderId)
+    {
+        if (!_releasedByOwner.TryGetValue(orderId, out var at)) return false;
+        if (DateTime.UtcNow - at < OwnerReleaseLifetime) return true;
+        _releasedByOwner.TryRemove(orderId, out _);
+        return false;
+    }
+
     public int PrintOrderNow(string orderUuid)
     {
         var credential = _agentCredential ?? throw new InvalidOperationException("This machine is not paired yet.");
@@ -628,7 +665,7 @@ public sealed class AgentCore : IAsyncDisposable
             Db.MarkPriority(row.JobId);
             if (_printQueue.Enqueue(
                     row.JobId, row.OrderCode, priority: true,
-                    () => JobPipeline.ProcessJobAsync(ctx, row.JobId, _shutdown.Token)))
+                    () => JobPipeline.ProcessJobAsync(ctx, row.JobId, _shutdown.Token, awaitOutcome: false)))
             {
                 started++;
                 _log.LogInformation(
@@ -641,13 +678,164 @@ public sealed class AgentCore : IAsyncDisposable
         return started;
     }
 
+    /// <summary>
+    /// What happened to each file of a job on this machine - the per-file list
+    /// under a job that needs attention.
+    /// </summary>
+    public List<Dictionary<string, object?>> JobItems(string jobId) =>
+        Db.ItemResults(jobId).Select(row => new Dictionary<string, object?>
+        {
+            ["itemId"] = row.ItemId,
+            ["fileName"] = row.FileName,
+            ["colorMode"] = row.ColorMode,
+            ["status"] = row.Status,
+            ["printerName"] = row.PrinterName,
+            ["reason"] = row.Reason,
+            ["updatedAt"] = row.UpdatedAt,
+        }).ToList();
+
+    /// <summary>
+    /// Prints one file of a job again, on its own - the Print button beside a
+    /// file that did not come out.
+    ///
+    /// The file is taken from this machine when it is still held (it is, for
+    /// any order not fully printed) and fetched otherwise. The printer is the
+    /// one asked for, or chosen exactly as the job would have chosen it. Once
+    /// every file of a job that was left for a person to check is on paper, the
+    /// job is closed as printed, so the order moves on without a second click.
+    /// </summary>
+    public async Task<Dictionary<string, object?>> PrintItemAsync(string jobId, string itemId, string? printerName)
+    {
+        var credential = _agentCredential ?? throw new InvalidOperationException("This computer is not connected to the shop yet.");
+        var job = Db.GetJob(jobId) ?? throw new InvalidOperationException("This computer has no record of that job.");
+        var ctx = JobContextFor(credential);
+        var ct = _shutdown.Token;
+
+        var detail = await Api.JobDetailAsync(credential, jobId, ct).ConfigureAwait(false);
+        var item = detail.Items.FirstOrDefault(i => i.ItemId == itemId)
+            ?? throw new InvalidOperationException("That file is no longer part of the order.");
+
+        var path = Db.HeldFilesForOrder(job.OrderId)
+            .FirstOrDefault(row => row.ItemId == itemId && File.Exists(row.LocalPath))?.LocalPath;
+        var scratch = false;
+        if (path is null)
+        {
+            var urls = await Api.DownloadUrlsAsync(credential, jobId, ct).ConfigureAwait(false);
+            var url = urls.Items.FirstOrDefault(u => u.DocumentId == item.DocumentId)
+                ?? throw new InvalidOperationException("The server did not give a download link for that file.");
+            path = await Documents.DownloadDocumentAsync(
+                Api.Http, url.Url, Settings.TempDir, Settings.DownloadTimeoutSeconds, ct).ConfigureAwait(false);
+            scratch = true;
+        }
+
+        try
+        {
+            LocalPrinter? printer;
+            var printers = await Task.Run(() => PrinterDiscovery.DiscoverPrinters(_log, askDrivers: true), ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(printerName))
+            {
+                printer = printers.FirstOrDefault(p =>
+                    string.Equals(p.WindowsPrinterName, printerName, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new InvalidOperationException($"{printerName} is not connected to this computer.");
+            }
+            else
+            {
+                var routing = PrinterRoutingStore.Read(Db);
+                printer = PrinterSelector.SelectPrinter(item, printers, routing).Printer;
+                if (printer is null)
+                {
+                    var reason = JobPipeline.NoPrinterReason(item, routing.For(item));
+                    Db.UpsertItemResult(jobId, itemId, job.OrderId, item.FileName, item.ColorMode.ToString(),
+                        JobPipeline.ITEM_FAILED, null, reason);
+                    OnJobProgress();
+                    return new Dictionary<string, object?> { ["ok"] = false, ["error"] = reason };
+                }
+            }
+
+            _log.LogInformation("print_item job={JobId} item={ItemId} printer={Printer}", jobId, itemId, printer.WindowsPrinterName);
+            var token = await Task.Run(
+                () => PrintSubmission.PrintPdf(printer.WindowsPrinterName, path, JobPipeline.OptionsFor(item), _log), ct)
+                .ConfigureAwait(false);
+            var outcome = await SpoolerOutcomePoller.PollJobOutcomeAsync(
+                printer.WindowsPrinterName, token, Settings.JobStallSeconds, log: _log, cancellation: ct).ConfigureAwait(false);
+
+            var status = outcome.Outcome switch
+            {
+                PrintOutcome.COMPLETED => JobPipeline.ITEM_PRINTED,
+                PrintOutcome.FAILED => JobPipeline.ITEM_FAILED,
+                _ => JobPipeline.ITEM_UNKNOWN,
+            };
+            var note = outcome.Outcome switch
+            {
+                PrintOutcome.COMPLETED => null,
+                PrintOutcome.FAILED => $"{printer.WindowsPrinterName} reported an error after accepting it.",
+                _ => outcome.Condition is { } c
+                    ? $"still waiting on {printer.WindowsPrinterName}: {c.Description()}"
+                    : $"sent to {printer.WindowsPrinterName}, but it never confirmed it finished",
+            };
+            Db.UpsertItemResult(jobId, itemId, job.OrderId, item.FileName, item.ColorMode.ToString(),
+                status, printer.WindowsPrinterName, note);
+
+            // Every file on paper: close the job as printed, so the order moves on.
+            var results = Db.ItemResults(jobId);
+            var allPrinted = detail.Items.All(i =>
+                results.Any(r => r.ItemId == i.ItemId && r.Status == JobPipeline.ITEM_PRINTED));
+            if (allPrinted && job.State == JobPipeline.UNKNOWN)
+            {
+                try
+                {
+                    await ResolvePrintJobAsync(jobId, success: true, note: "Every file printed from the per-file list.")
+                        .ConfigureAwait(false);
+                    JobPipeline.ReleaseHeldFiles(ctx, job.OrderId);
+                    _log.LogInformation("print_job_completed_by_items job={JobId}", jobId);
+                }
+                catch (Exception exc)
+                {
+                    _log.LogWarning(exc, "print_job_item_resolve_failed job={JobId}", jobId);
+                }
+            }
+
+            OnJobProgress();
+            return new Dictionary<string, object?>
+            {
+                ["ok"] = status == JobPipeline.ITEM_PRINTED,
+                ["status"] = status,
+                ["printerName"] = printer.WindowsPrinterName,
+                ["error"] = note,
+                ["jobDone"] = allPrinted,
+            };
+        }
+        catch (PrintSubmissionError exc)
+        {
+            Db.UpsertItemResult(jobId, itemId, job.OrderId, item.FileName, item.ColorMode.ToString(),
+                JobPipeline.ITEM_FAILED, printerName, exc.Message);
+            OnJobProgress();
+            return new Dictionary<string, object?> { ["ok"] = false, ["error"] = exc.Message };
+        }
+        finally
+        {
+            if (scratch)
+            {
+                try { File.Delete(path); } catch (Exception) { /* swept on next start */ }
+            }
+        }
+    }
+
     /// <summary>The printers on this PC, as the routing dropdowns need them.</summary>
     public async Task<List<Dictionary<string, object?>>> ListLocalPrintersAsync()
     {
-        var printers = await Task.Run(() => PrinterDiscovery.DiscoverPrinters(_log)).ConfigureAwait(false);
+        // askDrivers: this is the Printers page opening, and a printer plugged
+        // in a minute ago has to be on it - not two minutes from now when the
+        // cached list expires. It costs a fraction of a second, off the print
+        // path.
+        var printers = await Task.Run(() => PrinterDiscovery.DiscoverPrinters(_log, askDrivers: true)).ConfigureAwait(false);
         return printers.Select(p => new Dictionary<string, object?>
         {
             ["windowsPrinterName"] = p.WindowsPrinterName,
+            // Writes a file or sends a fax rather than putting paper in a tray.
+            // The page lists real printers only; the selector already passes
+            // these over whenever a real one exists.
+            ["virtual"] = PrintToFile.IsPrintToFileDriver(p.WindowsPrinterName),
             ["displayName"] = p.DisplayName,
             ["isSystemDefault"] = p.IsSystemDefault,
             ["status"] = p.Status.ToString(),
@@ -882,15 +1070,39 @@ public sealed class AgentCore : IAsyncDisposable
                     // also leaves the cache warm for the print path, which is
                     // where the cost would actually be felt.
                     var printers = PrinterDiscovery.DiscoverPrinters(_log, askDrivers: true);
-                    var request = new PrinterSyncRequest(printers.Select(p => new AgentPrinter(
+                    // The server validates the whole list at once - one name over
+                    // its limits refuses every printer in the sweep, and the shop
+                    // sees none. A long display name is shortened; a Windows name
+                    // longer than the server can store cannot be printed to by
+                    // that name anyway, so it is left out and said so.
+                    var reportable = printers.Where(p =>
+                    {
+                        if (p.WindowsPrinterName.Length is > 0 and <= MaxWindowsPrinterName) return true;
+                        _log.LogWarning("printer_not_reported name_length={Length} name={Name}",
+                            p.WindowsPrinterName.Length, p.WindowsPrinterName);
+                        return false;
+                    }).ToList();
+
+                    var request = new PrinterSyncRequest(reportable.Select(p => new AgentPrinter(
                         p.WindowsPrinterName,
-                        p.DisplayName,
+                        p.DisplayName.Length <= MaxPrinterDisplayName
+                            ? p.DisplayName
+                            : p.DisplayName[..MaxPrinterDisplayName],
                         p.ColorCapable,
                         p.DuplexCapable,
                         p.Sizes.ToList(),
                         p.Status)).ToList());
 
                     await Api.SyncPrintersAsync(credential, request, ct).ConfigureAwait(false);
+                    // Once per change, not per sweep: "which printers did the
+                    // server get" is the first question when a shop says none
+                    // are showing.
+                    var synced = string.Join(", ", request.Printers.Select(p => p.WindowsPrinterName));
+                    if (synced != _lastSyncedPrinters)
+                    {
+                        _log.LogInformation("printers_synced count={Count} names=[{Names}]", request.Printers.Count, synced);
+                        _lastSyncedPrinters = synced;
+                    }
 
                     foreach (var p in printers)
                     {
@@ -928,7 +1140,14 @@ public sealed class AgentCore : IAsyncDisposable
                 }
             }
 
-            if (!await DelayAsync(PrinterSyncInterval, ct).ConfigureAwait(false)) return;
+            try
+            {
+                await _printerSyncNow.WaitAsync(PrinterSyncInterval, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
         }
     }
 
@@ -1145,13 +1364,20 @@ public sealed class AgentCore : IAsyncDisposable
         _intake.Submit(jobId, async () =>
         {
             var ct = _shutdown.Token;
-            var lookup = await OrderScheduleLookupAsync(orderId, ct).ConfigureAwait(false);
+            // An order the owner has just pressed Print on is printed whatever
+            // the answer, so asking the server about its slot first was a round
+            // trip spent between the click and the paper.
+            var lookup = ReleasedByOwner(orderId)
+                ? ScheduleLookup.Unavailable.Instance
+                : await OrderScheduleLookupAsync(orderId, ct).ConfigureAwait(false);
 
             // Read off the same answer the schedule came from. The order lookup
             // is an HTTP call this path already makes, and OrderResponse has
             // carried inShopPriority all along - so knowing that a student is
             // standing at the counter costs nothing extra.
-            var priority = lookup is ScheduleLookup.Known { Priority: true };
+            // The owner pressed Print on it - see ReleaseOrder.
+            var released = ReleasedByOwner(orderId);
+            var priority = released || lookup is ScheduleLookup.Known { Priority: true };
 
             // The SSE push carries only a job id and an order uuid, so for most
             // jobs orderCode arrives null and the queue fell back to showing the
@@ -1160,7 +1386,7 @@ public sealed class AgentCore : IAsyncDisposable
             // so the real code is already in hand and costs nothing.
             orderCode ??= (lookup as ScheduleLookup.Known)?.OrderCode;
 
-            switch (Scheduling.PlanFor(lookup))
+            switch (released ? new SchedulePlan.PrintAt(null) : Scheduling.PlanFor(lookup))
             {
                 case SchedulePlan.PrintAt printAt:
                     JobPipeline.HandleJobReference(

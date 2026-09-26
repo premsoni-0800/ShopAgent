@@ -31,7 +31,7 @@ public sealed class ApiError : Exception
 /// print-agent device routes. Keeping them apart is not tidiness - sending an
 /// agent bearer at an owner route is a 401, and the reverse is worse.
 /// </summary>
-public sealed partial class PrintlyApiClient : IDisposable
+public sealed class PrintlyApiClient : IDisposable
 {
     public string BaseUrl { get; }
 
@@ -193,26 +193,19 @@ public sealed partial class PrintlyApiClient : IDisposable
                 new PrintJobStatusUpdateRequest(status, error, reasonCode, printerName),
                 AgentAuth(credential)), ct);
 
+    /// <summary>
+    /// The order's documents are on this machine's disk. Durable on the backend,
+    /// and what moves the student's timeline to "Order accepted" for an order
+    /// taken on before they arrive. Idempotent there: the first report wins.
+    /// </summary>
+    public Task ReportCachedAsync(AgentCredential credential, string jobId, CancellationToken ct = default) =>
+        SendAsync(Post(Url($"/api/v1/print-agent/jobs/{jobId}/cached"), null, AgentAuth(credential)), ct);
+
     public Task ReportProgressAsync(
         AgentCredential credential, string jobId, PrintJobProgressStage stage, CancellationToken ct = default) =>
         SendAsync(
             Post(Url($"/api/v1/print-agent/jobs/{jobId}/progress"),
                 new PrintJobProgressRequest(stage), AgentAuth(credential)), ct);
-
-    /// <summary>
-    /// The documents for this job are now on this agent's own disk.
-    ///
-    /// Durable, unlike <see cref="ReportProgressAsync"/>, which is a live trace
-    /// the backend never persists. This is what lights "Order accepted" on the
-    /// student's timeline for an order accepted before they arrived, so it must
-    /// be sent only once the files are written and validated - not when the
-    /// download starts. Idempotent: the first report wins and later ones change
-    /// nothing, which is what makes it safe to send again after a restart.
-    /// </summary>
-    public Task<PrintJobDetail> ReportCachedAsync(
-        AgentCredential credential, string jobId, CancellationToken ct = default) =>
-        SendAsync<PrintJobDetail>(
-            Post(Url($"/api/v1/print-agent/jobs/{jobId}/cached"), null, AgentAuth(credential)), ct);
 
     // -------------------------------------------------------------------------
 

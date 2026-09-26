@@ -144,13 +144,12 @@ public static class ManualPrint
             document.DocumentName = jobName;
 
             var pageIndex = 0;
+            // Same layout as an agent print, so a file printed by hand comes
+            // out the size it does from the queue - see PageLayout.
             document.PrintPage += (_, args) =>
             {
                 using var image = (System.Drawing.Image)renderer.RenderPage(pageIndex).Clone();
-                var bounds = args.MarginBounds;
-                var scale = Math.Min((double)bounds.Width / image.Width, (double)bounds.Height / image.Height);
-                args.Graphics!.DrawImage(
-                    image, bounds.Left, bounds.Top, (int)(image.Width * scale), (int)(image.Height * scale));
+                PageLayout.DrawOnSheet(args, image, PdfPageRenderer.RenderDpi);
                 pageIndex++;
                 args.HasMorePages = pageIndex < renderer.PageCount;
             };

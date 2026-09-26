@@ -17,12 +17,15 @@ public sealed class PasswordNotSetError : Exception
 }
 
 /// <summary>
-/// A different PC already holds this shop's one active agent slot - never
-/// silently taken over.
+/// A different PC already holds this shop's one active agent slot and is
+/// online right now - never silently taken over while it is.
 /// </summary>
 public sealed class AnotherMachinePairedError : Exception
 {
-    public AnotherMachinePairedError(string message) : base(message) { }
+    public AnotherMachinePairedError(string message, string holderName) : base(message) => HolderName = holderName;
+
+    /// <summary>The hostname of the PC that holds the registration.</summary>
+    public string HolderName { get; }
 }
 
 /// <summary>
@@ -153,8 +156,12 @@ public sealed class Auth
     /// code for the owner to copy between two apps, since this app is both the
     /// one minting the code and the one consuming it.
     /// </summary>
+    /// <param name="takeOver">
+    /// The owner has asked for this PC to become the shop's print agent even
+    /// though another PC is online and holding the registration.
+    /// </param>
     public async Task<AgentCredential> EnsurePairedAsync(
-        PrintlyApiClient api, OwnerSession session, CancellationToken ct = default)
+        PrintlyApiClient api, OwnerSession session, CancellationToken ct = default, bool takeOver = false)
     {
         var existing = CredentialStore.LoadAgentCredential();
         if (existing is not null
@@ -170,7 +177,7 @@ public sealed class Auth
         }
         catch (ApiError exc) when (exc.Code == "PRINT_AGENT_ALREADY_ACTIVE")
         {
-            await RevokeStaleRegistrationForThisMachineAsync(api, session, ct).ConfigureAwait(false);
+            await RevokeRegistrationBlockingThisMachineAsync(api, session, takeOver, ct).ConfigureAwait(false);
             return await PairAndExchangeAsync(api, session, ct).ConfigureAwait(false);
         }
     }
@@ -231,20 +238,22 @@ public sealed class Auth
     }
 
     /// <summary>
-    /// Clears a registration this same PC left behind - the backend allows one
-    /// ACTIVE agent per shop, so a local credential that has gone missing
-    /// (reinstall, cleared credential store, wiped profile) otherwise locks the
-    /// owner out of ever signing in here again: pairing refuses with
-    /// PRINT_AGENT_ALREADY_ACTIVE and no UI path exists to clear it.
+    /// Clears the registration standing in the way of pairing this PC - the
+    /// backend allows one ACTIVE agent per shop.
     ///
-    /// Only ever revokes a registration whose name matches this machine's own
-    /// hostname. A *different* PC holding the pairing is someone else's live
-    /// agent, and silently stealing it would take that shop's printing offline
-    /// with no warning - the backend's own "explicit revoke-then-pair, never a
-    /// silent swap" rule. That case is surfaced to the owner instead.
+    /// Revoked without asking when it is this PC's own (a reinstall or a wiped
+    /// credential store left it behind), or when it belongs to a PC that is
+    /// offline: that PC is not printing anything, and refusing here left the
+    /// owner signed in on a machine that looked fine and never received a job
+    /// or showed a printer - the dashboard had no way to say why.
+    ///
+    /// A different PC that is online right now is someone's live agent, and
+    /// taking it offline is the owner's call: that is surfaced to them, and
+    /// only revoked once they say so (takeOver). The revoked PC stops on its
+    /// next heartbeat and does not take the registration back by itself.
     /// </summary>
-    private async Task RevokeStaleRegistrationForThisMachineAsync(
-        PrintlyApiClient api, OwnerSession session, CancellationToken ct)
+    private async Task RevokeRegistrationBlockingThisMachineAsync(
+        PrintlyApiClient api, OwnerSession session, bool takeOver, CancellationToken ct)
     {
         var agents = await api.ListPrintAgentsAsync(session, ct).ConfigureAwait(false);
         var active = agents.FirstOrDefault(a => a.Status == "ACTIVE");
@@ -252,15 +261,18 @@ public sealed class Auth
         // is correct.
         if (active is null) return;
 
-        if (!string.Equals(active.Name, HostName(), StringComparison.OrdinalIgnoreCase))
+        var ours = string.Equals(active.Name, HostName(), StringComparison.OrdinalIgnoreCase);
+        if (!ours && active.Online && !takeOver)
         {
             throw new AnotherMachinePairedError(
-                $"\"{active.Name}\" is already this shop's print agent. Disconnect it there first, " +
-                "or revoke it from the shop dashboard, then sign in again here.");
+                $"\"{active.Name}\" is printing for this shop right now. Use this computer instead, " +
+                "or close Printly Partner there first.",
+                active.Name);
         }
 
         _log.LogInformation(
-            "revoking_stale_self_registration agentId={AgentId} name={Name}", active.Id, active.Name);
+            "revoking_blocking_registration agentId={AgentId} name={Name} ours={Ours} online={Online} takeOver={TakeOver}",
+            active.Id, active.Name, ours, active.Online, takeOver);
         await api.RevokePrintAgentAsync(session, active.Id, ct).ConfigureAwait(false);
     }
 

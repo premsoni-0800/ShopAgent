@@ -53,6 +53,9 @@ public sealed class JsBridge
         "print_document",
         "list_held_files",
         "print_order_now",
+        "release_order",
+        "job_items",
+        "print_item",
         "list_local_printers",
         "get_printer_routing",
         "set_printer_routing",
@@ -79,10 +82,11 @@ public sealed class JsBridge
         string Str(int i) => args[i].GetString() ?? "";
         string? StrOrNull(int i) => i < args.Count && args[i].ValueKind == JsonValueKind.String ? args[i].GetString() : null;
         bool Bool(int i) => args[i].ValueKind == JsonValueKind.True;
+        bool BoolOrFalse(int i) => i < args.Count && args[i].ValueKind == JsonValueKind.True;
 
-        return method switch
+        var result = method switch
         {
-            "adopt_session" => await AdoptSessionAsync(Str(0), Str(1), Str(2), StrOrNull(3)).ConfigureAwait(false),
+            "adopt_session" => await AdoptSessionAsync(Str(0), Str(1), Str(2), StrOrNull(3), BoolOrFalse(4)).ConfigureAwait(false),
             "sign_in_password" => await SignInPasswordAsync(Str(0), Str(1)).ConfigureAwait(false),
             "sign_in_otp" => await SignInOtpAsync(Str(0)).ConfigureAwait(false),
             "set_password" => await OkAsync(() => _core.SetPasswordAsync(Str(0))).ConfigureAwait(false),
@@ -97,12 +101,30 @@ public sealed class JsBridge
             "open_external" => OpenExternal(Str(0)),
             "print_document" => await ManualPrint.PrintWithDialogAsync(Str(0), StrOrNull(1), _log).ConfigureAwait(false),
             "list_held_files" => await ListHeldFilesAsync().ConfigureAwait(false),
+            "files_folder" => new Dictionary<string, object?> { ["ok"] = true, ["path"] = _core.Settings.FilesDir },
+            "open_files_folder" => OpenInExplorer(null, null),
+            "open_held_file" => OpenInExplorer(Str(0), Str(1)),
             "print_order_now" => await PrintOrderNowAsync(Str(0)).ConfigureAwait(false),
-            "list_local_printers" => ListLocalPrinters(),
+            "release_order" => await ReleaseOrderAsync(Str(0)).ConfigureAwait(false),
+            "job_items" => new Dictionary<string, object?> { ["ok"] = true, ["items"] = _core.JobItems(Str(0)) },
+            "print_item" => await PrintItemAsync(Str(0), Str(1), StrOrNull(2)).ConfigureAwait(false),
+            "list_local_printers" => await ListLocalPrinters().ConfigureAwait(false),
             "get_printer_routing" => GetPrinterRouting(),
             "set_printer_routing" => SetPrinterRouting(StrOrNull(0), StrOrNull(1)),
             _ => new Dictionary<string, object?> { ["ok"] = false, ["error"] = $"unknown bridge method: {method}" },
         };
+
+        // A handler that returns its Task instead of awaiting it would hand the
+        // page the Task object itself, which does not serialise - the call
+        // fails every time, silently. list_local_printers did exactly that, so
+        // the Printers page could never read this PC's printers. Awaited here so
+        // no arm can do it again.
+        if (result is Task pending)
+        {
+            await pending.ConfigureAwait(false);
+            result = pending.GetType().GetProperty("Result")?.GetValue(pending);
+        }
+        return result;
     }
 
     private object SignOut()
@@ -125,6 +147,36 @@ public sealed class JsBridge
     /// the page can say "nothing to print" instead of appearing to work and then
     /// leaving the counter waiting on a printer that was never going to run.
     /// </summary>
+    /// <summary>
+    /// The Print button on an order, inside the desktop app: print it now
+    /// rather than wait for the student to scan at the counter.
+    /// </summary>
+    private async Task<object> PrintItemAsync(string jobId, string itemId, string? printerName)
+    {
+        try
+        {
+            return await _core.PrintItemAsync(jobId, itemId, printerName).ConfigureAwait(false);
+        }
+        catch (Exception exc)
+        {
+            _log.LogWarning(exc, "print_item_failed job={JobId} item={ItemId}", jobId, itemId);
+            return Failure((exc as ApiError)?.Code, exc.Message);
+        }
+    }
+
+    private async Task<object> ReleaseOrderAsync(string orderUuid)
+    {
+        try
+        {
+            var started = await Task.Run(() => _core.ReleaseOrder(orderUuid)).ConfigureAwait(false);
+            return new Dictionary<string, object?> { ["ok"] = true, ["started"] = started };
+        }
+        catch (Exception exc)
+        {
+            return Failure((exc as ApiError)?.Code, exc.Message);
+        }
+    }
+
     private async Task<object> PrintOrderNowAsync(string orderUuid)
     {
         try
@@ -182,26 +234,28 @@ public sealed class JsBridge
     /// which PC currently holds the registration.
     /// </summary>
     private async Task<object> AdoptSessionAsync(
-        string accessToken, string refreshToken, string shopId, string? shopName)
+        string accessToken, string refreshToken, string shopId, string? shopName, bool takeOver)
     {
         try
         {
-            await _core.AdoptOwnerSessionAsync(accessToken, refreshToken, shopId, shopName).ConfigureAwait(false);
+            await _core.AdoptOwnerSessionAsync(accessToken, refreshToken, shopId, shopName, takeOver).ConfigureAwait(false);
             return new Dictionary<string, object?> { ["ok"] = true, ["status"] = _core.Status() };
         }
         catch (AnotherMachinePairedError exc)
         {
-            _log.LogWarning("adopt_session_failed reason=ANOTHER_MACHINE_PAIRED {Message}", exc.Message);
-            return Failure("ANOTHER_MACHINE_PAIRED", exc.Message);
+            _log.LogWarning("pairing_blocked holder={Holder}", exc.HolderName);
+            var failure = Failure("ANOTHER_MACHINE_PAIRED", exc.Message);
+            failure["holder"] = exc.HolderName;
+            return failure;
         }
         catch (ApiError exc)
         {
-            _log.LogWarning(exc, "adopt_session_failed code={Code}", exc.Code);
+            _log.LogWarning(exc, "pairing_failed code={Code}", exc.Code);
             return Failure(exc.Code, exc.Message);
         }
         catch (Exception exc)
         {
-            _log.LogWarning(exc, "adopt_session_failed");
+            _log.LogWarning(exc, "pairing_failed");
             return Failure(null, exc.Message);
         }
     }
@@ -250,6 +304,39 @@ public sealed class JsBridge
     /// the webview, and opening a file: or a custom scheme is a way to launch
     /// things on this machine rather than to open a document.
     /// </summary>
+    /// <summary>
+    /// Opens PrintlyFiles in Explorer, or one held file in its default viewer.
+    /// The file is looked up by order and item, never taken as a path from the
+    /// page - see AgentCore.HeldFilePath.
+    /// </summary>
+    private object OpenInExplorer(string? orderUuid, string? itemId)
+    {
+        try
+        {
+            string target;
+            if (orderUuid is null || itemId is null)
+            {
+                Directory.CreateDirectory(_core.Settings.FilesDir);
+                target = _core.Settings.FilesDir;
+            }
+            else
+            {
+                target = _core.HeldFilePath(orderUuid, itemId)
+                    ?? throw new FileNotFoundException("That file is no longer on this computer.");
+            }
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = target,
+                UseShellExecute = true,
+            });
+            return new Dictionary<string, object?> { ["ok"] = true };
+        }
+        catch (Exception exc)
+        {
+            return Failure(null, exc.Message);
+        }
+    }
+
     private object OpenExternal(string url)
     {
         try

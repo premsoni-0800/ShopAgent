@@ -71,6 +71,14 @@ if ($SkipPublish) {
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed ($LASTEXITCODE)" }
 }
 
+# The dashboard is served from webcontent beside the exe. Without it the MSI
+# builds and installs cleanly, and the app opens to "HTTP ERROR 404".
+foreach ($page in 'webcontent\dashboard\index.html', 'webcontent\webui\index.html') {
+    if (-not (Test-Path (Join-Path $publishDir $page))) {
+        throw "$publishDir has no $page - the installed app would open to a 404"
+    }
+}
+
 $fileCount = (Get-ChildItem $publishDir -Recurse -File).Count
 $sizeMb    = [math]::Round(((Get-ChildItem $publishDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
 Write-Host "  $fileCount files, $sizeMb MB"

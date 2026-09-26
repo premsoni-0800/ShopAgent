@@ -487,27 +487,6 @@ public sealed class WebUiServer : IDisposable
                 return;
             }
 
-            // The page went away mid-response, which is not a failure of
-            // anything.
-            //
-            // Error 1229 is HttpListener saying the client's connection no
-            // longer exists - the WebView navigated, the dashboard reloaded, or
-            // a fetch was aborted while the answer was still being written. It
-            // arrived as a warning with a full stack trace naming an order, so
-            // the log read as though proxying orders was broken, while the only
-            // thing that had happened was somebody clicking away from a screen.
-            // Nothing can be sent to a connection that is gone, so there is also
-            // no point falling through to the 502 below.
-            const int ClientConnectionGone = 1229;
-            var clientGone = exc is HttpListenerException { ErrorCode: ClientConnectionGone }
-                || exc is IOException { InnerException: HttpListenerException { ErrorCode: ClientConnectionGone } }
-                || exc is ObjectDisposedException;
-            if (clientGone)
-            {
-                _log.LogDebug("api_proxy_client_disconnected path={Path}", request.Url?.AbsolutePath);
-                return;
-            }
-
             var streaming = request.Url?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true;
             if (streaming) _log.LogDebug(exc, "api_proxy_stream_closed");
             else _log.LogWarning(exc, "api_proxy_failed path={Path}", request.Url?.AbsolutePath);

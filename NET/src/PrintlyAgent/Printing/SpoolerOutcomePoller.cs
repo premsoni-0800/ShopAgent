@@ -251,9 +251,12 @@ public static class SpoolerOutcomePoller
         Func<string, PrinterCondition?>? deviceConditionLookup = null,
         Action<PrinterCondition?>? onCondition = null,
         ILogger? log = null,
-        CancellationToken cancellation = default)
+        CancellationToken cancellation = default,
+        double unreachableSeconds = DefaultUnreachableSeconds,
+        Func<string, string, bool>? cancelJob = null)
     {
         var lookup = statusLookup ?? ((printer, token) => QueryJobStatus(printer, token, log));
+        var cancelQueued = cancelJob ?? ((printer, token) => CancelJob(printer, token, log));
         var deviceCondition = deviceConditionLookup ?? PrinterDiscovery.CurrentCondition;
         var report = onCondition ?? (_ => { });
 
@@ -264,6 +267,8 @@ public static class SpoolerOutcomePoller
         var detector = new StallDetector<object>((long)stallSeconds);
         var stallNanos = (long)(stallSeconds * 1_000_000_000L);
         long? unreadableSince = null;
+        long? unreachableSince = null;
+        var unreachableNanos = (long)(unreachableSeconds * 1_000_000_000L);
         var lastSeenStatus = 0;
         PrinterCondition? reportedCondition = null;
 
@@ -286,7 +291,15 @@ public static class SpoolerOutcomePoller
                 if (found)
                 {
                     lastSeenStatus = status.Value;
-                    if ((status.Value & FailureBits) != 0) return new SpoolerOutcome(PrintOutcome.FAILED);
+                    if ((status.Value & FailureBits) != 0)
+                    {
+                        // Reported as not printed, so it must not print later
+                        // either: a job left in an errored queue comes out the
+                        // moment the printer is fixed, on top of the reprint the
+                        // shop was just invited to make from the Errors page.
+                        cancelQueued(printerName, jobNameToken);
+                        return new SpoolerOutcome(PrintOutcome.FAILED);
+                    }
                     if ((status.Value & SuccessBits) != 0) return new SpoolerOutcome(PrintOutcome.COMPLETED);
 
                     // Stuck but not finished. Keep waiting - the job is still in the
@@ -305,6 +318,39 @@ public static class SpoolerOutcomePoller
                     {
                         reportedCondition = condition;
                         report(condition);
+                    }
+
+                    // A printer that is not there at all is different from one
+                    // that is out of paper. Somebody fixes paper in a minute; an
+                    // unplugged or switched-off machine can stay that way all
+                    // day, and waiting on it held the order on "Printing…" with
+                    // its other files already on paper and nothing telling the
+                    // counter to look. Nothing has come out, so the job is taken
+                    // back out of the queue and the file goes to the Errors page
+                    // as not printed, to be printed from there once it is back.
+                    var nowUnreachable = (condition is PrinterCondition.OFFLINE or PrinterCondition.NOT_REACHABLE)
+                                         && observation.PagesPrinted == 0;
+                    if (!nowUnreachable)
+                    {
+                        unreachableSince = null;
+                    }
+                    else
+                    {
+                        var at = (long)(Stopwatch.GetTimestamp() * nanosPerTick);
+                        unreachableSince ??= at;
+                        if (at - unreachableSince.Value >= unreachableNanos)
+                        {
+                            var withdrawn = cancelQueued(printerName, jobNameToken);
+                            if (log is not null)
+                            {
+                                log.LogWarning(
+                                    "spooler_printer_unreachable printer={Printer} condition={Condition} withdrawn={Withdrawn}",
+                                    printerName, condition, withdrawn);
+                            }
+                            // Withdrawn: certainly not printed. Not withdrawn: it
+                            // is still queued and may yet come out - unknown.
+                            return new SpoolerOutcome(withdrawn ? PrintOutcome.FAILED : PrintOutcome.UNKNOWN, condition);
+                        }
                     }
                 }
                 else
@@ -379,6 +425,59 @@ public static class SpoolerOutcomePoller
     /// long job from a stuck one: a 3,000-page document legitimately takes a
     /// while, but it climbs while it does. One that stops climbing has stopped.
     /// </summary>
+    /// <summary>
+    /// How long a job may sit, with nothing printed, on a printer Windows says is
+    /// offline or unreachable before the file is handed back to the shop.
+    /// Long enough for a printer that is just waking up; short enough that the
+    /// counter hears about it while the student is still standing there.
+    /// </summary>
+    public const double DefaultUnreachableSeconds = 45.0;
+
+    private const int JOB_CONTROL_DELETE = 5;
+
+    /// <summary>
+    /// Takes this agent's job back out of the printer's queue. True only when
+    /// the spooler confirmed it, or the job is already gone.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    internal static bool CancelJob(string printerName, string jobNameToken, ILogger? log = null)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        try
+        {
+            if (!OpenPrinterW(printerName, out var printerHandle, IntPtr.Zero)) return false;
+            try
+            {
+                var size = JobBufferSize(printerHandle);
+                if (size is null) return false;
+                if (size == 0) return true;
+
+                var needed = size.Value;
+                var buffer = Marshal.AllocHGlobal(needed);
+                try
+                {
+                    if (!EnumJobsW(printerHandle, 0, 999, 1, buffer, needed, out needed, out var returned)) return false;
+                    var match = FindJob(buffer, returned, jobNameToken);
+                    if (match is null) return true;
+                    return SetJobW(printerHandle, match.Value.JobId, 0, IntPtr.Zero, JOB_CONTROL_DELETE);
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buffer);
+                }
+            }
+            finally
+            {
+                ClosePrinter(printerHandle);
+            }
+        }
+        catch (Exception exc)
+        {
+            if (log is not null) log.LogWarning(exc, "spooler_job_cancel_failed printer={Printer}", printerName);
+            return false;
+        }
+    }
+
     public sealed record JobProgress(bool Found, int PagesPrinted);
 
     /// <summary>
@@ -592,6 +691,9 @@ public static class SpoolerOutcomePoller
 
     [DllImport("winspool.drv", SetLastError = true)]
     private static extern bool ClosePrinter(IntPtr hPrinter);
+
+    [DllImport("winspool.drv", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetJobW(IntPtr hPrinter, int jobId, int level, IntPtr pJob, int command);
 
     [DllImport("winspool.drv", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool EnumJobsW(

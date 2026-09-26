@@ -113,7 +113,14 @@ public static class SettingsLoader
         //
         // Deleted once the order prints, and swept if it never does. See
         // Documents.SweepAbandonedOrders.
-        var filesDir = Path.Combine(appDataDir, "files");
+        //
+        // A named folder in Documents - PrintlyFiles - rather than hidden in
+        // app data, so the counter can open it in Explorer and see exactly what
+        // this machine is holding; the Files page lists the same folder. One
+        // sub-folder per order, named by the order's number.
+        var filesDir = Environment.GetEnvironmentVariable("PRINTLY_FILES_DIR") is { Length: > 0 } overridden
+            ? overridden
+            : PrintlyFilesDir() ?? Path.Combine(appDataDir, "files");
 
         Directory.CreateDirectory(appDataDir);
         Directory.CreateDirectory(logDir);
@@ -135,6 +142,13 @@ public static class SettingsLoader
             // that prints nothing (0) or thrashes the temp dir (300).
             MaxConcurrentPrintJobs: ReadBoundedInt("PRINTLY_MAX_CONCURRENT_PRINT_JOBS", 1, 16, 1)
         );
+    }
+
+    /// <summary>Documents\PrintlyFiles, or null where there is no Documents folder.</summary>
+    private static string? PrintlyFilesDir()
+    {
+        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        return string.IsNullOrEmpty(documents) ? null : Path.Combine(documents, "PrintlyFiles");
     }
 
     private static int ReadBoundedInt(string name, int min, int max, int fallback)

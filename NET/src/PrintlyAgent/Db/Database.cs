@@ -54,6 +54,23 @@ public sealed record HeldFileRow(
 /// I/O - whereas the failure it prevents is printing a customer's document
 /// twice.
 /// </summary>
+/// <summary>
+/// What happened to one file of a print job on this machine. A job prints as
+/// a whole or not at all on the backend, so this is the only place that knows
+/// "two of these three came out" - which is what the shop needs in order to
+/// print just the one that did not.
+/// </summary>
+public sealed record JobItemResultRow(
+    string JobId,
+    string ItemId,
+    string OrderId,
+    string? FileName,
+    string? ColorMode,
+    string Status,
+    string? PrinterName,
+    string? Reason,
+    string UpdatedAt);
+
 public sealed class Database : IDisposable
 {
     private readonly object _lock = new();
@@ -140,6 +157,24 @@ public sealed class Database : IDisposable
             )
             """);
 
+        // One row per file of a job this machine tried to print: PRINTED,
+        // FAILED (nothing reached a printer) or UNKNOWN (sent, outcome not
+        // confirmed). Keyed like held_files so a reprint overwrites its row.
+        Execute("""
+            CREATE TABLE IF NOT EXISTS job_item_results (
+                job_id       TEXT NOT NULL,
+                item_id      TEXT NOT NULL,
+                order_id     TEXT NOT NULL,
+                file_name    TEXT,
+                color_mode   TEXT,
+                status       TEXT NOT NULL,
+                printer_name TEXT,
+                reason       TEXT,
+                updated_at   TEXT NOT NULL,
+                PRIMARY KEY (job_id, item_id)
+            )
+            """);
+
         // The Files screen lists one shop's waiting orders, newest first, on
         // every open and every agent push.
         Execute("CREATE INDEX IF NOT EXISTS ix_held_files_shop ON held_files(shop_id, received_at)");
@@ -219,6 +254,58 @@ public sealed class Database : IDisposable
         }
     }
 
+    // --- job_item_results ----------------------------------------------------
+
+    public void UpsertItemResult(
+        string jobId, string itemId, string orderId, string? fileName, string? colorMode,
+        string status, string? printerName, string? reason)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText =
+                "INSERT INTO job_item_results " +
+                "(job_id, item_id, order_id, file_name, color_mode, status, printer_name, reason, updated_at) " +
+                "VALUES ($jobId, $itemId, $orderId, $fileName, $colorMode, $status, $printer, $reason, $now) " +
+                "ON CONFLICT(job_id, item_id) DO UPDATE SET " +
+                "status = excluded.status, printer_name = excluded.printer_name, " +
+                "reason = excluded.reason, updated_at = excluded.updated_at, " +
+                "file_name = COALESCE(excluded.file_name, job_item_results.file_name), " +
+                "color_mode = COALESCE(excluded.color_mode, job_item_results.color_mode)";
+            command.Parameters.AddWithValue("$jobId", jobId);
+            command.Parameters.AddWithValue("$itemId", itemId);
+            command.Parameters.AddWithValue("$orderId", orderId);
+            command.Parameters.AddWithValue("$fileName", (object?)fileName ?? DBNull.Value);
+            command.Parameters.AddWithValue("$colorMode", (object?)colorMode ?? DBNull.Value);
+            command.Parameters.AddWithValue("$status", status);
+            command.Parameters.AddWithValue("$printer", (object?)printerName ?? DBNull.Value);
+            command.Parameters.AddWithValue("$reason", (object?)reason ?? DBNull.Value);
+            command.Parameters.AddWithValue("$now", NowIso());
+            command.ExecuteNonQuery();
+        }
+    }
+
+    public List<JobItemResultRow> ItemResults(string jobId)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "SELECT * FROM job_item_results WHERE job_id = $jobId ORDER BY rowid";
+            command.Parameters.AddWithValue("$jobId", jobId);
+            using var reader = command.ExecuteReader();
+            var rows = new List<JobItemResultRow>();
+            while (reader.Read())
+            {
+                string? Text(string column) =>
+                    reader.IsDBNull(reader.GetOrdinal(column)) ? null : reader.GetString(reader.GetOrdinal(column));
+                rows.Add(new JobItemResultRow(
+                    Text("job_id")!, Text("item_id")!, Text("order_id")!, Text("file_name"), Text("color_mode"),
+                    Text("status")!, Text("printer_name"), Text("reason"), Text("updated_at")!));
+            }
+            return rows;
+        }
+    }
+
     // --- held_files ----------------------------------------------------------
 
     /// <summary>
@@ -269,6 +356,21 @@ public sealed class Database : IDisposable
             command => command.Parameters.AddWithValue("$orderId", orderId));
 
     /// <summary>Whether anything is already held for this order.</summary>
+    /// <summary>The order's number and its newest job here, from the jobs this machine has been sent.</summary>
+    public (string? OrderCode, string? JobId) OrderReference(string orderId)
+    {
+        lock (_lock)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText =
+                "SELECT order_code, job_id FROM print_jobs WHERE order_id = $orderId ORDER BY received_at DESC LIMIT 1";
+            command.Parameters.AddWithValue("$orderId", orderId);
+            using var reader = command.ExecuteReader();
+            if (!reader.Read()) return (null, null);
+            return (reader.IsDBNull(0) ? null : reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1));
+        }
+    }
+
     public bool HasHeldFiles(string orderId)
     {
         lock (_lock)

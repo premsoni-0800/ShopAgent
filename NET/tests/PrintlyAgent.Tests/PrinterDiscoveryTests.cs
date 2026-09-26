@@ -91,6 +91,8 @@ public class PrintToFileDriverTests
             "Adobe PDF",
             "CutePDF Writer",
             "Foxit Reader PDF Printer",
+            "Fax",
+            "HP OfficeJet Pro 9010 series Fax",
         };
 
         foreach (var name in names)

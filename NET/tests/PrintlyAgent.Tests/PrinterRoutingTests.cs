@@ -108,6 +108,51 @@ public class PrinterRoutingTests
     }
 
     [Fact]
+    public void AColourFileNeverFallsBackOntoThePrinterNamedForBlackAndWhite()
+    {
+        // The mixed-order case: colour printer unplugged, mono laser whose
+        // driver will not say it is mono. The colour file must wait for its
+        // printer, not come out grey and be reported printed.
+        var printers = new[]
+        {
+            Printer("Colour Laser", status: PrinterReportedStatus.OFFLINE),
+            Printer("Mono Laser", isDefault: true, colour: null),
+        };
+        var routing = new PrinterRouting(Colour: "Colour Laser", BlackAndWhite: "Mono Laser");
+
+        var colour = PrinterSelector.SelectPrinter(Item(ColorMode.COLOR), printers, routing);
+        var mono = PrinterSelector.SelectPrinter(Item(ColorMode.BLACK_AND_WHITE), printers, routing);
+
+        Assert.Null(colour.Printer);
+        Assert.Equal("Mono Laser", mono.Printer?.WindowsPrinterName);
+    }
+
+    [Fact]
+    public void ABlackAndWhiteFileNeverFallsBackOntoThePrinterNamedForColour()
+    {
+        var printers = new[]
+        {
+            Printer("Colour Laser", isDefault: true),
+            Printer("Mono Laser", colour: false, status: PrinterReportedStatus.OFFLINE),
+        };
+        var routing = new PrinterRouting(Colour: "Colour Laser", BlackAndWhite: "Mono Laser");
+
+        var chosen = PrinterSelector.SelectPrinter(Item(ColorMode.BLACK_AND_WHITE), printers, routing);
+
+        Assert.Null(chosen.Printer);
+    }
+
+    [Fact]
+    public void OnePrinterNamedForBothModesStillTakesBoth()
+    {
+        var printers = new[] { Printer("Only One", isDefault: true) };
+        var routing = new PrinterRouting(Colour: "Only One", BlackAndWhite: "Only One");
+
+        Assert.Equal("Only One", PrinterSelector.SelectPrinter(Item(ColorMode.COLOR), printers, routing).Printer?.WindowsPrinterName);
+        Assert.Equal("Only One", PrinterSelector.SelectPrinter(Item(ColorMode.BLACK_AND_WHITE), printers, routing).Printer?.WindowsPrinterName);
+    }
+
+    [Fact]
     public void WithNoRoutingAtAllNothingAboutSelectionChanges()
     {
         var printers = new[] { Printer("Front Desk", isDefault: true), Printer("Colour Laser") };
