@@ -98,6 +98,7 @@ internal static class Program
         // that is sitting on this disk. The agent resolves it from its own
         // table, so the page never gets to name a path.
         server.HeldFileResolver = core.HeldFilePath;
+        server.HeldSettingsResolver = core.HeldFileSettings;
 
         var bridge = new JsBridge(loggerFactory.CreateLogger<JsBridge>(), core);
 

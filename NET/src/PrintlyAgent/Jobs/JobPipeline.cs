@@ -1202,7 +1202,8 @@ public static class JobPipeline
 
                         ctx.Db.UpsertHeldFile(
                             orderId, item.ItemId, ctx.Credential.ShopId, item.FileName,
-                            destination, new FileInfo(destination).Length);
+                            destination, new FileInfo(destination).Length,
+                            item.Orientation.ToString(), item.ColorMode.ToString(), item.PaperSize.ToString());
                     }
                     finally
                     {
@@ -1216,6 +1217,10 @@ public static class JobPipeline
             ctx.RaiseEvent();
             ctx.Logger.LogInformation(
                 "order_files_held order={OrderId} files={Count}", orderId, fetches.Count);
+
+            // The owner's preview, drawn now so opening the order is instant.
+            PreviewCache.WarmInBackground(ctx.Db.HeldFilesForOrder(orderId).Select(row =>
+                (row.LocalPath, row.Orientation, row.ColorMode, row.PaperSize)));
 
             // Every file is on disk: tell the backend. This is the report that
             // moves the student's timeline from "Order placed" to "Order

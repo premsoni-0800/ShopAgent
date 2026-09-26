@@ -192,6 +192,13 @@ public sealed class AgentCore : IAsyncDisposable
 
         var moved = MoveHeldFilesIntoPrintlyFiles(settings, Db, _log);
         if (moved > 0) _log.LogInformation("held_files_moved_into_printlyfiles count={Count}", moved);
+
+        // Previews of every held file, drawn now rather than on the first click.
+        PreviewCache.Root = Path.Combine(settings.AppDataDir, "preview-cache");
+        PreviewCache.Log = _log;
+        PreviewCache.Sweep();
+        PreviewCache.WarmInBackground(Db.AllHeldFiles().Select(row =>
+            (row.LocalPath, row.Orientation, row.ColorMode, row.PaperSize)));
     }
 
     /// <summary>
@@ -223,7 +230,8 @@ public sealed class AgentCore : IAsyncDisposable
                     Directory.CreateDirectory(folder);
                     var destination = Path.Combine(folder, $"{number} - {JobPipeline.ReadableFileStem(row.FileName, row.ItemId)}.pdf");
                     File.Move(row.LocalPath, destination, overwrite: true);
-                    db.UpsertHeldFile(row.OrderId, row.ItemId, row.ShopId, row.FileName, destination, row.Bytes);
+                    db.UpsertHeldFile(row.OrderId, row.ItemId, row.ShopId, row.FileName, destination, row.Bytes,
+                        row.Orientation, row.ColorMode, row.PaperSize);
                     moved++;
 
                     // The old per-order folder, once it has nothing left in it.
@@ -574,6 +582,36 @@ public sealed class AgentCore : IAsyncDisposable
     /// order's are swept with the rest after HeldFileRetentionDays.
     /// </para>
     /// </summary>
+    private List<Dictionary<string, object?>> _recentOrders = new();
+    private DateTime _recentOrdersAt = DateTime.MinValue;
+    private int _recentOrdersRefreshing;
+
+    /// <summary>
+    /// The shop's order list for naming held files, without making the Files
+    /// page wait for it: the last copy is used at once and refreshed behind
+    /// the scenes when it is more than 20 seconds old. Only the very first
+    /// call waits, and then for at most two seconds.
+    /// </summary>
+    private async Task<List<Dictionary<string, object?>>> RecentOrdersAsync()
+    {
+        var stale = DateTime.UtcNow - _recentOrdersAt > TimeSpan.FromSeconds(20);
+        if (stale && Interlocked.Exchange(ref _recentOrdersRefreshing, 1) == 0)
+        {
+            var refresh = Task.Run(async () =>
+            {
+                try
+                {
+                    _recentOrders = await ListOrdersAsync().ConfigureAwait(false);
+                    _recentOrdersAt = DateTime.UtcNow;
+                }
+                catch (Exception exc) { _log.LogDebug(exc, "held_orders_enrich_failed"); }
+                finally { Interlocked.Exchange(ref _recentOrdersRefreshing, 0); }
+            });
+            if (_recentOrdersAt == DateTime.MinValue) await Task.WhenAny(refresh, Task.Delay(2000)).ConfigureAwait(false);
+        }
+        return _recentOrders;
+    }
+
     public async Task<List<Dictionary<string, object?>>> HeldOrdersAsync()
     {
         var shopId = RequireSession().ShopId;
@@ -586,16 +624,9 @@ public sealed class AgentCore : IAsyncDisposable
         // the orders that have not been scanned yet. The backend only adds the
         // customer's name when it will say it.
         var byUuid = new Dictionary<string, Dictionary<string, object?>>(StringComparer.Ordinal);
-        try
+        foreach (var order in await RecentOrdersAsync().ConfigureAwait(false))
         {
-            foreach (var order in await ListOrdersAsync().ConfigureAwait(false))
-            {
-                if (order.TryGetValue("id", out var id) && id is not null) byUuid[id.ToString()!] = order;
-            }
-        }
-        catch (Exception exc)
-        {
-            _log.LogDebug(exc, "held_orders_enrich_failed");
+            if (order.TryGetValue("id", out var id) && id is not null) byUuid[id.ToString()!] = order;
         }
 
         return held
@@ -908,6 +939,58 @@ public sealed class AgentCore : IAsyncDisposable
         _log.LogInformation(
             "printer_routing_set colour={Colour} bw={Bw}",
             colour ?? "(auto)", blackAndWhite ?? "(auto)");
+    }
+
+    /// <summary>
+    /// How a held file is to be printed - orientation, colour, paper - for its
+    /// preview. Read from the row the prefetch wrote; a file held by an older
+    /// version has none, so the job is asked once and the answer kept.
+    /// </summary>
+    public (string? Orientation, string? ColorMode, string? PaperSize) HeldFileSettings(string orderUuid, string itemId)
+    {
+        var row = Db.HeldFilesForOrder(orderUuid).FirstOrDefault(r => string.Equals(r.ItemId, itemId, StringComparison.Ordinal));
+        if (row is null) return (null, null, null);
+        if (row.Orientation is null) FillHeldSettingsInBackground(orderUuid);
+        return (row.Orientation, row.ColorMode, row.PaperSize);
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _settingsLookups = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Asks the job, once, how an older held order's files are to be printed,
+    /// then draws their previews - off the request path, so a click never waits
+    /// on the network for a file that is already on this disk.
+    /// </summary>
+    private void FillHeldSettingsInBackground(string orderUuid)
+    {
+        if (!_settingsLookups.TryAdd(orderUuid, true)) return;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var credential = _agentCredential;
+                var jobId = Db.OrderReference(orderUuid).JobId;
+                if (credential is null || jobId is null) return;
+                var detail = await Api.JobDetailAsync(credential, jobId, _shutdown.Token).ConfigureAwait(false);
+                var warm = new List<(string, string?, string?, string?)>();
+                foreach (var row in Db.HeldFilesForOrder(orderUuid))
+                {
+                    var item = detail.Items.FirstOrDefault(i => i.ItemId == row.ItemId);
+                    if (item is null) continue;
+                    Db.UpsertHeldFile(row.OrderId, row.ItemId, row.ShopId, row.FileName, row.LocalPath, row.Bytes,
+                        item.Orientation.ToString(), item.ColorMode.ToString(), item.PaperSize.ToString());
+                    warm.Add((row.LocalPath, item.Orientation.ToString(), item.ColorMode.ToString(), item.PaperSize.ToString()));
+                }
+                PreviewCache.WarmInBackground(warm);
+                OnJobProgress();
+            }
+            catch (Exception exc)
+            {
+                // Retried the next time the preview asks.
+                _settingsLookups.TryRemove(orderUuid, out _);
+                _log.LogDebug(exc, "held_file_settings_lookup_failed order={OrderId}", orderUuid);
+            }
+        });
     }
 
     /// <summary>

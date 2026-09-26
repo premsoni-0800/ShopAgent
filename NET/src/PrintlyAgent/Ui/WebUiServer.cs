@@ -231,6 +231,9 @@ public sealed class WebUiServer : IDisposable
     /// </summary>
     public Func<string, string, string?>? HeldFileResolver { get; set; }
 
+    /// <summary>(orientation, colorMode, paperSize) a held file was ordered with.</summary>
+    public Func<string, string, (string? Orientation, string? ColorMode, string? PaperSize)>? HeldSettingsResolver { get; set; }
+
     /// <summary>
     /// Serves one held document off this disk.
     ///
@@ -269,14 +272,16 @@ public sealed class WebUiServer : IDisposable
         // .../pages and .../page/{n}: the file as sheet images, so the
         // dashboard shows each page as the paper it will print on - no PDF
         // viewer, no toolbar, nothing to zoom.
+        var settings = HeldSettingsResolver?.Invoke(
+            Uri.UnescapeDataString(segments[0]), Uri.UnescapeDataString(segments[1])) ?? (null, null, null);
         if (segments.Length == 3 && segments[2] == "pages")
         {
-            ServePageList(context, resolved);
+            ServePageList(context, resolved, settings);
             return;
         }
         if (segments.Length == 4 && segments[2] == "page" && int.TryParse(segments[3], out var pageNumber))
         {
-            ServePageImage(context, resolved, pageNumber, context.Request.QueryString["w"]);
+            ServePageImage(context, resolved, pageNumber, context.Request.QueryString["w"], settings);
             return;
         }
         if (segments.Length != 2)
@@ -310,20 +315,28 @@ public sealed class WebUiServer : IDisposable
         }
     }
 
-    /// <summary>{"pages":[{"width":pt,"height":pt}]} - each page's size, for its sheet's shape.</summary>
-    private void ServePageList(HttpListenerContext context, string pdfPath)
+    /// <summary>
+    /// {"pages":[{"width":pt,"height":pt}], "orientation", "colorMode", "paperSize"}:
+    /// one entry per page, each the size of the SHEET it prints on - the order's
+    /// paper turned the order's way - not of the page itself, because the sheet
+    /// is what the owner is shown.
+    /// </summary>
+    private void ServePageList(
+        HttpListenerContext context, string pdfPath, (string? Orientation, string? ColorMode, string? PaperSize) settings)
     {
         try
         {
-            // 72 dpi renders a page at its size in points, which is all this needs.
-            using var renderer = new Printing.PdfPageRenderer(pdfPath, 72);
-            var pages = new List<object>();
-            for (var i = 0; i < renderer.PageCount; i++)
+            var (sheetW, sheetH) = Printing.PageLayout.SheetInches(settings.PaperSize, settings.Orientation);
+            var pages = Enumerable.Range(0, Printing.PreviewCache.PageCount(pdfPath))
+                .Select(_ => new { width = (int)Math.Round(sheetW * 72), height = (int)Math.Round(sheetH * 72) })
+                .ToList();
+            WriteJson(context, new
             {
-                var page = renderer.RenderPage(i);
-                pages.Add(new { width = page.Width, height = page.Height });
-            }
-            WriteJson(context, new { pages });
+                pages,
+                orientation = settings.Orientation ?? "PORTRAIT",
+                colorMode = settings.ColorMode ?? "COLOR",
+                paperSize = settings.PaperSize ?? "A4",
+            });
         }
         catch (Exception exc)
         {
@@ -333,37 +346,30 @@ public sealed class WebUiServer : IDisposable
     }
 
     /// <summary>
-    /// One page as a PNG, rendered for a sheet <paramref name="widthParam"/>
-    /// pixels wide (the dashboard asks for its on-screen size), 150 dpi if not
-    /// given, never above 200 dpi.
+    /// Page n as the printed sheet, <paramref name="widthParam"/> pixels wide
+    /// (1240 - A4 at 150 dpi - if not given, at most 3200): drawn by
+    /// PageLayout.RenderSheet, the same placement the printer uses.
     /// </summary>
-    private void ServePageImage(HttpListenerContext context, string pdfPath, int pageNumber, string? widthParam)
+    private void ServePageImage(
+        HttpListenerContext context, string pdfPath, int pageNumber, string? widthParam,
+        (string? Orientation, string? ColorMode, string? PaperSize) settings)
     {
         try
         {
-            using var probe = new Printing.PdfPageRenderer(pdfPath, 72);
-            if (pageNumber < 1 || pageNumber > probe.PageCount)
+            if (pageNumber < 1 || pageNumber > Printing.PreviewCache.PageCount(pdfPath))
             {
                 context.Response.StatusCode = 404;
                 context.Response.Close();
                 return;
             }
-            var widthPt = probe.RenderPage(pageNumber - 1).Width;
-            var dpi = 150;
-            if (int.TryParse(widthParam, out var wanted) && wanted > 0 && widthPt > 0)
-            {
-                dpi = Math.Clamp((int)Math.Ceiling(wanted * 72.0 / widthPt), 36, 200);
-            }
-
-            using var renderer = new Printing.PdfPageRenderer(pdfPath, dpi);
-            var bitmap = renderer.RenderPage(pageNumber - 1);
-            using var buffer = new MemoryStream();
-            bitmap.Save(buffer, System.Drawing.Imaging.ImageFormat.Png);
-            context.Response.ContentType = "image/png";
+            // Drawn ahead of time (PreviewCache), so this is a read off the
+            // disk; the width the page asked for is ignored - one size serves.
+            var bytes = Printing.PreviewCache.SheetJpeg(
+                pdfPath, pageNumber, settings.Orientation, settings.ColorMode, settings.PaperSize);
+            context.Response.ContentType = "image/jpeg";
             context.Response.Headers["Cache-Control"] = "no-store";
-            context.Response.ContentLength64 = buffer.Length;
-            buffer.Position = 0;
-            buffer.CopyTo(context.Response.OutputStream);
+            context.Response.ContentLength64 = bytes.Length;
+            context.Response.OutputStream.Write(bytes);
         }
         catch (Exception exc)
         {

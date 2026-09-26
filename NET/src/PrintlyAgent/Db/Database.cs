@@ -36,7 +36,11 @@ public sealed record HeldFileRow(
     string? FileName,
     string LocalPath,
     long Bytes,
-    string ReceivedAt);
+    string ReceivedAt,
+    /// <summary>The print settings the file was ordered with - what its preview is drawn as.</summary>
+    string? Orientation = null,
+    string? ColorMode = null,
+    string? PaperSize = null);
 
 /// <summary>
 /// Local SQLite state - the agent's source of truth for "have I already handled
@@ -213,6 +217,15 @@ public sealed class Database : IDisposable
         }
         catch (SqliteException) { /* column already there */ }
 
+        // How each held file is to be printed, kept with it so the dashboard's
+        // preview can draw the sheet exactly as the printer will - see
+        // WebUiServer.ServePageImage.
+        foreach (var column in new[] { "orientation", "color_mode", "paper_size" })
+        {
+            try { Execute($"ALTER TABLE held_files ADD COLUMN {column} TEXT"); }
+            catch (SqliteException) { /* column already there */ }
+        }
+
         // The two shapes every hot query uses. Without them each one is a full
         // scan of a table that only ever grows: the priority rotation and the
         // counter-scan sweep between them run thousands of times a day, for the
@@ -336,23 +349,33 @@ public sealed class Database : IDisposable
         string? shopId,
         string? fileName,
         string localPath,
-        long bytes)
+        long bytes,
+        string? orientation = null,
+        string? colorMode = null,
+        string? paperSize = null)
     {
         lock (_lock)
         {
             using var command = _connection.CreateCommand();
             command.CommandText =
-                "INSERT INTO held_files (order_id, item_id, shop_id, file_name, local_path, bytes, received_at) " +
-                "VALUES ($orderId, $itemId, $shopId, $fileName, $localPath, $bytes, $now) " +
+                "INSERT INTO held_files (order_id, item_id, shop_id, file_name, local_path, bytes, received_at, " +
+                "orientation, color_mode, paper_size) " +
+                "VALUES ($orderId, $itemId, $shopId, $fileName, $localPath, $bytes, $now, $orientation, $colorMode, $paperSize) " +
                 "ON CONFLICT(order_id, item_id) DO UPDATE SET " +
                 "shop_id = excluded.shop_id, file_name = excluded.file_name, " +
-                "local_path = excluded.local_path, bytes = excluded.bytes";
+                "local_path = excluded.local_path, bytes = excluded.bytes, " +
+                "orientation = COALESCE(excluded.orientation, held_files.orientation), " +
+                "color_mode = COALESCE(excluded.color_mode, held_files.color_mode), " +
+                "paper_size = COALESCE(excluded.paper_size, held_files.paper_size)";
             command.Parameters.AddWithValue("$orderId", orderId);
             command.Parameters.AddWithValue("$itemId", itemId);
             command.Parameters.AddWithValue("$shopId", (object?)shopId ?? DBNull.Value);
             command.Parameters.AddWithValue("$fileName", (object?)fileName ?? DBNull.Value);
             command.Parameters.AddWithValue("$localPath", localPath);
             command.Parameters.AddWithValue("$bytes", bytes);
+            command.Parameters.AddWithValue("$orientation", (object?)orientation ?? DBNull.Value);
+            command.Parameters.AddWithValue("$colorMode", (object?)colorMode ?? DBNull.Value);
+            command.Parameters.AddWithValue("$paperSize", (object?)paperSize ?? DBNull.Value);
             command.Parameters.AddWithValue("$now", NowIso());
             command.ExecuteNonQuery();
         }
@@ -456,7 +479,10 @@ public sealed class Database : IDisposable
                     FileName: ReadNullableString(reader, "file_name"),
                     LocalPath: reader.GetString(reader.GetOrdinal("local_path")),
                     Bytes: reader.GetInt64(reader.GetOrdinal("bytes")),
-                    ReceivedAt: reader.GetString(reader.GetOrdinal("received_at"))));
+                    ReceivedAt: reader.GetString(reader.GetOrdinal("received_at")),
+                    Orientation: ReadNullableString(reader, "orientation"),
+                    ColorMode: ReadNullableString(reader, "color_mode"),
+                    PaperSize: ReadNullableString(reader, "paper_size")));
             }
             return rows;
         }
